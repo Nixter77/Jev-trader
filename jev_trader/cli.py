@@ -692,7 +692,7 @@ def build_parser() -> argparse.ArgumentParser:
             dest="follow_jev",
             action="store_true",
             default=follow_jev,
-            help="Trade Jev buy/close without false-break/strength gates (buy still needs should_trade_now 0.50)",
+            help="Trade Jev buy/close without probability gates (size/stop still in code; no shorts)",
         )
         p.add_argument(
             "--strict-gates",

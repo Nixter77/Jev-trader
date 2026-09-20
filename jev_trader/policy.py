@@ -7,7 +7,6 @@ from jev_trader.models import (
 )
 
 SHOULD_TRADE_NOW_MIN = 0.72
-FOLLOW_JEV_ENTRY_MIN = 0.50
 FALSE_BREAK_RISK_MAX = 0.35
 SIGNAL_STRENGTH_MIN = "рабочий"
 TREND_ALIGNED_MIN = 0.60
@@ -30,9 +29,8 @@ def apply_policy(
 ) -> PolicyDecision:
     """Confidence gates in code. Size/stop/leverage are never decided here.
 
-    `follow_jev=True` still ignores hold and skips false-break/strength/trend
-    gates, but buy_long still needs should_trade_now >= 0.50 (noise floor).
-    Risk sizing stays in code.
+    `follow_jev=True` still ignores hold, but skips probability gates so Jev's
+    buy/close is the trade decision. Risk sizing stays in code.
     """
     if judgment.action not in TRADE_ACTIONS:
         return PolicyDecision(
@@ -42,15 +40,6 @@ def apply_policy(
             judgment=judgment,
         )
     if follow_jev:
-        if judgment.action in ENTRY_ACTIONS:
-            floor = FOLLOW_JEV_ENTRY_MIN if min_should_trade == SHOULD_TRADE_NOW_MIN else min_should_trade
-            if judgment.should_trade_now < floor:
-                return PolicyDecision(
-                    action="hold",
-                    passed=False,
-                    skip_reason="should_trade_now",
-                    judgment=judgment,
-                )
         return PolicyDecision(
             action=judgment.action,
             passed=True,

@@ -34,20 +34,11 @@ def test_hold_action_skips() -> None:
 
 def test_follow_jev_skips_probability_gates() -> None:
     decision = apply_policy(
-        _judgment(should_trade_now=0.55, false_break_risk=0.9, signal_strength="слабый"),
+        _judgment(should_trade_now=0.36, false_break_risk=0.9, signal_strength="слабый"),
         follow_jev=True,
     )
     assert decision.passed is True
     assert decision.action == "buy_long"
-
-
-def test_follow_jev_entry_still_needs_noise_floor() -> None:
-    decision = apply_policy(
-        _judgment(should_trade_now=0.36, false_break_risk=0.9, signal_strength="слабый"),
-        follow_jev=True,
-    )
-    assert decision.passed is False
-    assert decision.skip_reason == "should_trade_now"
 
 
 def test_follow_jev_still_holds_on_hold_action() -> None:
