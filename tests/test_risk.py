@@ -55,7 +55,9 @@ def test_size_from_risk_pct_and_atr_stop_not_jev_probability(market_snapshot) ->
     assert high_p.qty == low_p.qty
     stop_distance = 1.5 * features.atr
     assert high_p.stop_distance == pytest.approx(stop_distance)
-    assert high_p.qty * high_p.stop_distance == pytest.approx(10_000.0 * 0.005)
+    risk_qty = (10_000.0 * 0.005) / stop_distance
+    max_qty = (10_000.0 * 3.0) / features.close
+    assert high_p.qty == pytest.approx(min(risk_qty, max_qty))
     assert high_p.qty != 0.95 * 10_000.0
     assert high_p.entry_type == "LIMIT_POST_ONLY"
     assert high_p.reduce_only is False
@@ -125,8 +127,8 @@ def test_reduce_only_set_on_close() -> None:
     assert intent.reduce_only is True
     assert intent.qty == 0.07
     assert intent.order_side == "SELL"
-    assert intent.limit_price == snapshot.book.asks[0].price
-    assert intent.entry_type == "LIMIT_POST_ONLY"
+    assert intent.entry_type == "MARKET"
+    assert intent.limit_price is None
 
 
 def test_sell_short_while_flat_does_not_open(market_snapshot) -> None:
@@ -143,7 +145,7 @@ def test_sell_short_while_flat_does_not_open(market_snapshot) -> None:
     assert intent.reduce_only is False
 
 
-def test_sell_short_while_long_closes_with_sell() -> None:
+def test_sell_short_while_long_does_not_dump() -> None:
     snapshot = build_fixture_snapshot(side="LONG", size=0.4)
     features = compute_features(snapshot)
     account = AccountState(
@@ -153,11 +155,9 @@ def test_sell_short_while_long_closes_with_sell() -> None:
         open_positions=1,
     )
     intent = apply_risk(_pass_policy("sell_short"), features, snapshot, account)
-    assert intent.action == "close"
-    assert intent.order_side == "SELL"
-    assert intent.reduce_only is True
-    assert intent.qty == 0.4
-    assert intent.limit_price == snapshot.book.asks[0].price
+    assert intent.qty == 0
+    assert intent.skip_reason == "no_short"
+    assert intent.action == "hold"
 
 
 def test_leftover_short_is_flattened_even_on_hold() -> None:
@@ -189,6 +189,26 @@ def test_buy_long_skips_when_already_long() -> None:
     intent = apply_risk(_pass_policy("buy_long"), features, snapshot, account)
     assert intent.skip_reason == "already_long"
     assert intent.qty == 0
+
+
+def test_stop_hit_flattens_long_even_on_hold() -> None:
+    snapshot = build_fixture_snapshot(side="LONG", size=0.4)
+    snapshot = replace(
+        snapshot,
+        position=replace(snapshot.position, stop_price=snapshot.candles[-1].close + 1_000.0),
+    )
+    features = compute_features(snapshot)
+    account = AccountState(
+        equity_usdt=10_000.0,
+        daily_pnl_pct=0.0,
+        kill_switch=False,
+        open_positions=1,
+    )
+    intent = apply_risk(_pass_policy("hold"), features, snapshot, account)
+    assert intent.action == "close"
+    assert intent.entry_type == "MARKET"
+    assert intent.reduce_only is True
+    assert intent.risk_event == "stop"
 
 
 def test_limit_price_falls_back_to_last_close_without_book(market_snapshot) -> None:

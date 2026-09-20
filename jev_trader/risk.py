@@ -108,13 +108,23 @@ def apply_risk(
     if in_position and pos_side == "SHORT":
         return close_position(risk_event="no_short", entry_type="MARKET")
 
+    if in_position and pos_side == "LONG":
+        stop = snapshot.position.stop_price
+        if stop is None and features.atr and features.atr > 0 and snapshot.position.entry:
+            stop = snapshot.position.entry - stop_mult * features.atr
+        if stop is not None and close <= stop:
+            return close_position(risk_event="stop", entry_type="MARKET")
+
     if not policy.passed:
         return skip(policy.skip_reason or "hold")
 
-    if policy.action in {"close", "sell_short"}:
+    if policy.action == "sell_short":
+        return skip("no_short")
+
+    if policy.action == "close":
         if not in_position or pos_side != "LONG":
-            return skip("no_short" if policy.action == "sell_short" else "flat")
-        return close_position(risk_event=None, entry_type="LIMIT_POST_ONLY")
+            return skip("flat")
+        return close_position(risk_event=None, entry_type="MARKET")
 
     if policy.action != "buy_long":
         return skip(policy.skip_reason or "hold")
@@ -132,6 +142,15 @@ def apply_risk(
     stop_distance = stop_mult * atr
     risk_amount = account.equity_usdt * account.risk_pct
     qty = risk_amount / stop_distance
+    available = account.available_usdt
+    if available is None:
+        available = account.equity_usdt
+    leverage = max(float(account.leverage or 1.0), 1.0)
+    max_notional = max(0.0, float(available)) * leverage
+    if close > 0 and max_notional > 0:
+        qty = min(qty, max_notional / close)
+    if qty <= 0:
+        return skip("insufficient_margin")
     return TradeIntent(
         action="buy_long",
         qty=qty,

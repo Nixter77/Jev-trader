@@ -32,6 +32,7 @@ def snapshot_from_dict(data: dict[str, Any]) -> MarketSnapshot:
         entry=pos_raw.get("entry"),
         upnl_pct=pos_raw.get("upnl_pct"),
         bars_in_trade=int(pos_raw.get("bars_in_trade") or 0),
+        stop_price=pos_raw.get("stop_price"),
     )
     news = data.get("news") or []
     if isinstance(news, str):
@@ -153,6 +154,7 @@ def snapshot_to_jsonable(snapshot: MarketSnapshot) -> dict[str, Any]:
             "upnl_pct": snapshot.position.upnl_pct,
             "bars_in_trade": snapshot.position.bars_in_trade,
             "cash_usdt": snapshot.position.cash_usdt,
+            "stop_price": snapshot.position.stop_price,
         },
         "news": list(snapshot.news),
         "funding": snapshot.funding,

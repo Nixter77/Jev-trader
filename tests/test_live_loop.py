@@ -10,9 +10,10 @@ import pytest
 
 from jev_trader.cycle import decision_payload, run_once
 from jev_trader.execution import PaperBroker
+from jev_trader.features import compute_features
 from jev_trader.jev import judgment_from_dict
 from jev_trader.ledger import Ledger
-from jev_trader.live import FiveMinuteCloseLoop, make_run_cycle
+from jev_trader.live import FiveMinuteCloseLoop, make_run_cycle, overlay_wallet_position
 from jev_trader.public_market import parse_rest_klines
 from jev_trader.state import build_compact_state
 
@@ -218,5 +219,28 @@ def test_run_cycle_sizes_from_binance_wallet_not_paper_10k(
     result = cycle(market_snapshot)
     assert box["wallet"]["equity_usdt"] == 3044.7
     assert result.intent is not None
-    assert result.intent.qty * result.intent.stop_distance == pytest.approx(3044.7 * 0.005)
+    features = compute_features(market_snapshot)
+    risk_qty = (3044.7 * 0.005) / result.intent.stop_distance
+    max_qty = (3044.7 * 3.0) / features.close
+    assert result.intent.qty == pytest.approx(min(risk_qty, max_qty))
     assert result.intent.qty * result.intent.stop_distance != pytest.approx(10_000.0 * 0.005)
+
+
+def test_overlay_wallet_uses_exchange_position(market_snapshot) -> None:
+    long_snap = overlay_wallet_position(
+        market_snapshot,
+        {
+            "equity_usdt": 2800.0,
+            "positions": [
+                {"symbol": "BTCUSDT", "side": "LONG", "size": 0.5, "entry": 80_000.0},
+            ],
+        },
+    )
+    assert long_snap.position.side == "LONG"
+    assert long_snap.position.size == pytest.approx(0.5)
+    assert long_snap.position.cash_usdt == pytest.approx(2800.0)
+    assert long_snap.position.entry == pytest.approx(80_000.0)
+    flat = overlay_wallet_position(long_snap, {"equity_usdt": 2800.0, "positions": []})
+    assert flat.position.side == "FLAT"
+    assert flat.position.size == 0.0
+    assert flat.position.stop_price is None

@@ -10,11 +10,12 @@ from jev_trader.execution import (
     BinanceTestnetBroker,
     PaperBroker,
     format_binance_decimal,
+    is_real_fill,
     parse_symbol_filters,
     parse_usdt_wallet,
     round_to_step,
 )
-from jev_trader.models import TradeIntent
+from jev_trader.models import ExecutionResult, TradeIntent
 
 
 def _intent(**overrides) -> TradeIntent:
@@ -66,9 +67,9 @@ def test_live_broker_accepts_production_with_confirm(monkeypatch: pytest.MonkeyP
 
 
 class _FakeResponse:
-    def __init__(self, payload: dict[str, Any] | None = None, status: int = 200) -> None:
+    def __init__(self, payload: Any = None, status: int = 200) -> None:
         self.status = status
-        self._body = json.dumps(payload or {"orderId": 1}).encode()
+        self._body = json.dumps({"orderId": 1} if payload is None else payload).encode()
 
     def read(self) -> bytes:
         return self._body
@@ -85,6 +86,40 @@ def _patch_urlopen(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
 
     def fake_urlopen(req: Any, timeout: float | None = None, context: Any = None) -> _FakeResponse:
         captured.append({"req": req, "timeout": timeout, "context": context})
+        parsed = urllib.parse.urlparse(req.full_url)
+        path = parsed.path
+        method = req.get_method()
+        params = urllib.parse.parse_qs(parsed.query)
+        if path.endswith("/time"):
+            return _FakeResponse({"serverTime": 1_000_000_000_000})
+        if path.endswith("/exchangeInfo"):
+            return _FakeResponse({"symbols": []})
+        if path.endswith("/openOrders"):
+            return _FakeResponse([])
+        if method == "DELETE":
+            return _FakeResponse({"code": 200})
+        if method == "POST" and path.endswith("/order"):
+            qty = (params.get("quantity") or ["0"])[0]
+            if params.get("type") == ["MARKET"] or params.get("type") == ["STOP_MARKET"]:
+                return _FakeResponse(
+                    {
+                        "orderId": 1,
+                        "status": "FILLED",
+                        "executedQty": qty,
+                        "avgPrice": "100",
+                        "symbol": (params.get("symbol") or ["BTCUSDT"])[0],
+                    }
+                )
+            return _FakeResponse(
+                {
+                    "orderId": 1,
+                    "status": "NEW",
+                    "executedQty": "0",
+                    "avgPrice": "0",
+                    "symbol": (params.get("symbol") or ["BTCUSDT"])[0],
+                    "timeInForce": (params.get("timeInForce") or [None])[0],
+                }
+            )
         return _FakeResponse()
 
     monkeypatch.setattr("jev_trader.execution.urllib.request.urlopen", fake_urlopen)
@@ -97,7 +132,8 @@ def test_testnet_limit_post_only_sends_mandatory_price(monkeypatch: pytest.Monke
     intent = _intent(limit_price=104_900.5, qty=0.0123, entry_type="LIMIT_POST_ONLY")
     result = broker.submit(intent)
 
-    assert result.status == "accepted"
+    assert result.status == "working"
+    assert not is_real_fill(result)
     posts = [c["req"] for c in captured if c["req"].get_method() == "POST"]
     assert len(posts) == 1
     req = posts[0]
@@ -214,10 +250,90 @@ def test_testnet_market_flatten_omits_price(monkeypatch: pytest.MonkeyPatch) -> 
         qty=0.25,
     )
     result = broker.submit(intent)
-    assert result.status == "accepted"
+    assert result.status == "filled"
+    assert is_real_fill(result)
     posts = [c["req"] for c in captured if c["req"].get_method() == "POST"]
     params = urllib.parse.parse_qs(urllib.parse.urlparse(posts[0].full_url).query)
     assert params["type"] == ["MARKET"]
     assert params["reduceOnly"] == ["true"]
     assert "price" not in params
     assert "timeInForce" not in params
+
+
+def test_new_gtx_body_is_not_a_real_fill() -> None:
+    fake = ExecutionResult(
+        status="accepted",
+        venue="binance_testnet",
+        client_order_id="x",
+        reduce_only=False,
+        detail={"http_status": 200, "body": {"status": "NEW", "executedQty": "0", "orderId": 9}},
+    )
+    assert is_real_fill(fake) is False
+    filled = ExecutionResult(
+        status="filled",
+        venue="binance_testnet",
+        client_order_id="x",
+        reduce_only=False,
+        detail={
+            "http_status": 200,
+            "body": {"status": "FILLED", "executedQty": "10", "avgPrice": "1.5"},
+        },
+    )
+    assert is_real_fill(filled) is True
+
+
+def test_flatten_all_market_closes_wallet_positions(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _patch_urlopen(monkeypatch)
+
+    def fake_urlopen(req: Any, timeout: float | None = None, context: Any = None) -> _FakeResponse:
+        captured.append({"req": req, "timeout": timeout, "context": context})
+        parsed = urllib.parse.urlparse(req.full_url)
+        path = parsed.path
+        method = req.get_method()
+        params = urllib.parse.parse_qs(parsed.query)
+        if path.endswith("/time"):
+            return _FakeResponse({"serverTime": 1_000_000_000_000})
+        if path.endswith("/account") or path.endswith("/balance"):
+            return _FakeResponse(
+                {
+                    "totalWalletBalance": "2800",
+                    "availableBalance": "2000",
+                    "positions": [
+                        {
+                            "symbol": "ETHUSDT",
+                            "positionAmt": "0.5",
+                            "entryPrice": "2000",
+                            "unrealizedProfit": "-10",
+                        }
+                    ],
+                }
+            )
+        if path.endswith("/openOrders"):
+            return _FakeResponse([])
+        if path.endswith("/exchangeInfo"):
+            return _FakeResponse({"symbols": []})
+        if method == "DELETE":
+            return _FakeResponse({"code": 200})
+        if method == "POST" and path.endswith("/order"):
+            return _FakeResponse(
+                {
+                    "orderId": 99,
+                    "status": "FILLED",
+                    "executedQty": (params.get("quantity") or ["0.5"])[0],
+                    "avgPrice": "1990",
+                    "symbol": "ETHUSDT",
+                }
+            )
+        return _FakeResponse()
+
+    monkeypatch.setattr("jev_trader.execution.urllib.request.urlopen", fake_urlopen)
+    broker = BinanceTestnetBroker("k", "s", "https://testnet.binancefuture.com")
+    result = broker.flatten_all()
+    posts = [c["req"] for c in captured if c["req"].get_method() == "POST"]
+    assert posts
+    params = urllib.parse.parse_qs(urllib.parse.urlparse(posts[0].full_url).query)
+    assert params["symbol"] == ["ETHUSDT"]
+    assert params["type"] == ["MARKET"]
+    assert params["reduceOnly"] == ["true"]
+    assert params["side"] == ["SELL"]
+    assert result["closes"][0]["status"] == "filled"

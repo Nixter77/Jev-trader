@@ -17,7 +17,12 @@ from pathlib import Path
 from typing import Any
 
 from jev_trader.cycle import decision_payload, dumps_decision, run_once
-from jev_trader.execution import BinanceFuturesBroker, BinanceTestnetBroker, PaperBroker
+from jev_trader.execution import (
+    BinanceFuturesBroker,
+    BinanceTestnetBroker,
+    PaperBroker,
+    is_real_fill,
+)
 from jev_trader.ledger import Ledger
 from jev_trader.status import seconds_to_next_5m, utc_now, write_json
 from jev_trader.models import (
@@ -201,7 +206,7 @@ class FiveMinuteCloseLoop:
         intent = result.intent
         if execution is None or intent is None or intent.qty <= 0:
             return
-        if execution.status not in {"paper_recorded", "accepted"}:
+        if not is_real_fill(execution):
             return
         cash = self.position.cash_usdt
         if result.action == "buy_long":
@@ -211,6 +216,7 @@ class FiveMinuteCloseLoop:
                 cash_usdt=cash,
                 entry=intent.limit_price,
                 bars_in_trade=0,
+                stop_price=intent.stop_price,
             )
         elif result.action == "sell_short":
             self.position = Position(
@@ -222,6 +228,45 @@ class FiveMinuteCloseLoop:
             )
         elif result.action == "close":
             self.position = Position(side="FLAT", size=0.0, cash_usdt=cash)
+
+
+def overlay_wallet_position(snapshot: MarketSnapshot, wallet: dict[str, Any]) -> MarketSnapshot:
+    """Exchange positions are the source of truth on testnet/live."""
+    cash = float(wallet.get("equity_usdt") or snapshot.position.cash_usdt)
+    match: dict[str, Any] | None = None
+    for row in wallet.get("positions") or []:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("symbol") or "").upper() == snapshot.symbol.upper():
+            match = row
+            break
+    if match is None:
+        return replace(
+            snapshot,
+            position=replace(
+                snapshot.position,
+                side="FLAT",
+                size=0.0,
+                entry=None,
+                cash_usdt=cash,
+                stop_price=None,
+            ),
+        )
+    side = str(match.get("side") or "FLAT")
+    if side not in {"FLAT", "LONG", "SHORT"}:
+        side = "FLAT"
+    stop = snapshot.position.stop_price if side == "LONG" else None
+    return replace(
+        snapshot,
+        position=replace(
+            snapshot.position,
+            side=side,  # type: ignore[arg-type]
+            size=float(match.get("size") or 0.0),
+            entry=None if not match.get("entry") else float(match["entry"]),
+            cash_usdt=cash,
+            stop_price=stop,
+        ),
+    )
 
 
 def make_run_cycle(
@@ -249,25 +294,46 @@ def make_run_cycle(
             except Exception as exc:  # noqa: BLE001
                 if wallet_box is not None:
                     wallet_box["wallet_error"] = f"{type(exc).__name__}: {exc}"
+        cash = snapshot.position.cash_usdt
+        available = None
+        daily_pnl_pct = float(account_kwargs.get("daily_pnl_pct", 0.0))
+        if wallet is not None:
+            snapshot = overlay_wallet_position(snapshot, wallet)
+            cash = float(wallet.get("equity_usdt") or cash)
+            if wallet.get("available_usdt") is not None:
+                available = float(wallet["available_usdt"])
+            if wallet_box is not None:
+                start = wallet_box.get("start_equity_usdt")
+                if not start and cash:
+                    wallet_box["start_equity_usdt"] = cash
+                    start = cash
+                if start:
+                    daily_pnl_pct = (cash - float(start)) / float(start)
+            if ledger is not None:
+                try:
+                    ledger.sync_exchange_positions(wallet)
+                    if snapshot.position.stop_price is None and snapshot.position.side == "LONG":
+                        loaded = ledger.load_position(snapshot.symbol, default_cash=cash)
+                        if loaded.stop_price is not None:
+                            snapshot = replace(
+                                snapshot,
+                                position=replace(snapshot.position, stop_price=loaded.stop_price),
+                            )
+                except Exception:  # noqa: BLE001 — trading must not die on ledger sync
+                    pass
         if ledger is not None:
             open_n = ledger.count_open_positions()
         else:
             open_n = 0 if snapshot.position.side == "FLAT" else 1
         if wallet is not None and wallet.get("open_positions") is not None:
             open_n = int(wallet["open_positions"])
-        cash = snapshot.position.cash_usdt
-        if wallet is not None and wallet.get("equity_usdt"):
-            cash = float(wallet["equity_usdt"])
-            snapshot = replace(
-                snapshot,
-                position=replace(snapshot.position, cash_usdt=cash),
-            )
         account = AccountState(
             equity_usdt=cash,
-            daily_pnl_pct=float(account_kwargs.get("daily_pnl_pct", 0.0)),
+            daily_pnl_pct=daily_pnl_pct,
             kill_switch=bool(account_kwargs.get("kill_switch", False)),
             open_positions=open_n,
             max_positions=int(account_kwargs.get("max_positions", max_positions)),
+            available_usdt=available,
         )
         return run_once(
             snapshot,
@@ -544,7 +610,7 @@ class LiveRunner:
             "last_error": self.last_error or self.wallet_box.get("wallet_error"),
             "last_decisions": self.last_decisions[:30],
             "wallet": self.wallet_box.get("wallet"),
-            "hint": "Jev на закрытии 5m. Вход только BUY/лонг; SELL только закрывает лонг.",
+            "hint": "Jev на закрытии 5m. Вход только BUY/лонг; выход MARKET; стоп на бирже.",
         }
         try:
             write_json(self.status_path, payload)

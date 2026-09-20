@@ -22,6 +22,12 @@ from jev_trader.models import ExecutionResult, TradeIntent
 
 SELL_ONLY_CLOSES_LONG = "sell_only_closes_long"
 RECV_WINDOW_MS = 60_000
+FILLED_ORDER_STATUSES = frozenset({"FILLED", "PARTIALLY_FILLED"})
+LIMIT_ORDER_TYPES = frozenset({"LIMIT", "LIMIT_MAKER"})
+
+
+def _flatten_client_id(symbol: str) -> str:
+    return f"jev1_{symbol}_flatten_{int(time.time() * 1000)}"
 
 
 def format_binance_decimal(value: float) -> str:
@@ -124,6 +130,96 @@ def open_sell_error(intent: TradeIntent) -> str | None:
     return None
 
 
+def order_executed_qty(body: Any) -> float:
+    if not isinstance(body, dict):
+        return 0.0
+    try:
+        return float(body.get("executedQty") or body.get("cumQty") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def order_fill_price(body: Any) -> float | None:
+    if not isinstance(body, dict):
+        return None
+    try:
+        avg = float(body.get("avgPrice") or 0.0)
+    except (TypeError, ValueError):
+        avg = 0.0
+    if avg > 0:
+        return avg
+    try:
+        px = float(body.get("price") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    return px if px > 0 else None
+
+
+def order_is_filled(body: Any) -> bool:
+    if not isinstance(body, dict):
+        return False
+    status = str(body.get("status") or "")
+    return order_executed_qty(body) > 0 or status in FILLED_ORDER_STATUSES
+
+
+def is_real_fill(execution: ExecutionResult | None) -> bool:
+    """True only for paper fills or Binance orders with executedQty > 0."""
+    if execution is None:
+        return False
+    if execution.status == "paper_recorded":
+        return True
+    if execution.status not in {"filled", "accepted"}:
+        return False
+    body = execution.detail.get("body") if isinstance(execution.detail, dict) else None
+    if execution.status == "filled" and not isinstance(body, dict):
+        return True
+    if order_is_filled(body):
+        return True
+    if execution.status == "filled":
+        detail = execution.detail if isinstance(execution.detail, dict) else {}
+        try:
+            return float(detail.get("filled_qty") or 0.0) > 0
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
+def fill_qty(execution: ExecutionResult | None, fallback: float = 0.0) -> float:
+    if execution is None:
+        return 0.0
+    if execution.status == "paper_recorded":
+        return fallback
+    body = execution.detail.get("body") if isinstance(execution.detail, dict) else None
+    qty = order_executed_qty(body)
+    if qty > 0:
+        return qty
+    if isinstance(execution.detail, dict):
+        try:
+            extra = float(execution.detail.get("filled_qty") or 0.0)
+        except (TypeError, ValueError):
+            extra = 0.0
+        if extra > 0:
+            return extra
+    return fallback if execution.status == "filled" else 0.0
+
+
+def fill_price(execution: ExecutionResult | None, fallback: float | None) -> float | None:
+    if execution is None:
+        return fallback
+    body = execution.detail.get("body") if isinstance(execution.detail, dict) else None
+    px = order_fill_price(body)
+    if px is not None:
+        return px
+    if isinstance(execution.detail, dict):
+        try:
+            extra = float(execution.detail.get("fill_price") or 0.0)
+        except (TypeError, ValueError):
+            extra = 0.0
+        if extra > 0:
+            return extra
+    return fallback
+
+
 class PaperBroker:
     venue = "paper"
 
@@ -204,6 +300,8 @@ class BinanceFuturesBroker:
         self._wallet_ts = 0.0
         self._filters: dict[str, dict[str, str]] = {}
         self._filters_loaded = False
+        self._fill_poll_attempts = 4
+        self._fill_poll_sleep = 0.25
 
     def sync_time(self) -> int:
         status, data = self._request("GET", "/fapi/v1/time", signed=False)
@@ -292,6 +390,10 @@ class BinanceFuturesBroker:
         self._wallet_ts = now
         return wallet
 
+    def invalidate_wallet(self) -> None:
+        self._wallet_cache = None
+        self._wallet_ts = 0.0
+
     def filters_for(self, symbol: str) -> dict[str, str]:
         if not self._filters_loaded:
             status, data = self._request("GET", "/fapi/v1/exchangeInfo")
@@ -364,15 +466,191 @@ class BinanceFuturesBroker:
                 )
             params["timeInForce"] = "GTX"  # post-only
             params["price"] = format_binance_decimal(price)
+        if intent.reduce_only or intent.entry_type == "MARKET":
+            self.cancel_open_orders(intent.symbol)
+        else:
+            self.cancel_open_limits(intent.symbol)
         status, data = self._request("POST", "/fapi/v1/order", params=params, signed=True)
         ok = 200 <= status < 300
+        if not ok:
+            return ExecutionResult(
+                status="rejected",
+                venue=self.venue,
+                client_order_id=intent.client_order_id,
+                reduce_only=intent.reduce_only,
+                detail={"http_status": status, "body": data},
+            )
+        filled_qty = order_executed_qty(data)
+        fill_px = order_fill_price(data)
+        if not order_is_filled(data) and intent.entry_type == "MARKET":
+            data = self._poll_order(intent.symbol, intent.client_order_id, data)
+            filled_qty = order_executed_qty(data)
+            fill_px = order_fill_price(data)
+        self.invalidate_wallet()
+        if order_is_filled(data):
+            return ExecutionResult(
+                status="filled",
+                venue=self.venue,
+                client_order_id=intent.client_order_id,
+                reduce_only=intent.reduce_only,
+                detail={
+                    "http_status": status,
+                    "body": data,
+                    "filled_qty": filled_qty,
+                    "fill_price": fill_px,
+                },
+            )
+        if intent.entry_type == "MARKET":
+            self.cancel_order(intent.symbol, intent.client_order_id)
+            self.invalidate_wallet()
+            return ExecutionResult(
+                status="unfilled",
+                venue=self.venue,
+                client_order_id=intent.client_order_id,
+                reduce_only=intent.reduce_only,
+                detail={"http_status": status, "body": data, "error": "not_filled"},
+            )
         return ExecutionResult(
-            status="accepted" if ok else "rejected",
+            status="working",
             venue=self.venue,
             client_order_id=intent.client_order_id,
             reduce_only=intent.reduce_only,
             detail={"http_status": status, "body": data},
         )
+
+    def _poll_order(self, symbol: str, client_order_id: str, last: Any) -> Any:
+        data = last
+        for _ in range(max(0, int(self._fill_poll_attempts))):
+            if order_is_filled(data):
+                return data
+            if self._fill_poll_sleep:
+                time.sleep(self._fill_poll_sleep)
+            status, queried = self._request(
+                "GET",
+                "/fapi/v1/order",
+                params={"symbol": symbol, "origClientOrderId": client_order_id},
+                signed=True,
+            )
+            if 200 <= status < 300:
+                data = queried
+        return data
+
+    def cancel_order(self, symbol: str, client_order_id: str) -> dict[str, Any]:
+        status, data = self._request(
+            "DELETE",
+            "/fapi/v1/order",
+            params={"symbol": symbol, "origClientOrderId": client_order_id},
+            signed=True,
+        )
+        return {"http_status": status, "body": data}
+
+    def cancel_open_orders(self, symbol: str) -> dict[str, Any]:
+        status, data = self._request(
+            "DELETE",
+            "/fapi/v1/allOpenOrders",
+            params={"symbol": symbol.upper()},
+            signed=True,
+        )
+        return {"http_status": status, "body": data}
+
+    def cancel_open_limits(self, symbol: str) -> list[dict[str, Any]]:
+        status, data = self._request(
+            "GET",
+            "/fapi/v1/openOrders",
+            params={"symbol": symbol.upper()},
+            signed=True,
+        )
+        if not (200 <= status < 300) or not isinstance(data, list):
+            return []
+        cancelled: list[dict[str, Any]] = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            typ = str(row.get("type") or "")
+            tif = str(row.get("timeInForce") or "")
+            if typ not in LIMIT_ORDER_TYPES and tif != "GTX":
+                continue
+            oid = row.get("orderId")
+            params: dict[str, Any] = {"symbol": symbol.upper()}
+            if oid is not None:
+                params["orderId"] = oid
+            else:
+                params["origClientOrderId"] = row.get("clientOrderId")
+            c_status, c_body = self._request("DELETE", "/fapi/v1/order", params=params, signed=True)
+            cancelled.append({"http_status": c_status, "body": c_body})
+        return cancelled
+
+    def cancel_all_open_orders(self, symbols: list[str] | None = None) -> list[dict[str, Any]]:
+        names = [s.upper() for s in (symbols or [])]
+        if not names:
+            status, data = self._request("GET", "/fapi/v1/openOrders", signed=True)
+            if 200 <= status < 300 and isinstance(data, list):
+                names = sorted(
+                    {
+                        str(row.get("symbol") or "").upper()
+                        for row in data
+                        if isinstance(row, dict) and row.get("symbol")
+                    }
+                )
+        return [self.cancel_open_orders(symbol) for symbol in names]
+
+    def place_stop_market(
+        self,
+        symbol: str,
+        *,
+        stop_price: float,
+        order_side: str = "SELL",
+    ) -> dict[str, Any]:
+        flt = self.filters_for(symbol)
+        price = stop_price
+        if flt.get("tickSize"):
+            price = round_to_step(stop_price, flt["tickSize"])
+        if price <= 0:
+            return {"http_status": 0, "body": {"error": "invalid stop_price"}}
+        params = {
+            "symbol": symbol.upper(),
+            "side": order_side,
+            "type": "STOP_MARKET",
+            "stopPrice": format_binance_decimal(price),
+            "closePosition": "true",
+            "workingType": "CONTRACT_PRICE",
+        }
+        status, data = self._request("POST", "/fapi/v1/order", params=params, signed=True)
+        self.invalidate_wallet()
+        return {"http_status": status, "body": data}
+
+    def flatten_all(self) -> dict[str, Any]:
+        cancelled = self.cancel_all_open_orders()
+        wallet = self.fetch_wallet(ttl=0)
+        closes: list[dict[str, Any]] = []
+        for pos in wallet.get("positions") or []:
+            symbol = str(pos.get("symbol") or "")
+            size = float(pos.get("size") or 0.0)
+            side = str(pos.get("side") or "")
+            if not symbol or size <= 0:
+                continue
+            intent = TradeIntent(
+                action="close",
+                qty=size,
+                stop_price=None,
+                stop_distance=None,
+                entry_type="MARKET",
+                reduce_only=True,
+                client_order_id=_flatten_client_id(symbol),
+                symbol=symbol,
+                risk_pct=0.0,
+                order_side="SELL" if side == "LONG" else "BUY",
+            )
+            result = self.submit(intent)
+            closes.append(
+                {
+                    "symbol": symbol,
+                    "status": result.status,
+                    "detail": result.detail,
+                }
+            )
+        after = self.fetch_wallet(ttl=0)
+        return {"cancelled": cancelled, "closes": closes, "wallet": after}
 
 
 class BinanceTestnetBroker(BinanceFuturesBroker):

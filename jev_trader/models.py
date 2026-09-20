@@ -39,6 +39,7 @@ class Position:
     entry: float | None = None
     upnl_pct: float | None = None
     bars_in_trade: int = 0
+    stop_price: float | None = None
 
 
 @dataclass(frozen=True)
@@ -140,6 +141,7 @@ class AccountState:
     atr_stop_mult: float = 1.5
     daily_loss_limit_pct: float = 0.025
     leverage: float = 3.0
+    available_usdt: float | None = None
 
 
 @dataclass(frozen=True)

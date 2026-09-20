@@ -1975,7 +1975,8 @@
     "entry": null,
     "upnl_pct": null,
     "bars_in_trade": 0,
-    "cash_usdt": 10000.0
+    "cash_usdt": 10000.0,
+    "stop_price": null
   },
   "news": [
     "ETF inflow +$240m; no FOMC today"

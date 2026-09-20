@@ -10,7 +10,7 @@ from pathlib import Path
 from jev_trader.cycle import run_once_from_answers
 from jev_trader.execution import PaperBroker
 from jev_trader.ledger import Ledger
-from jev_trader.models import Position
+from jev_trader.models import CycleResult, ExecutionResult, Position, TradeIntent
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -95,6 +95,46 @@ def test_paper_buy_then_close_records_realized_pnl(
     assert close_fill["realized_pnl_usdt"] is not None
     assert book["realized_pnl_usdt"] == close_fill["realized_pnl_usdt"]
     assert abs(flat.cash_usdt - (10_000.0 + float(close_fill["realized_pnl_usdt"]))) < 1e-6
+
+
+def test_accepted_new_order_does_not_open_ledger_position(
+    tmp_path: Path, market_snapshot, passing_answers
+) -> None:
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    intent = TradeIntent(
+        action="buy_long",
+        qty=10.0,
+        stop_price=1.0,
+        stop_distance=1.0,
+        entry_type="LIMIT_POST_ONLY",
+        reduce_only=False,
+        client_order_id="jev1_fake",
+        symbol="BTCUSDT",
+        risk_pct=0.005,
+        order_side="BUY",
+        limit_price=100.0,
+    )
+    execution = ExecutionResult(
+        status="accepted",
+        venue="binance_testnet",
+        client_order_id="jev1_fake",
+        reduce_only=False,
+        detail={"http_status": 200, "body": {"status": "NEW", "executedQty": "0", "orderId": 1}},
+    )
+    ledger.record(
+        CycleResult(
+            action="buy_long",
+            skip_reason=None,
+            intent=intent,
+            execution=execution,
+            judgment=None,
+            state_text="",
+            state={"symbol": "BTCUSDT", "price": {"close": 100.0}},
+        )
+    )
+    pos = ledger.load_position("BTCUSDT")
+    assert pos.side == "FLAT"
+    assert ledger.book()["fills"] == []
 
 
 def test_cli_trades_shows_position_after_paper_buy(

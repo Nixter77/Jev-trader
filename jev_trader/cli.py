@@ -201,9 +201,16 @@ def _make_live_runner(args: argparse.Namespace, settings, ledger: Ledger, broker
     follow_jev = bool(getattr(args, "follow_jev", False))
     wallet_box: dict = {}
     fetch = getattr(broker, "fetch_wallet", None)
+    cancel_all = getattr(broker, "cancel_all_open_orders", None)
     if callable(fetch):
         try:
-            wallet_box["wallet"] = fetch()
+            if callable(cancel_all):
+                cancel_all()
+            wallet = fetch(ttl=0)
+            wallet_box["wallet"] = wallet
+            if wallet.get("equity_usdt"):
+                wallet_box["start_equity_usdt"] = float(wallet["equity_usdt"])
+            ledger.sync_exchange_positions(wallet)
         except Exception as exc:  # noqa: BLE001
             wallet_box["wallet_error"] = f"{type(exc).__name__}: {exc}"
     run_cycle = make_run_cycle(
@@ -467,6 +474,77 @@ def cmd_trades(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_flatten(args: argparse.Namespace) -> int:
+    """Cancel open orders and MARKET-close every Binance position."""
+    settings = load_settings(args.env, allow_production=args.venue == "live")
+    missing = _require_binance_keys(settings, args.venue)
+    if missing:
+        print(json.dumps({"ok": False, "error": missing}))
+        return 2
+    if args.venue == "paper":
+        print(json.dumps({"ok": False, "error": "flatten is for --venue testnet or live"}))
+        return 2
+    ledger = Ledger(_ledger_path(args))
+    pid_path = _sidecar(ledger, "bot.pid", getattr(args, "pid", None))
+    existing = other_bot_running(pid_path)
+    if existing is not None and not args.force:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "bot is still running; Ctrl+C it first, or pass --force",
+                    "pid": existing,
+                }
+            )
+        )
+        return 2
+    if args.venue == "live":
+        print(
+            json.dumps(
+                {
+                    "warning": "flatten sends SIGNED MARKET closes to Binance production",
+                    "confirm": LIVE_CONFIRM_VALUE,
+                    "base": settings.binance_fapi_base,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    broker = _make_broker(args, settings)
+    flatten = getattr(broker, "flatten_all", None)
+    if not callable(flatten):
+        print(json.dumps({"ok": False, "error": "broker cannot flatten"}))
+        return 1
+    try:
+        result = flatten()
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
+        return 1
+    wallet = result.get("wallet") if isinstance(result, dict) else None
+    if isinstance(wallet, dict):
+        ledger.sync_exchange_positions(wallet)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "venue": args.venue,
+                "closes": None if not isinstance(result, dict) else result.get("closes"),
+                "wallet": None
+                if not isinstance(wallet, dict)
+                else {
+                    "equity_usdt": wallet.get("equity_usdt"),
+                    "available_usdt": wallet.get("available_usdt"),
+                    "open_positions": wallet.get("open_positions"),
+                    "positions": wallet.get("positions"),
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def cmd_binance_ping(args: argparse.Namespace) -> int:
     settings = load_settings(args.env)
     try:
@@ -501,6 +579,7 @@ def build_parser() -> argparse.ArgumentParser:
             "flag (--snapshot, --env, --ledger, --symbol) into a new command.\n"
             "\n"
             "  python -m jev_trader run --venue testnet --env .env --no-telegram\n"
+            "  python -m jev_trader flatten --venue testnet --env .env\n"
             "  python -m jev_trader run --venue paper --env .env --ledger data/ledger.sqlite --no-telegram\n"
             "  python -m jev_trader monitor --ledger data/ledger-testnet.sqlite\n"
             "  python -m jev_trader trades --ledger data/ledger.sqlite\n"
@@ -613,7 +692,7 @@ def build_parser() -> argparse.ArgumentParser:
             dest="follow_jev",
             action="store_true",
             default=follow_jev,
-            help="Trade Jev buy/sell/close without probability gates (size/stop still in code)",
+            help="Trade Jev buy/close without false-break/strength gates (buy still needs should_trade_now 0.50)",
         )
         p.add_argument(
             "--strict-gates",
@@ -665,6 +744,21 @@ def build_parser() -> argparse.ArgumentParser:
     book.add_argument("--ledger", default="data/ledger.sqlite")
     book.add_argument("--limit", type=int, default=20)
     book.set_defaults(func=cmd_trades)
+
+    flat = sub.add_parser(
+        "flatten",
+        help="Cancel open orders and MARKET-close all Binance positions (testnet/live)",
+    )
+    flat.add_argument("--env", default=".env")
+    flat.add_argument("--ledger", default="data/ledger.sqlite")
+    flat.add_argument("--venue", choices=("testnet", "live"), default="testnet")
+    flat.add_argument("--pid", default=None)
+    flat.add_argument(
+        "--force",
+        action="store_true",
+        help="Flatten even if the bot PID file still looks alive",
+    )
+    flat.set_defaults(func=cmd_flatten)
     return parser
 
 

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from jev_trader.execution import fill_price, fill_qty, is_real_fill
 from jev_trader.models import CycleResult, ExecutionResult, JevJudgment, Position, TradeIntent
 
 
@@ -90,11 +91,20 @@ class Ledger:
                     cash_usdt REAL NOT NULL,
                     realized_pnl_usdt REAL NOT NULL DEFAULT 0,
                     last_mark REAL,
-                    updated_ts TEXT NOT NULL
+                    updated_ts TEXT NOT NULL,
+                    stop_price REAL
                 )
                 """
             )
+            self._ensure_column(conn, "positions", "stop_price", "REAL")
             conn.commit()
+
+    def _ensure_column(
+        self, conn: sqlite3.Connection, table: str, column: str, decl: str
+    ) -> None:
+        cols = [str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")]
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def record(self, result: CycleResult) -> None:
         intent = result.intent
@@ -147,8 +157,8 @@ class Ledger:
             if (
                 intent is not None
                 and execution is not None
-                and execution.status in {"paper_recorded", "accepted"}
-                and intent.qty > 0
+                and is_real_fill(execution)
+                and fill_qty(execution, intent.qty) > 0
                 and result.action in {"buy_long", "sell_short", "close"}
             ):
                 self._apply_fill(conn, result, mark)
@@ -168,12 +178,14 @@ class Ledger:
         cash_usdt: float,
         realized_pnl_usdt: float,
         last_mark: float | None,
+        stop_price: float | None = None,
     ) -> None:
         conn.execute(
             """
             INSERT INTO positions (
-                symbol, side, size, entry, cash_usdt, realized_pnl_usdt, last_mark, updated_ts
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                symbol, side, size, entry, cash_usdt, realized_pnl_usdt, last_mark, updated_ts,
+                stop_price
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 side = excluded.side,
                 size = excluded.size,
@@ -181,7 +193,8 @@ class Ledger:
                 cash_usdt = excluded.cash_usdt,
                 realized_pnl_usdt = excluded.realized_pnl_usdt,
                 last_mark = excluded.last_mark,
-                updated_ts = excluded.updated_ts
+                updated_ts = excluded.updated_ts,
+                stop_price = excluded.stop_price
             """,
             (
                 symbol,
@@ -192,6 +205,7 @@ class Ledger:
                 realized_pnl_usdt,
                 last_mark,
                 _now(),
+                stop_price,
             ),
         )
 
@@ -227,8 +241,9 @@ class Ledger:
         if intent is None or execution is None:
             return
         symbol = intent.symbol
-        price = _fill_price(result, mark)
-        if price is None:
+        qty = fill_qty(execution, float(intent.qty))
+        price = fill_price(execution, _fill_price(result, mark))
+        if price is None or qty <= 0:
             return
         row = self._row_position(conn, symbol)
         side = str(row["side"]) if row else "FLAT"
@@ -236,21 +251,29 @@ class Ledger:
         entry = float(row["entry"]) if row and row["entry"] is not None else None
         cash = float(row["cash_usdt"]) if row else 10_000.0
         realized_total = float(row["realized_pnl_usdt"]) if row else 0.0
+        stop_price = None
+        if row is not None:
+            try:
+                raw_stop = row["stop_price"]
+            except (KeyError, IndexError):
+                raw_stop = None
+            stop_price = None if raw_stop is None else float(raw_stop)
         pnl: float | None = None
         pos_side = side
         if result.action == "buy_long":
             pos_side = "LONG"
-            size = float(intent.qty)
+            size = qty
             entry = price
             side = "LONG"
+            stop_price = intent.stop_price
         elif result.action == "sell_short":
             pos_side = "SHORT"
-            size = float(intent.qty)
+            size = qty
             entry = price
             side = "SHORT"
+            stop_price = None
         elif result.action == "close":
             pos_side = side if side != "FLAT" else "LONG"
-            qty = float(intent.qty)
             if entry is not None and side != "FLAT":
                 pnl = _realized_pnl(side, entry, price, qty)
                 cash = cash + pnl
@@ -258,6 +281,7 @@ class Ledger:
             side = "FLAT"
             size = 0.0
             entry = None
+            stop_price = None
         else:
             return
         conn.execute(
@@ -273,7 +297,7 @@ class Ledger:
                 symbol,
                 result.action,
                 pos_side,
-                float(intent.qty),
+                qty,
                 price,
                 execution.venue,
                 pnl,
@@ -289,6 +313,7 @@ class Ledger:
             cash_usdt=cash,
             realized_pnl_usdt=realized_total,
             last_mark=price,
+            stop_price=stop_price,
         )
 
     def count_open_positions(self) -> int:
@@ -320,13 +345,76 @@ class Ledger:
             upnl_pct = (float(mark) - float(entry)) / float(entry) * 100.0
             if side == "SHORT":
                 upnl_pct = -upnl_pct
+        stop_raw = None
+        try:
+            stop_raw = row["stop_price"]
+        except (KeyError, IndexError):
+            stop_raw = None
         return Position(
             side=side,  # type: ignore[arg-type]
             size=float(row["size"] or 0.0),
             cash_usdt=float(row["cash_usdt"] if row["cash_usdt"] is not None else default_cash),
             entry=None if entry is None else float(entry),
             upnl_pct=upnl_pct,
+            stop_price=None if stop_raw is None else float(stop_raw),
         )
+
+    def sync_exchange_positions(self, wallet: dict[str, Any]) -> None:
+        """Overwrite local side/size/entry from Binance wallet. Do not invent fills."""
+        cash = float(wallet.get("equity_usdt") or 10_000.0)
+        seen: set[str] = set()
+        with self._connect() as conn:
+            for raw in wallet.get("positions") or []:
+                if not isinstance(raw, dict):
+                    continue
+                symbol = str(raw.get("symbol") or "").upper()
+                size = float(raw.get("size") or 0.0)
+                side = str(raw.get("side") or "FLAT")
+                if not symbol or size <= 0 or side not in {"LONG", "SHORT"}:
+                    continue
+                seen.add(symbol)
+                row = self._row_position(conn, symbol)
+                realized = float(row["realized_pnl_usdt"]) if row else 0.0
+                stop_price = None
+                if row is not None and side == "LONG":
+                    try:
+                        stop_raw = row["stop_price"]
+                    except (KeyError, IndexError):
+                        stop_raw = None
+                    stop_price = None if stop_raw is None else float(stop_raw)
+                mark = raw.get("entry")
+                self._upsert_position(
+                    conn,
+                    symbol=symbol,
+                    side=side,
+                    size=size,
+                    entry=None if not raw.get("entry") else float(raw["entry"]),
+                    cash_usdt=cash,
+                    realized_pnl_usdt=realized,
+                    last_mark=None if mark is None else float(mark),
+                    stop_price=stop_price,
+                )
+            rows = conn.execute(
+                "SELECT symbol, side, size FROM positions WHERE side != 'FLAT' AND size > 0"
+            ).fetchall()
+            for row in rows:
+                symbol = str(row["symbol"]).upper()
+                if symbol in seen:
+                    continue
+                existing = self._row_position(conn, symbol)
+                realized = float(existing["realized_pnl_usdt"]) if existing else 0.0
+                self._upsert_position(
+                    conn,
+                    symbol=symbol,
+                    side="FLAT",
+                    size=0.0,
+                    entry=None,
+                    cash_usdt=cash,
+                    realized_pnl_usdt=realized,
+                    last_mark=None if existing is None else existing["last_mark"],
+                    stop_price=None,
+                )
+            conn.commit()
 
     def book(self, *, limit: int = 20) -> dict[str, Any]:
         with self._connect() as conn:

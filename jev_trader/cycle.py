@@ -3,7 +3,13 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from jev_trader.execution import BinanceFuturesBroker, BinanceTestnetBroker, PaperBroker
+from jev_trader.execution import (
+    BinanceFuturesBroker,
+    BinanceTestnetBroker,
+    PaperBroker,
+    fill_qty,
+    is_real_fill,
+)
 from jev_trader.features import compute_features
 from jev_trader.jev import JevClient, judgment_from_dict
 from jev_trader.ledger import Ledger
@@ -113,6 +119,24 @@ def run_once(
     intent = apply_risk(policy, features, snapshot, acct)
     exec_broker = broker or PaperBroker()
     execution = exec_broker.submit(intent)
+    if (
+        is_real_fill(execution)
+        and intent.action == "buy_long"
+        and intent.stop_price
+        and fill_qty(execution, intent.qty) > 0
+    ):
+        place_stop = getattr(exec_broker, "place_stop_market", None)
+        if callable(place_stop):
+            try:
+                stop_res = place_stop(
+                    intent.symbol,
+                    stop_price=float(intent.stop_price),
+                    order_side="SELL",
+                )
+                if isinstance(execution.detail, dict):
+                    execution.detail["stop"] = stop_res
+            except Exception:  # noqa: BLE001 — fill already happened; stop is extra
+                pass
 
     action = intent.action if intent.skip_reason is None else "hold"
     skip_reason = intent.skip_reason
@@ -122,6 +146,11 @@ def run_once(
     elif not policy.passed:
         action = "hold"
         skip_reason = policy.skip_reason
+    if execution.status == "unfilled":
+        action = "hold"
+        skip_reason = skip_reason or "unfilled"
+    elif execution.status == "working":
+        skip_reason = skip_reason or "working"
 
     result = CycleResult(
         action=action,
