@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jevtrader.run</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/nikolay/gemini_projekts/Jev-trader</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/nikolay/gemini_projekts/Jev-trader/.venv/bin/python</string>
+    <string>-m</string>
+    <string>jev_trader</string>
+    <string>run</string>
+    <string>--venue</string>
+    <string>paper</string>
+    <string>--env</string>
+    <string>.env</string>
+    <string>--ledger</string>
+    <string>data/ledger.sqlite</string>
+    <string>--no-telegram</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/nikolay/gemini_projekts/Jev-trader/data/bot.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/nikolay/gemini_projekts/Jev-trader/data/bot.stderr.log</string>
+</dict>
+</plist>

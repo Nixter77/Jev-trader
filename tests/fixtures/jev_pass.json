@@ -1,0 +1,8 @@
+{
+  "action": "buy_long",
+  "trend_aligned": 0.81,
+  "false_break_risk": 0.22,
+  "signal_strength": "рабочий",
+  "should_trade_now": 0.84,
+  "model": "jev-1.13.0"
+}

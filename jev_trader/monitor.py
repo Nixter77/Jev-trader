@@ -1,0 +1,474 @@
+"""Local trade blotter: open positions, fills, Jev decisions, bot heartbeat."""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+from jev_trader.ledger import Ledger
+from jev_trader.status import pid_alive, read_json, read_pid, seconds_to_next_5m
+
+STARTING_CASH_USDT = 10_000.0
+STALE_AFTER_SEC = 90.0
+
+
+def _parse_ts(raw: Any) -> datetime | None:
+    if not raw or not isinstance(raw, str):
+        return None
+    text = raw.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def bot_view(status: dict[str, Any] | None, *, pid_path: str | Path | None = None) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    pid = None if status is None else status.get("pid")
+    if pid is None:
+        pid = read_pid(pid_path)
+    alive_pid = pid_alive(pid if isinstance(pid, int) else None)
+    ts = None if status is None else _parse_ts(status.get("ts"))
+    age = None if ts is None else (now - ts).total_seconds()
+    stale = age is not None and age > STALE_AFTER_SEC
+    running = bool(status) and alive_pid and not stale
+    if running:
+        state = "running"
+    elif status and not alive_pid:
+        state = "stopped"
+    elif status and stale:
+        state = "stale"
+    else:
+        state = "idle"
+    watch = [] if status is None else list(status.get("watch") or [])
+    return {
+        "state": state,
+        "running": running,
+        "pid": pid,
+        "ts": None if status is None else status.get("ts"),
+        "age_sec": None if age is None else round(age, 1),
+        "venue": None if status is None else status.get("venue"),
+        "follow_jev": None if status is None else status.get("follow_jev"),
+        "cycles": 0 if status is None else status.get("cycles") or 0,
+        "watch": watch,
+        "universe": None if status is None else status.get("universe"),
+        "seconds_to_next_5m": seconds_to_next_5m(),
+        "last_error": None if status is None else status.get("last_error"),
+        "hint": None if status is None else status.get("hint"),
+    }
+
+
+def dashboard_state(
+    ledger: Ledger,
+    *,
+    status_path: str | Path | None = None,
+    pid_path: str | Path | None = None,
+    limit: int = 40,
+) -> dict[str, Any]:
+    book = ledger.book(limit=limit)
+    status = read_json(status_path)
+    bot = bot_view(status, pid_path=pid_path)
+    positions = list(book.get("positions") or [])
+    open_positions = [
+        row
+        for row in positions
+        if str(row.get("side") or "FLAT") != "FLAT" and float(row.get("size") or 0.0) > 0
+    ]
+    realized = float(book.get("realized_pnl_usdt") or 0.0)
+    unrealized = float(book.get("unrealized_pnl_usdt") or 0.0)
+    wallet = None if status is None else status.get("wallet")
+    starting = STARTING_CASH_USDT
+    equity = STARTING_CASH_USDT + realized + unrealized
+    if isinstance(wallet, dict) and wallet.get("equity_usdt") is not None:
+        starting = float(wallet["equity_usdt"])
+        equity = float(wallet["equity_usdt"])
+        w_unreal = sum(float(p.get("unrealized_pnl_usdt") or 0.0) for p in wallet.get("positions") or [])
+        if w_unreal:
+            unrealized = w_unreal
+        w_pos = [
+            {
+                "symbol": p.get("symbol"),
+                "side": p.get("side"),
+                "size": p.get("size"),
+                "entry": p.get("entry"),
+                "last_mark": None,
+                "unrealized_pnl_usdt": p.get("unrealized_pnl_usdt"),
+            }
+            for p in wallet.get("positions") or []
+            if p.get("side") != "FLAT" and float(p.get("size") or 0.0) > 0
+        ]
+        if w_pos:
+            open_positions = w_pos
+    return {
+        "ok": True,
+        "ledger": str(ledger.path),
+        "bot": bot,
+        "starting_cash_usdt": starting,
+        "realized_pnl_usdt": realized,
+        "unrealized_pnl_usdt": unrealized,
+        "equity_usdt": equity,
+        "wallet": wallet,
+        "open_count": len(open_positions),
+        "open_positions": open_positions,
+        "positions": positions,
+        "fills": book.get("fills") or [],
+        "recent_decisions": book.get("recent_decisions") or [],
+        "status_decisions": list((status or {}).get("last_decisions") or []),
+    }
+
+
+def render_html(state: dict[str, Any] | None = None) -> str:
+    initial = json.dumps(state or {}, ensure_ascii=False, default=str).replace("<", "\\u003c")
+    return MONITOR_HTML.replace("__INITIAL_STATE__", initial)
+
+
+class MonitorHandler(BaseHTTPRequestHandler):
+    ledger: Ledger
+    status_path: Path
+    pid_path: Path
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
+        return
+
+    def _send(self, code: int, body: bytes, content_type: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        path = urlparse(self.path).path
+        if path in {"/", "/index.html", "/monitor"}:
+            state = dashboard_state(self.ledger, status_path=self.status_path, pid_path=self.pid_path)
+            html = render_html(state).encode("utf-8")
+            self._send(200, html, "text/html; charset=utf-8")
+            return
+        if path in {"/api/state", "/api/book"}:
+            state = dashboard_state(self.ledger, status_path=self.status_path, pid_path=self.pid_path)
+            body = json.dumps(state, ensure_ascii=False, default=str).encode("utf-8")
+            self._send(200, body, "application/json; charset=utf-8")
+            return
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+        self._send(404, b'{"ok":false,"error":"not found"}', "application/json; charset=utf-8")
+
+
+def make_handler(ledger: Ledger, status_path: str | Path, pid_path: str | Path):
+    class BoundHandler(MonitorHandler):
+        pass
+
+    BoundHandler.ledger = ledger
+    BoundHandler.status_path = Path(status_path)
+    BoundHandler.pid_path = Path(pid_path)
+    return BoundHandler
+
+
+class ReuseThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def bind_monitor(
+    ledger: Ledger,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8787,
+    status_path: str | Path = "data/bot-status.json",
+    pid_path: str | Path = "data/bot.pid",
+) -> ThreadingHTTPServer:
+    handler = make_handler(ledger, status_path, pid_path)
+    return ReuseThreadingHTTPServer((host, port), handler)
+
+
+def serve_monitor(
+    ledger: Ledger,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8787,
+    status_path: str | Path = "data/bot-status.json",
+    pid_path: str | Path = "data/bot.pid",
+) -> ThreadingHTTPServer:
+    server = bind_monitor(
+        ledger, host=host, port=port, status_path=status_path, pid_path=pid_path
+    )
+    server.serve_forever()
+    return server
+
+
+MONITOR_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Jev desk — монитор сделок</title>
+  <style>
+    :root {
+      --ink: #102033;
+      --panel: #173049;
+      --rule: #3d5470;
+      --blotter: #e8dcc0;
+      --ticket: #f4ecd8;
+      --copper: #c47a3a;
+      --profit: #1f7a6c;
+      --loss: #a33b32;
+      --mute: #8aa0b5;
+      --hold: #7a6a4a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--ink); color: var(--blotter); }
+    body {
+      font-family: "Iowan Old Style", Palatino, "Palatino Linotype", "Times New Roman", serif;
+      min-height: 100vh;
+    }
+    .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 22px 64px; }
+    header.mast {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 16px;
+      border-bottom: 1px solid var(--rule);
+      padding-bottom: 18px;
+      margin-bottom: 22px;
+    }
+    .house { letter-spacing: 0.22em; font-size: 13px; color: var(--copper); text-transform: uppercase; }
+    h1 { margin: 4px 0 0; font-size: 34px; font-weight: 600; letter-spacing: 0.02em; }
+    .sub { margin-top: 6px; color: var(--mute); font-size: 15px; }
+    .clock {
+      min-width: 220px;
+      text-align: right;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+    .state {
+      display: inline-block;
+      border: 1px solid var(--copper);
+      color: var(--copper);
+      padding: 2px 8px;
+      font-size: 12px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+    .state.on { border-color: var(--profit); color: #8fd1c6; }
+    .state.off { border-color: var(--loss); color: #e7a39d; }
+    .bar {
+      margin-top: 10px;
+      height: 8px;
+      background: #0a1826;
+      border: 1px solid var(--rule);
+      position: relative;
+    }
+    .bar > i {
+      display: block;
+      height: 100%;
+      background: var(--copper);
+      width: 0%;
+    }
+    .eta { margin-top: 6px; font-size: 12px; color: var(--mute); }
+    .kpis {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin-bottom: 22px;
+    }
+    .kpi {
+      background: var(--panel);
+      padding: 14px 16px;
+      border-left: 3px solid var(--copper);
+    }
+    .kpi label {
+      display: block;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--mute);
+    }
+    .kpi b {
+      display: block;
+      margin-top: 6px;
+      font-size: 26px;
+      font-weight: 600;
+    }
+    .up { color: #8fd1c6; }
+    .down { color: #e7a39d; }
+    h2 {
+      font-size: 18px;
+      font-weight: 600;
+      margin: 28px 0 10px;
+      letter-spacing: 0.04em;
+    }
+    .tickets { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+    .ticket {
+      background: var(--ticket);
+      color: #1b140c;
+      padding: 14px 14px 14px 22px;
+      position: relative;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 13px;
+    }
+    .ticket::before {
+      content: "";
+      position: absolute;
+      left: 0; top: 0; bottom: 0; width: 10px;
+      background:
+        radial-gradient(circle at 5px 10px, var(--ink) 3px, transparent 3.5px) 0 0 / 10px 16px;
+    }
+    .ticket .sym { font-size: 18px; font-weight: 700; }
+    .ticket .side { float: right; letter-spacing: 0.12em; }
+    .empty {
+      color: var(--mute);
+      border: 1px dashed var(--rule);
+      padding: 16px;
+      font-size: 15px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12.5px;
+    }
+    th {
+      text-align: left;
+      color: var(--mute);
+      font-weight: 500;
+      border-bottom: 1px solid var(--rule);
+      padding: 8px 6px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-size: 11px;
+    }
+    td { padding: 8px 6px; border-bottom: 1px solid #1c334a; vertical-align: top; }
+    .tag { letter-spacing: 0.06em; }
+    .tag.hold { color: #d7c394; }
+    .tag.buy_long, .tag.close { color: #8fd1c6; }
+    .tag.sell_short { color: #e7a39d; }
+    footer {
+      margin-top: 36px;
+      color: var(--mute);
+      font-size: 13px;
+      border-top: 1px solid var(--rule);
+      padding-top: 12px;
+    }
+    .watch { color: var(--blotter); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+    @media (max-width: 800px) {
+      .kpis { grid-template-columns: 1fr 1fr; }
+      header.mast { grid-template-columns: 1fr; }
+      .clock { text-align: left; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="mast">
+      <div>
+        <div class="house">Jev desk · Binance USD-M</div>
+        <h1>Монитор сделок</h1>
+        <div class="sub" id="sub">Jev решает вход, удержание и выход. Размер и стоп считает код.</div>
+      </div>
+      <div class="clock">
+        <div id="state" class="state">…</div>
+        <div class="bar" title="до закрытия 5m"><i id="wick"></i></div>
+        <div class="eta" id="eta">следующий бар</div>
+      </div>
+    </header>
+    <section class="kpis" id="kpis"></section>
+    <h2>Открытые позиции</h2>
+    <div id="positions"></div>
+    <h2>Исполнения</h2>
+    <div id="fills"></div>
+    <h2>Решения Jev</h2>
+    <div id="decisions"></div>
+    <footer>
+      Обновление каждые 3 секунды · журнал <span id="ledger"></span><br>
+      Список, который сейчас судит Jev: <span class="watch" id="watch"></span>
+    </footer>
+  </div>
+  <script>
+    const initial = __INITIAL_STATE__;
+    const fmt = (n, d=2) => (n === null || n === undefined || n === "") ? "—" : Number(n).toLocaleString("ru-RU", {minimumFractionDigits:d, maximumFractionDigits:d});
+    const money = (n) => fmt(n, 2) + " USDT";
+    const clsPnl = (n) => Number(n) > 0 ? "up" : Number(n) < 0 ? "down" : "";
+    const tag = (a) => `<span class="tag ${a||""}">${a||"—"}</span>`;
+    function rows(headers, body) {
+      if (!body) return '<div class="empty">пока пусто</div>';
+      return `<table><thead><tr>${headers.map(h=>`<th>${h}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table>`;
+    }
+    function render(s) {
+      const bot = s.bot || {};
+      const st = document.getElementById("state");
+      st.textContent = bot.running ? "работает" : (bot.state === "stale" ? "нет пульса" : "остановлен");
+      st.className = "state " + (bot.running ? "on" : "off");
+      const left = Number(bot.seconds_to_next_5m || 0);
+      const pct = Math.max(0, Math.min(100, 100 - (left / 300) * 100));
+      document.getElementById("wick").style.width = pct + "%";
+      document.getElementById("eta").textContent = "до закрытия 5m · " + Math.floor(left/60) + ":" + String(Math.floor(left%60)).padStart(2,"0")
+        + " · циклов " + (bot.cycles||0)
+        + " · " + (bot.venue||"paper")
+        + (bot.follow_jev ? " · по решению Jev" : " · с порогами")
+        + (s.wallet && s.wallet.equity_usdt != null ? " · Binance " + fmt(s.wallet.equity_usdt,2) + " USDT" : "");
+      document.getElementById("kpis").innerHTML = [
+        ["Капитал", money(s.equity_usdt), ""],
+        ["Реал. PnL", money(s.realized_pnl_usdt), clsPnl(s.realized_pnl_usdt)],
+        ["Нереал. PnL", money(s.unrealized_pnl_usdt), clsPnl(s.unrealized_pnl_usdt)],
+        ["Открыто", String(s.open_count||0), ""]
+      ].map(([k,v,c]) => `<div class="kpi"><label>${k}</label><b class="${c}">${v}</b></div>`).join("");
+      const opens = s.open_positions || [];
+      document.getElementById("positions").innerHTML = opens.length ? `<div class="tickets">${opens.map(p => `
+        <div class="ticket">
+          <div><span class="sym">${p.symbol}</span><span class="side">${p.side}</span></div>
+          <div>qty ${fmt(p.size,4)}</div>
+          <div>вход ${fmt(p.entry,4)} · mark ${fmt(p.last_mark,4)}</div>
+          <div class="${clsPnl(p.unrealized_pnl_usdt)}">uPnL ${fmt(p.unrealized_pnl_usdt,2)}</div>
+        </div>`).join("")}</div>` : '<div class="empty">Позиций нет. Jev пока держит. Следующий вопрос — на закрытии 5-минутной свечи.</div>';
+      const fills = s.fills || [];
+      document.getElementById("fills").innerHTML = fills.length ? rows(
+        ["время","пара","действие","qty","цена","PnL","площадка"],
+        fills.map(f => `<tr>
+          <td>${(f.ts||"").replace("T"," ").slice(0,19)}</td>
+          <td>${f.symbol||""}</td>
+          <td>${tag(f.action)}</td>
+          <td>${fmt(f.qty,4)}</td>
+          <td>${fmt(f.price,4)}</td>
+          <td class="${clsPnl(f.realized_pnl_usdt)}">${f.realized_pnl_usdt==null?"—":fmt(f.realized_pnl_usdt,2)}</td>
+          <td>${f.venue||""}</td>
+        </tr>`).join("")
+      ) : '<div class="empty">Исполнений ещё не было — вход только buy_long (BUY). SELL бывает, когда закрываем лонг.</div>';
+      const dec = (s.recent_decisions && s.recent_decisions.length) ? s.recent_decisions : (s.status_decisions||[]);
+      document.getElementById("decisions").innerHTML = dec.length ? rows(
+        ["время","пара","Jev","бот","почему нет","should","qty"],
+        dec.map(d => `<tr>
+          <td>${(d.ts||"").replace("T"," ").slice(0,19)}</td>
+          <td>${d.symbol||""}</td>
+          <td>${tag(d.judgment_action || d.jev_action)}</td>
+          <td>${tag(d.action)}</td>
+          <td>${d.skip_reason||"—"}</td>
+          <td>${d.should_trade_now==null?"—":fmt(d.should_trade_now,2)}</td>
+          <td>${d.qty==null?"—":fmt(d.qty,4)}</td>
+        </tr>`).join("")
+      ) : '<div class="empty">Решений пока нет. Бот спрашивает Jev на каждом закрытии 5m по ликвидным USDT-парам.</div>';
+      document.getElementById("ledger").textContent = s.ledger || "";
+      document.getElementById("watch").textContent = (bot.watch||[]).join("  ") || "—";
+    }
+    render(initial);
+    async function tick() {
+      try {
+        const r = await fetch("/api/state", {cache:"no-store"});
+        if (!r.ok) return;
+        render(await r.json());
+      } catch (e) {}
+    }
+    setInterval(tick, 3000);
+  </script>
+</body>
+</html>
+"""
