@@ -6,7 +6,8 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import pytest
 
@@ -15,6 +16,7 @@ from jev_trader.execution import PaperBroker
 from jev_trader.jev import judgment_from_dict
 from jev_trader.ledger import Ledger
 from jev_trader.live import LiveRunner, make_run_cycle
+from jev_trader.flatten import flatten_open_positions
 from jev_trader.monitor import bind_monitor, dashboard_state, render_html
 from jev_trader.status import read_json, write_json
 
@@ -60,6 +62,7 @@ def test_dashboard_state_shows_fill_and_open_position(
     html = render_html(state)
     assert "Монитор сделок" in html
     assert "BTCUSDT" in html
+    assert "Закрыть все" in html
 
 
 def test_dashboard_uses_binance_wallet_equity(tmp_path: Path) -> None:
@@ -174,6 +177,109 @@ def test_monitor_http_serves_blotter(tmp_path: Path, market_snapshot, passing_an
             html = resp.read().decode("utf-8")
         assert "Монитор сделок" in html
         assert "BTCUSDT" in html
+        assert "Закрыть все" in html
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _start_monitor(ledger: Ledger, tmp_path: Path, flatten_fn=None):
+    server = bind_monitor(
+        ledger,
+        host="127.0.0.1",
+        port=0,
+        status_path=tmp_path / "bot-status.json",
+        pid_path=tmp_path / "bot.pid",
+        flatten_fn=flatten_fn,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+def test_flatten_post_requires_confirm(
+    tmp_path: Path, market_snapshot, passing_answers
+) -> None:
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    run_once_from_answers(
+        market_snapshot, passing_answers, broker=PaperBroker(), ledger=ledger
+    )
+    server = _start_monitor(ledger, tmp_path, flatten_fn=lambda: flatten_open_positions(PaperBroker(), ledger))
+    try:
+        port = server.server_address[1]
+        req = Request(
+            f"http://127.0.0.1:{port}/api/flatten",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urlopen(req, timeout=5)
+            raise AssertionError("expected HTTPError")
+        except HTTPError as exc:
+            assert exc.code == 400
+            payload = json.loads(exc.read().decode("utf-8"))
+            assert payload["error"] == "confirm_required"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_flatten_post_closes_paper_position(
+    tmp_path: Path, market_snapshot, passing_answers
+) -> None:
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    run_once_from_answers(
+        market_snapshot, passing_answers, broker=PaperBroker(), ledger=ledger
+    )
+    assert ledger.count_open_positions() == 1
+    server = _start_monitor(
+        ledger,
+        tmp_path,
+        flatten_fn=lambda: flatten_open_positions(PaperBroker(), ledger),
+    )
+    try:
+        port = server.server_address[1]
+        with urlopen(f"http://127.0.0.1:{port}/api/state", timeout=5) as resp:
+            before = json.loads(resp.read().decode("utf-8"))
+        assert before["open_count"] == 1
+        assert before["can_flatten"] is True
+        req = Request(
+            f"http://127.0.0.1:{port}/api/flatten",
+            data=json.dumps({"confirm": True}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        assert payload["ok"] is True
+        assert payload["open_count"] == 0
+        assert payload["state"]["open_count"] == 0
+        assert ledger.count_open_positions() == 0
+        assert ledger.load_position("BTCUSDT").side == "FLAT"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_flatten_post_without_callback_is_unavailable(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    server = _start_monitor(ledger, tmp_path, flatten_fn=None)
+    try:
+        port = server.server_address[1]
+        req = Request(
+            f"http://127.0.0.1:{port}/api/flatten",
+            data=json.dumps({"confirm": True}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urlopen(req, timeout=5)
+            raise AssertionError("expected HTTPError")
+        except HTTPError as exc:
+            assert exc.code == 409
+            payload = json.loads(exc.read().decode("utf-8"))
+            assert payload["error"] == "flatten_unavailable"
     finally:
         server.shutdown()
         server.server_close()

@@ -17,6 +17,7 @@ from jev_trader.jev import JevClient, judgment_from_dict
 from jev_trader.ledger import Ledger
 from jev_trader.live import LiveRunner, load_answers, load_json, make_run_cycle
 from jev_trader.models import AccountState
+from jev_trader.flatten import run_flatten
 from jev_trader.monitor import bind_monitor, dashboard_state
 from jev_trader.public_market import (
     compact_universe_payload,
@@ -25,7 +26,7 @@ from jev_trader.public_market import (
 )
 from jev_trader.snapshot import load_snapshot
 from jev_trader.state import build_compact_state
-from jev_trader.status import clear_pid, other_bot_running, write_pid
+from jev_trader.status import clear_pid, other_bot_running, read_json, write_pid
 from jev_trader.telegram import notifier_from_settings
 
 
@@ -42,6 +43,33 @@ def _require_binance_keys(settings, venue: str) -> str | None:
     if settings.binance_api_key and settings.binance_api_secret:
         return None
     return "BINANCE_API_KEY / BINANCE_API_SECRET missing in .env"
+
+
+def _flatten_callback(broker, ledger: Ledger, status_path, runner=None):
+    def _run() -> dict:
+        return run_flatten(broker, ledger, status_path=status_path, runner=runner)
+
+    return _run
+
+
+def _flatten_callback_from_env(args: argparse.Namespace, ledger: Ledger, status_path):
+    venue = getattr(args, "venue", None)
+    if not venue:
+        status = read_json(status_path) or {}
+        venue = status.get("venue") or "paper"
+    try:
+        settings = load_settings(
+            getattr(args, "env", ".env"),
+            allow_production=venue == "live",
+        )
+        ns = argparse.Namespace(venue=venue)
+        missing = _require_binance_keys(settings, venue)
+        if missing:
+            return None
+        broker = _make_broker(ns, settings)
+    except Exception:  # noqa: BLE001
+        return None
+    return _flatten_callback(broker, ledger, status_path)
 
 
 def _make_broker(args: argparse.Namespace, settings) -> PaperBroker | BinanceTestnetBroker | BinanceFuturesBroker:
@@ -302,11 +330,19 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     ledger = Ledger(args.ledger)
     status_path = _sidecar(ledger, "bot-status.json", args.status)
     pid_path = _sidecar(ledger, "bot.pid", args.pid)
+    flatten_fn = _flatten_callback_from_env(args, ledger, status_path)
     if args.json:
-        print(json.dumps(dashboard_state(ledger, status_path=status_path, pid_path=pid_path), ensure_ascii=False, indent=2, default=str))
+        print(json.dumps(dashboard_state(ledger, status_path=status_path, pid_path=pid_path, can_flatten=flatten_fn is not None), ensure_ascii=False, indent=2, default=str))
         return 0
     host, port = args.host, int(args.port)
-    server = bind_monitor(ledger, host=host, port=port, status_path=status_path, pid_path=pid_path)
+    server = bind_monitor(
+        ledger,
+        host=host,
+        port=port,
+        status_path=status_path,
+        pid_path=pid_path,
+        flatten_fn=flatten_fn,
+    )
     bound = server.server_address[1]
     print(
         json.dumps(
@@ -365,7 +401,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             ),
             flush=True,
         )
-        server = bind_monitor(ledger, host=host, port=port, status_path=status_path, pid_path=pid_path)
+        server = bind_monitor(
+            ledger,
+            host=host,
+            port=port,
+            status_path=status_path,
+            pid_path=pid_path,
+            flatten_fn=_flatten_callback_from_env(args, ledger, status_path),
+        )
         try:
             server.serve_forever()
         except KeyboardInterrupt:
@@ -407,7 +450,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     thread = threading.Thread(target=bot_loop, name="jev-live", daemon=True)
     thread.start()
     try:
-        server = bind_monitor(ledger, host=host, port=port, status_path=status_path, pid_path=pid_path)
+        server = bind_monitor(
+            ledger,
+            host=host,
+            port=port,
+            status_path=status_path,
+            pid_path=pid_path,
+            flatten_fn=_flatten_callback(broker, ledger, status_path, runner=runner),
+        )
     except OSError as exc:
         print(
             json.dumps(
@@ -511,18 +561,16 @@ def cmd_flatten(args: argparse.Namespace) -> int:
             flush=True,
         )
     broker = _make_broker(args, settings)
-    flatten = getattr(broker, "flatten_all", None)
-    if not callable(flatten):
-        print(json.dumps({"ok": False, "error": "broker cannot flatten"}))
-        return 1
     try:
-        result = flatten()
+        result = run_flatten(
+            broker,
+            ledger,
+            status_path=_sidecar(ledger, "bot-status.json", None),
+        )
     except Exception as exc:  # noqa: BLE001
         print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
         return 1
     wallet = result.get("wallet") if isinstance(result, dict) else None
-    if isinstance(wallet, dict):
-        ledger.sync_exchange_positions(wallet)
     print(
         json.dumps(
             {
@@ -732,6 +780,8 @@ def build_parser() -> argparse.ArgumentParser:
     mon.add_argument("--ledger", default="data/ledger.sqlite")
     mon.add_argument("--status", default=None)
     mon.add_argument("--pid", default=None)
+    mon.add_argument("--env", default=".env")
+    mon.add_argument("--venue", choices=("paper", "testnet", "live"), default=None)
     mon.add_argument("--host", default="127.0.0.1")
     mon.add_argument("--port", type=int, default=8787)
     mon.add_argument("--json", action="store_true", help="Print blotter JSON once and exit")

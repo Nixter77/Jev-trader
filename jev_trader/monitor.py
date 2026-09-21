@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from collections.abc import Callable
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -71,6 +73,7 @@ def dashboard_state(
     status_path: str | Path | None = None,
     pid_path: str | Path | None = None,
     limit: int = 40,
+    can_flatten: bool = False,
 ) -> dict[str, Any]:
     book = ledger.book(limit=limit)
     status = read_json(status_path)
@@ -116,6 +119,7 @@ def dashboard_state(
         "equity_usdt": equity,
         "wallet": wallet,
         "open_count": len(open_positions),
+        "can_flatten": bool(can_flatten),
         "open_positions": open_positions,
         "positions": positions,
         "fills": book.get("fills") or [],
@@ -133,9 +137,19 @@ class MonitorHandler(BaseHTTPRequestHandler):
     ledger: Ledger
     status_path: Path
     pid_path: Path
+    flatten_fn: Callable[[], dict[str, Any]] | None = None
+    _flatten_lock = threading.Lock()
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
         return
+
+    def _state(self) -> dict[str, Any]:
+        return dashboard_state(
+            self.ledger,
+            status_path=self.status_path,
+            pid_path=self.pid_path,
+            can_flatten=callable(self.flatten_fn),
+        )
 
     def _send(self, code: int, body: bytes, content_type: str) -> None:
         self.send_response(code)
@@ -145,33 +159,100 @@ class MonitorHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_json(self, code: int, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+        self._send(code, body, "application/json; charset=utf-8")
+
+    def _read_json_body(self) -> dict[str, Any]:
+        raw_len = self.headers.get("Content-Length") or "0"
+        try:
+            length = max(0, int(raw_len))
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length else b""
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         if path in {"/", "/index.html", "/monitor"}:
-            state = dashboard_state(self.ledger, status_path=self.status_path, pid_path=self.pid_path)
-            html = render_html(state).encode("utf-8")
+            html = render_html(self._state()).encode("utf-8")
             self._send(200, html, "text/html; charset=utf-8")
             return
         if path in {"/api/state", "/api/book"}:
-            state = dashboard_state(self.ledger, status_path=self.status_path, pid_path=self.pid_path)
-            body = json.dumps(state, ensure_ascii=False, default=str).encode("utf-8")
-            self._send(200, body, "application/json; charset=utf-8")
+            self._send_json(200, self._state())
             return
         if path == "/favicon.ico":
             self.send_response(204)
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return
-        self._send(404, b'{"ok":false,"error":"not found"}', "application/json; charset=utf-8")
+        self._send_json(404, {"ok": False, "error": "not found"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        path = urlparse(self.path).path
+        if path != "/api/flatten":
+            self._send_json(404, {"ok": False, "error": "not found"})
+            return
+        payload = self._read_json_body()
+        if payload.get("confirm") is not True:
+            self._send_json(400, {"ok": False, "error": "confirm_required"})
+            return
+        flatten = self.flatten_fn
+        if not callable(flatten):
+            self._send_json(
+                409,
+                {
+                    "ok": False,
+                    "error": "flatten_unavailable",
+                    "hint": "кнопка работает, когда монитор запущен вместе с ботом (run)",
+                },
+            )
+            return
+        if not self._flatten_lock.acquire(blocking=False):
+            self._send_json(409, {"ok": False, "error": "flatten_busy"})
+            return
+        try:
+            result = flatten()
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            return
+        finally:
+            self._flatten_lock.release()
+        state = self._state()
+        self._send_json(
+            200,
+            {
+                "ok": True,
+                "closes": None if not isinstance(result, dict) else result.get("closes") or [],
+                "cancelled": None if not isinstance(result, dict) else result.get("cancelled") or [],
+                "wallet": None if not isinstance(result, dict) else result.get("wallet"),
+                "open_count": state.get("open_count"),
+                "state": state,
+            },
+        )
 
 
-def make_handler(ledger: Ledger, status_path: str | Path, pid_path: str | Path):
+def make_handler(
+    ledger: Ledger,
+    status_path: str | Path,
+    pid_path: str | Path,
+    flatten_fn: Callable[[], dict[str, Any]] | None = None,
+):
     class BoundHandler(MonitorHandler):
         pass
 
     BoundHandler.ledger = ledger
     BoundHandler.status_path = Path(status_path)
     BoundHandler.pid_path = Path(pid_path)
+    # A raw function on the class would bind `self` as the first argument.
+    BoundHandler.flatten_fn = staticmethod(flatten_fn) if flatten_fn is not None else None
+    BoundHandler._flatten_lock = threading.Lock()
     return BoundHandler
 
 
@@ -187,8 +268,9 @@ def bind_monitor(
     port: int = 8787,
     status_path: str | Path = "data/bot-status.json",
     pid_path: str | Path = "data/bot.pid",
+    flatten_fn: Callable[[], dict[str, Any]] | None = None,
 ) -> ThreadingHTTPServer:
-    handler = make_handler(ledger, status_path, pid_path)
+    handler = make_handler(ledger, status_path, pid_path, flatten_fn=flatten_fn)
     return ReuseThreadingHTTPServer((host, port), handler)
 
 
@@ -199,9 +281,15 @@ def serve_monitor(
     port: int = 8787,
     status_path: str | Path = "data/bot-status.json",
     pid_path: str | Path = "data/bot.pid",
+    flatten_fn: Callable[[], dict[str, Any]] | None = None,
 ) -> ThreadingHTTPServer:
     server = bind_monitor(
-        ledger, host=host, port=port, status_path=status_path, pid_path=pid_path
+        ledger,
+        host=host,
+        port=port,
+        status_path=status_path,
+        pid_path=pid_path,
+        flatten_fn=flatten_fn,
     )
     server.serve_forever()
     return server
@@ -307,6 +395,30 @@ MONITOR_HTML = """<!DOCTYPE html>
       margin: 28px 0 10px;
       letter-spacing: 0.04em;
     }
+    .pos-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 28px 0 10px;
+    }
+    .pos-head h2 { margin: 0; }
+    button.flatten {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      background: var(--loss);
+      color: #f4ecd8;
+      border: 0;
+      padding: 10px 14px;
+      cursor: pointer;
+    }
+    button.flatten:hover:not(:disabled) { filter: brightness(1.1); }
+    button.flatten:disabled { opacity: 0.4; cursor: not-allowed; }
+    #flatten-msg { font-size: 13px; color: var(--mute); min-height: 1.2em; margin: 0 0 8px; }
+    #flatten-msg.err { color: #e7a39d; }
+    #flatten-msg.ok { color: #8fd1c6; }
     .tickets { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
     .ticket {
       background: var(--ticket);
@@ -364,6 +476,8 @@ MONITOR_HTML = """<!DOCTYPE html>
       .kpis { grid-template-columns: 1fr 1fr; }
       header.mast { grid-template-columns: 1fr; }
       .clock { text-align: left; }
+      .pos-head { flex-wrap: wrap; }
+      button.flatten { width: 100%; }
     }
   </style>
 </head>
@@ -382,7 +496,11 @@ MONITOR_HTML = """<!DOCTYPE html>
       </div>
     </header>
     <section class="kpis" id="kpis"></section>
-    <h2>Открытые позиции</h2>
+    <div class="pos-head">
+      <h2>Открытые позиции</h2>
+      <button type="button" id="flatten" class="flatten" disabled>Закрыть все</button>
+    </div>
+    <p id="flatten-msg"></p>
     <div id="positions"></div>
     <h2>Исполнения</h2>
     <div id="fills"></div>
@@ -395,6 +513,7 @@ MONITOR_HTML = """<!DOCTYPE html>
   </div>
   <script>
     const initial = __INITIAL_STATE__;
+    let last = initial;
     const fmt = (n, d=2) => (n === null || n === undefined || n === "") ? "—" : Number(n).toLocaleString("ru-RU", {minimumFractionDigits:d, maximumFractionDigits:d});
     const money = (n) => fmt(n, 2) + " USDT";
     const clsPnl = (n) => Number(n) > 0 ? "up" : Number(n) < 0 ? "down" : "";
@@ -404,6 +523,7 @@ MONITOR_HTML = """<!DOCTYPE html>
       return `<table><thead><tr>${headers.map(h=>`<th>${h}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table>`;
     }
     function render(s) {
+      last = s;
       const bot = s.bot || {};
       const st = document.getElementById("state");
       st.textContent = bot.running ? "работает" : (bot.state === "stale" ? "нет пульса" : "остановлен");
@@ -458,6 +578,12 @@ MONITOR_HTML = """<!DOCTYPE html>
       ) : '<div class="empty">Решений пока нет. Бот спрашивает Jev на каждом закрытии 5m по ликвидным USDT-парам.</div>';
       document.getElementById("ledger").textContent = s.ledger || "";
       document.getElementById("watch").textContent = (bot.watch||[]).join("  ") || "—";
+      const flattenBtn = document.getElementById("flatten");
+      const can = !!s.can_flatten && (s.open_count||0) > 0;
+      flattenBtn.disabled = !can;
+      flattenBtn.title = s.can_flatten
+        ? "MARKET-закрытие всех позиций на бирже"
+        : "Кнопка доступна, когда монитор запущен вместе с ботом (run)";
     }
     render(initial);
     async function tick() {
@@ -467,6 +593,46 @@ MONITOR_HTML = """<!DOCTYPE html>
         render(await r.json());
       } catch (e) {}
     }
+    document.getElementById("flatten").addEventListener("click", async () => {
+      const btn = document.getElementById("flatten");
+      const msg = document.getElementById("flatten-msg");
+      const n = (last && last.open_count) || 0;
+      if (!n || !last.can_flatten) return;
+      const venue = (last.bot || {}).venue || "";
+      const question = venue === "live"
+        ? "Закрыть все позиции MARKET на Binance production? Это нельзя отменить."
+        : "Закрыть все открытые позиции рыночным ордером (MARKET)? Это нельзя отменить.";
+      if (!confirm(question)) return;
+      btn.disabled = true;
+      msg.className = "";
+      msg.textContent = "закрываю…";
+      try {
+        const r = await fetch("/api/flatten", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({confirm: true}),
+          cache: "no-store",
+        });
+        const data = await r.json();
+        if (!data.ok) {
+          msg.className = "err";
+          msg.textContent = data.hint || data.error || "не закрылось";
+          btn.disabled = false;
+          return;
+        }
+        const names = (data.closes || []).map(c => c.symbol).filter(Boolean);
+        msg.className = "ok";
+        msg.textContent = names.length
+          ? ("закрыто: " + names.join(", "))
+          : "позиций на бирже уже не было";
+        if (data.state) render(data.state);
+        else await tick();
+      } catch (e) {
+        msg.className = "err";
+        msg.textContent = "ошибка сети";
+        btn.disabled = false;
+      }
+    });
     setInterval(tick, 3000);
   </script>
 </body>

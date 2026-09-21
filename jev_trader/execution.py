@@ -647,6 +647,10 @@ class BinanceFuturesBroker:
                     "symbol": symbol,
                     "status": result.status,
                     "detail": result.detail,
+                    "qty": size,
+                    "side": side,
+                    "client_order_id": intent.client_order_id,
+                    "order_side": intent.order_side,
                 }
             )
         after = self.fetch_wallet(ttl=0)
