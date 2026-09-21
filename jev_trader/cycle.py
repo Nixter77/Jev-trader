@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import Any
 
 from jev_trader.execution import (
     BinanceFuturesBroker,
     BinanceTestnetBroker,
     PaperBroker,
+    current_flatten_generation,
     fill_qty,
     is_real_fill,
+    order_lock,
 )
 from jev_trader.features import compute_features
 from jev_trader.jev import JevClient, judgment_from_dict
@@ -21,7 +24,7 @@ from jev_trader.models import (
     TradeIntent,
 )
 from jev_trader.policy import apply_policy
-from jev_trader.risk import apply_risk
+from jev_trader.risk import apply_risk, long_protective_stop
 from jev_trader.state import build_compact_state
 from jev_trader.telegram import TelegramNotifier
 
@@ -75,6 +78,38 @@ def decision_payload(result: CycleResult) -> dict[str, Any]:
     return payload
 
 
+def arm_exchange_stop(
+    broker: Any,
+    ledger: Ledger | None,
+    symbol: str,
+    stop_price: float | None,
+    detail: dict[str, Any] | None,
+) -> None:
+    """Remember the stop and make sure the exchange has a close-all STOP_MARKET."""
+    if not symbol or stop_price is None or float(stop_price) <= 0:
+        return
+    price = float(stop_price)
+    with order_lock:
+        if ledger is not None:
+            try:
+                ledger.set_stop(symbol, price)
+            except Exception:  # noqa: BLE001 — a missing ledger row must not block the order
+                pass
+        ensure = getattr(broker, "ensure_stop_market", None)
+        if not callable(ensure):
+            return
+        try:
+            res = ensure(symbol, stop_price=price, order_side="SELL")
+        except Exception as exc:  # noqa: BLE001 — fill already happened; surface the miss
+            res = {"error": f"{type(exc).__name__}: {exc}"}
+        if not isinstance(detail, dict):
+            return
+        if isinstance(res, dict) and res.get("error"):
+            detail["stop_error"] = res["error"]
+        else:
+            detail["stop"] = res
+
+
 def run_once(
     snapshot: MarketSnapshot,
     *,
@@ -91,6 +126,17 @@ def run_once(
     """One paper/testnet decision cycle: features → state → Jev → policy → risk → exec."""
     features = compute_features(snapshot)
     compact = build_compact_state(snapshot, features)
+    exec_broker = broker or PaperBroker()
+    acct = account or AccountState(
+        equity_usdt=snapshot.position.cash_usdt,
+        daily_pnl_pct=0.0,
+        kill_switch=False,
+        open_positions=0 if snapshot.position.side == "FLAT" else 1,
+    )
+    seen_flatten = current_flatten_generation()
+    protective = long_protective_stop(snapshot, features, acct)
+    if protective is not None and protective < features.close:
+        arm_exchange_stop(exec_broker, ledger, snapshot.symbol, protective, None)
     resolved = judgment
     if resolved is None:
         client = jev_client
@@ -110,33 +156,29 @@ def run_once(
     if min_should_trade is not None:
         policy_kwargs["min_should_trade"] = min_should_trade
     policy = apply_policy(resolved, **policy_kwargs)
-    acct = account or AccountState(
-        equity_usdt=snapshot.position.cash_usdt,
-        daily_pnl_pct=0.0,
-        kill_switch=False,
-        open_positions=0 if snapshot.position.side == "FLAT" else 1,
-    )
     intent = apply_risk(policy, features, snapshot, acct)
-    exec_broker = broker or PaperBroker()
-    execution = exec_broker.submit(intent)
-    if (
-        is_real_fill(execution)
-        and intent.action == "buy_long"
-        and intent.stop_price
-        and fill_qty(execution, intent.qty) > 0
-    ):
-        place_stop = getattr(exec_broker, "place_stop_market", None)
-        if callable(place_stop):
-            try:
-                stop_res = place_stop(
-                    intent.symbol,
-                    stop_price=float(intent.stop_price),
-                    order_side="SELL",
-                )
-                if isinstance(execution.detail, dict):
-                    execution.detail["stop"] = stop_res
-            except Exception:  # noqa: BLE001 — fill already happened; stop is extra
-                pass
+    with order_lock:
+        if (
+            intent.action == "buy_long"
+            and intent.skip_reason is None
+            and current_flatten_generation() != seen_flatten
+        ):
+            intent = replace(intent, skip_reason="flatten", qty=0.0, risk_event="flatten")
+        execution = exec_broker.submit(intent)
+        if (
+            is_real_fill(execution)
+            and intent.action == "buy_long"
+            and intent.stop_price
+            and fill_qty(execution, intent.qty) > 0
+            and float(intent.stop_price) < features.close
+        ):
+            arm_exchange_stop(
+                exec_broker,
+                ledger,
+                intent.symbol,
+                float(intent.stop_price),
+                execution.detail if isinstance(execution.detail, dict) else None,
+            )
 
     action = intent.action if intent.skip_reason is None else "hold"
     skip_reason = intent.skip_reason

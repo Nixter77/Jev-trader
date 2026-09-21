@@ -18,7 +18,7 @@ from jev_trader.ledger import Ledger
 from jev_trader.live import LiveRunner, make_run_cycle
 from jev_trader.flatten import flatten_open_positions
 from jev_trader.monitor import bind_monitor, dashboard_state, render_html
-from jev_trader.status import read_json, write_json
+from jev_trader.status import read_json, resolve_day_anchor, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -63,6 +63,45 @@ def test_dashboard_state_shows_fill_and_open_position(
     assert "Монитор сделок" in html
     assert "BTCUSDT" in html
     assert "Закрыть все" in html
+    assert "стоп" in html
+    assert state["open_positions"][0]["stop_price"] is not None
+
+
+def test_wallet_row_keeps_the_ledger_stop(tmp_path: Path, market_snapshot, passing_answers) -> None:
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    run_once_from_answers(market_snapshot, passing_answers, broker=PaperBroker(), ledger=ledger)
+    stop = ledger.book()["positions"][0]["stop_price"]
+    assert stop is not None
+    status_path = tmp_path / "bot-status.json"
+    write_json(
+        status_path,
+        {
+            "ts": "2099-01-01T00:00:00+00:00",
+            "pid": os.getpid(),
+            "venue": "testnet",
+            "wallet": {
+                "equity_usdt": 2800.0,
+                "positions": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "side": "LONG",
+                        "size": 0.01,
+                        "entry": 100.0,
+                        "unrealized_pnl_usdt": -2.0,
+                    }
+                ],
+            },
+        },
+    )
+    state = dashboard_state(ledger, status_path=status_path)
+    assert state["open_positions"][0]["stop_price"] == pytest.approx(stop)
+
+
+def test_day_anchor_does_not_reset_on_restart(tmp_path: Path) -> None:
+    path = tmp_path / "risk-anchor.json"
+    assert resolve_day_anchor(path, venue="testnet", equity=3000.0, today="2026-09-21") == pytest.approx(3000.0)
+    assert resolve_day_anchor(path, venue="testnet", equity=2800.0, today="2026-09-21") == pytest.approx(3000.0)
+    assert resolve_day_anchor(path, venue="testnet", equity=2800.0, today="2026-09-22") == pytest.approx(2800.0)
 
 
 def test_dashboard_uses_binance_wallet_equity(tmp_path: Path) -> None:

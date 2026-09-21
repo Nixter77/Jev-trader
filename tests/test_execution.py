@@ -9,7 +9,9 @@ import pytest
 from jev_trader.execution import (
     BinanceTestnetBroker,
     PaperBroker,
+    client_order_id,
     format_binance_decimal,
+    gtx_inside_price,
     is_real_fill,
     parse_symbol_filters,
     parse_usdt_wallet,
@@ -162,6 +164,183 @@ def test_testnet_limit_without_price_does_not_post(monkeypatch: pytest.MonkeyPat
     assert result.status == "rejected"
     assert [c["req"].get_method() for c in captured if c["req"].get_method() == "POST"] == []
     assert "limit_price" in result.detail["error"]
+
+
+def test_client_order_id_fits_binance_limit() -> None:
+    cid = client_order_id("1000SHIBUSDT", "buy_long")
+    assert len(cid) <= 36
+    assert cid.startswith("jb1000SHIBUSDT")
+    other = client_order_id("1000SHIBUSDT", "flatten")
+    assert other != cid
+    assert len(other) <= 36
+
+
+def test_gtx_inside_price_steps_away_from_the_touch() -> None:
+    assert gtx_inside_price(100.0, "BUY", "0.1") == pytest.approx(99.9)
+    assert gtx_inside_price(100.0, "SELL", "0.1") == pytest.approx(100.1)
+
+
+def test_limit_price_is_one_tick_inside_when_filters_known(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _patch_urlopen(monkeypatch)
+
+    def fake_urlopen(req: Any, timeout: float | None = None, context: Any = None) -> _FakeResponse:
+        captured.append({"req": req, "timeout": timeout, "context": context})
+        path = urllib.parse.urlparse(req.full_url).path
+        if path.endswith("/exchangeInfo"):
+            return _FakeResponse(
+                {
+                    "symbols": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "filters": [
+                                {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+                                {"filterType": "PRICE_FILTER", "tickSize": "0.1"},
+                                {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                            ],
+                        }
+                    ]
+                }
+            )
+        if path.endswith("/openOrders"):
+            return _FakeResponse([])
+        if req.get_method() == "DELETE":
+            return _FakeResponse({"code": 200})
+        if req.get_method() == "POST":
+            return _FakeResponse({"status": "NEW", "executedQty": "0", "orderId": 7})
+        return _FakeResponse({"serverTime": 1})
+
+    monkeypatch.setattr("jev_trader.execution.urllib.request.urlopen", fake_urlopen)
+    broker = BinanceTestnetBroker("k", "s", "https://testnet.binancefuture.com")
+    result = broker.submit(_intent(limit_price=100.0, qty=0.2, entry_type="LIMIT_POST_ONLY"))
+    assert result.status == "working"
+    posts = [c["req"] for c in captured if c["req"].get_method() == "POST"]
+    params = urllib.parse.parse_qs(urllib.parse.urlparse(posts[0].full_url).query)
+    assert float(params["price"][0]) == pytest.approx(99.9)
+
+
+def test_exchange_filters_are_not_cached_after_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"n": 0}
+
+    def fake_urlopen(req: Any, timeout: float | None = None, context: Any = None) -> _FakeResponse:
+        path = urllib.parse.urlparse(req.full_url).path
+        if path.endswith("/exchangeInfo"):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _FakeResponse({"error": "down"}, status=503)
+            return _FakeResponse(
+                {
+                    "symbols": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "filters": [
+                                {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+                            ],
+                        }
+                    ]
+                }
+            )
+        return _FakeResponse({"serverTime": 1})
+
+    monkeypatch.setattr("jev_trader.execution.urllib.request.urlopen", fake_urlopen)
+    broker = BinanceTestnetBroker("k", "s", "https://testnet.binancefuture.com")
+    assert broker.filters_for("BTCUSDT") == {}
+    assert broker.filters_for("BTCUSDT")["stepSize"] == "0.001"
+    assert calls["n"] == 2
+
+
+def test_ensure_stop_posts_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _patch_urlopen(monkeypatch)
+    open_orders: list[dict[str, Any]] = []
+
+    def fake_urlopen(req: Any, timeout: float | None = None, context: Any = None) -> _FakeResponse:
+        captured.append({"req": req})
+        parsed = urllib.parse.urlparse(req.full_url)
+        params = urllib.parse.parse_qs(parsed.query)
+        if parsed.path.endswith("/openOrders") and req.get_method() == "GET":
+            return _FakeResponse(list(open_orders))
+        if parsed.path.endswith("/exchangeInfo"):
+            return _FakeResponse({"symbols": []})
+        if req.get_method() == "POST" and params.get("type") == ["STOP_MARKET"]:
+            open_orders.append(
+                {
+                    "symbol": "BTCUSDT",
+                    "type": "STOP_MARKET",
+                    "closePosition": True,
+                    "side": "SELL",
+                }
+            )
+            return _FakeResponse({"orderId": 9, "status": "NEW", "type": "STOP_MARKET"})
+        return _FakeResponse({"serverTime": 1})
+
+    monkeypatch.setattr("jev_trader.execution.urllib.request.urlopen", fake_urlopen)
+    broker = BinanceTestnetBroker("k", "s", "https://testnet.binancefuture.com")
+    first = broker.ensure_stop_market("BTCUSDT", stop_price=90_000.0)
+    second = broker.ensure_stop_market("BTCUSDT", stop_price=90_000.0)
+    posts = [
+        c["req"]
+        for c in captured
+        if c["req"].get_method() == "POST"
+        and urllib.parse.parse_qs(urllib.parse.urlparse(c["req"].full_url).query).get("type")
+        == ["STOP_MARKET"]
+    ]
+    assert len(posts) == 1
+    posted = urllib.parse.parse_qs(urllib.parse.urlparse(posts[0].full_url).query)
+    assert posted["workingType"] == ["MARK_PRICE"]
+    assert posted["closePosition"] == ["true"]
+    assert "quantity" not in posted
+    assert first["http_status"] == 200
+    assert second["body"]["skipped"] == "stop_exists"
+
+
+def test_cancel_working_entries_leaves_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[Any] = []
+
+    def fake_urlopen(req: Any, timeout: float | None = None, context: Any = None) -> _FakeResponse:
+        captured.append(req)
+        parsed = urllib.parse.urlparse(req.full_url)
+        if parsed.path.endswith("/openOrders") and req.get_method() == "GET":
+            return _FakeResponse(
+                [
+                    {
+                        "symbol": "BTCUSDT",
+                        "orderId": 1,
+                        "type": "LIMIT",
+                        "timeInForce": "GTX",
+                        "side": "BUY",
+                    },
+                    {
+                        "symbol": "BTCUSDT",
+                        "orderId": 2,
+                        "type": "STOP_MARKET",
+                        "closePosition": True,
+                        "side": "SELL",
+                    },
+                ]
+            )
+        if req.get_method() == "DELETE":
+            return _FakeResponse({"code": 200})
+        return _FakeResponse({"serverTime": 1})
+
+    monkeypatch.setattr("jev_trader.execution.urllib.request.urlopen", fake_urlopen)
+    broker = BinanceTestnetBroker("k", "s", "https://testnet.binancefuture.com")
+    broker.cancel_working_entries()
+    deletes = [req for req in captured if req.get_method() == "DELETE"]
+    assert len(deletes) == 1
+    params = urllib.parse.parse_qs(urllib.parse.urlparse(deletes[0].full_url).query)
+    assert params["orderId"] == ["1"]
+
+
+def test_margin_balance_is_equity_when_present() -> None:
+    wallet = parse_usdt_wallet(
+        {
+            "totalWalletBalance": "3044.7",
+            "totalMarginBalance": "2900.5",
+            "availableBalance": "2500",
+            "positions": [],
+        }
+    )
+    assert wallet["equity_usdt"] == pytest.approx(2900.5)
+    assert wallet["available_usdt"] == pytest.approx(2500)
 
 
 def test_round_to_step_floors_qty() -> None:

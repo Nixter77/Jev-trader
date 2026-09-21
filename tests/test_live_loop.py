@@ -8,8 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from dataclasses import replace
+
 from jev_trader.cycle import decision_payload, run_once
-from jev_trader.execution import PaperBroker
+from jev_trader.execution import PaperBroker, bump_flatten_generation
 from jev_trader.features import compute_features
 from jev_trader.jev import judgment_from_dict
 from jev_trader.ledger import Ledger
@@ -224,6 +226,76 @@ def test_run_cycle_sizes_from_binance_wallet_not_paper_10k(
     max_qty = (3044.7 * 3.0) / features.close
     assert result.intent.qty == pytest.approx(min(risk_qty, max_qty))
     assert result.intent.qty * result.intent.stop_distance != pytest.approx(10_000.0 * 0.005)
+
+
+def test_open_long_gets_exchange_stop_before_the_next_order(tmp_path: Path, market_snapshot) -> None:
+    calls: list[tuple[str, float, str]] = []
+
+    class Broker(PaperBroker):
+        def ensure_stop_market(self, symbol: str, *, stop_price: float, order_side: str = "SELL"):
+            calls.append((symbol, float(stop_price), order_side))
+            return {"http_status": 200, "body": {"skipped": "stop_exists"}}
+
+    snapshot = replace(
+        market_snapshot,
+        position=replace(
+            market_snapshot.position,
+            side="LONG",
+            size=0.01,
+            entry=50_000.0,
+            stop_price=40_000.0,
+        ),
+    )
+    result = run_once(
+        snapshot,
+        judgment=judgment_from_dict(
+            {
+                "action": "hold",
+                "trend_aligned": 0.2,
+                "false_break_risk": 0.2,
+                "signal_strength": "слабый",
+                "should_trade_now": 0.1,
+                "model": "jev-1.13.0",
+            }
+        ),
+        broker=Broker(),
+        ledger=Ledger(tmp_path / "ledger.sqlite"),
+    )
+    assert result is not None
+    assert result.action == "hold"
+    assert calls == [(snapshot.symbol, 40_000.0, "SELL")]
+
+
+def test_flatten_during_jev_does_not_open(market_snapshot, passing_answers) -> None:
+    class Judging:
+        def judge(self, _compact):
+            bump_flatten_generation()
+            return judgment_from_dict(passing_answers)
+
+        def close(self) -> None:
+            return None
+
+    result = run_once(market_snapshot, jev_client=Judging(), broker=PaperBroker())
+    assert result.action == "hold"
+    assert result.skip_reason == "flatten"
+    assert result.execution is not None
+    assert result.execution.status == "skipped"
+
+
+def test_filled_long_asks_for_a_stop(market_snapshot, passing_answers) -> None:
+    calls: list[float] = []
+
+    class Broker(PaperBroker):
+        def ensure_stop_market(self, symbol: str, *, stop_price: float, order_side: str = "SELL"):
+            calls.append(float(stop_price))
+            return {"http_status": 200, "body": {"status": "NEW"}}
+
+    result = run_once(market_snapshot, judgment=judgment_from_dict(passing_answers), broker=Broker())
+    assert result.execution is not None
+    assert result.intent is not None
+    assert len(calls) == 1
+    assert calls[0] == pytest.approx(result.intent.stop_price)
+    assert result.execution.detail["stop"]["body"]["status"] == "NEW"
 
 
 def test_overlay_wallet_uses_exchange_position(market_snapshot) -> None:

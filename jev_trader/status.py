@@ -21,6 +21,30 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def resolve_day_anchor(
+    path: str | Path,
+    *,
+    venue: str,
+    equity: float,
+    today: str | None = None,
+) -> float:
+    """Equity at the start of this UTC day. A restart must not reset the loss limit."""
+    day = today or datetime.now(timezone.utc).date().isoformat()
+    current = read_json(path) or {}
+    saved = current.get("equity_usdt")
+    if (
+        current.get("utc_date") == day
+        and current.get("venue") == venue
+        and isinstance(saved, (int, float))
+        and not isinstance(saved, bool)
+        and float(saved) > 0
+    ):
+        return float(saved)
+    if equity > 0:
+        write_json(path, {"utc_date": day, "venue": venue, "equity_usdt": equity})
+    return equity
+
+
 def write_json(path: str | Path, payload: dict[str, Any]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)

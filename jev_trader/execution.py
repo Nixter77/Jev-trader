@@ -4,11 +4,12 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from decimal import Decimal, ROUND_DOWN
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from typing import Any
 
 from jev_trader.config import (
@@ -24,23 +25,63 @@ SELL_ONLY_CLOSES_LONG = "sell_only_closes_long"
 RECV_WINDOW_MS = 60_000
 FILLED_ORDER_STATUSES = frozenset({"FILLED", "PARTIALLY_FILLED"})
 LIMIT_ORDER_TYPES = frozenset({"LIMIT", "LIMIT_MAKER"})
+CLOSE_STOP_TYPES = frozenset({"STOP", "STOP_MARKET"})
+# Binance rejects newClientOrderId longer than 36 characters.
+_CLIENT_ID_MAX = 36
+
+order_lock = threading.RLock()
+flatten_generation = 0
+_id_lock = threading.Lock()
+_id_seq = 0
 
 
-def _flatten_client_id(symbol: str) -> str:
-    return f"jev1_{symbol}_flatten_{int(time.time() * 1000)}"
+def bump_flatten_generation() -> int:
+    """Mark that a force-close started. In-flight entries must not reopen."""
+    global flatten_generation
+    with order_lock:
+        flatten_generation += 1
+        return flatten_generation
+
+
+def current_flatten_generation() -> int:
+    return flatten_generation
+
+
+def client_order_id(symbol: str, action: str) -> str:
+    """Short id. `jev1_1000SHIBUSDT_buy_long_<ms>` does not fit Binance's 36-char limit."""
+    global _id_seq
+    tag = {"buy_long": "b", "close": "c", "sell_short": "s", "flatten": "f"}.get(action, "x")
+    sym = "".join(ch for ch in symbol.upper() if ch.isalnum())[:12]
+    with _id_lock:
+        _id_seq = (_id_seq + 1) % 1000
+        seq = _id_seq
+    cid = f"j{tag}{sym}{int(time.time() * 1000)}{seq:03d}"
+    return cid[:_CLIENT_ID_MAX]
 
 
 def format_binance_decimal(value: float) -> str:
     return f"{value:.8f}".rstrip("0").rstrip(".")
 
 
-def round_to_step(value: float, step: str | float) -> float:
+def round_to_step(value: float, step: str | float, *, rounding=ROUND_DOWN) -> float:
     v = Decimal(str(value))
     s = Decimal(str(step))
     if s <= 0:
         return float(v)
-    q = (v / s).to_integral_value(rounding=ROUND_DOWN) * s
+    q = (v / s).to_integral_value(rounding=rounding) * s
     return float(q)
+
+
+def gtx_inside_price(price: float, order_side: str, tick: str | float) -> float:
+    """One tick away from the touch so a post-only order does not cross and get -5022."""
+    step = Decimal(str(tick))
+    if step <= 0 or price <= 0:
+        return price
+    nudged = Decimal(str(price)) + (step if order_side == "SELL" else -step)
+    rounding = ROUND_UP if order_side == "SELL" else ROUND_DOWN
+    q = (nudged / step).to_integral_value(rounding=rounding) * step
+    out = float(q)
+    return out if out > 0 else price
 
 
 def parse_symbol_filters(info: dict[str, Any]) -> dict[str, dict[str, str]]:
@@ -84,13 +125,21 @@ def parse_usdt_wallet(payload: Any) -> dict[str, Any]:
             if abs(amt) > 0:
                 positions.append(_position_row(row, amt))
     elif isinstance(payload, dict):
-        equity = float(payload.get("totalWalletBalance") or payload.get("availableBalance") or 0.0)
+        # Margin balance includes unrealized PnL. Wallet balance does not, so a
+        # daily-loss limit keyed off it never sees an open loss.
+        margin = payload.get("totalMarginBalance")
+        equity = float(
+            margin
+            if margin not in (None, "")
+            else payload.get("totalWalletBalance") or payload.get("availableBalance") or 0.0
+        )
         available = float(payload.get("availableBalance") or equity)
         for row in payload.get("assets") or []:
             if not isinstance(row, dict):
                 continue
             if str(row.get("asset") or "").upper() == "USDT":
-                equity = float(row.get("walletBalance") or row.get("marginBalance") or equity)
+                if margin in (None, ""):
+                    equity = float(row.get("marginBalance") or row.get("walletBalance") or equity)
                 available = float(row.get("availableBalance") or available or equity)
         for row in payload.get("positions") or []:
             if not isinstance(row, dict):
@@ -310,7 +359,6 @@ class BinanceFuturesBroker:
             self._time_offset_ms = server - int(time.time() * 1000)
             self._time_synced = True
             return server
-        self._time_synced = True
         return int(time.time() * 1000) + self._time_offset_ms
 
     def _timestamp_ms(self) -> int:
@@ -397,12 +445,16 @@ class BinanceFuturesBroker:
     def filters_for(self, symbol: str) -> dict[str, str]:
         if not self._filters_loaded:
             status, data = self._request("GET", "/fapi/v1/exchangeInfo")
-            self._filters_loaded = True
-            if 200 <= status < 300 and isinstance(data, dict):
+            if 200 <= status < 300 and isinstance(data, dict) and data.get("symbols"):
                 self._filters = parse_symbol_filters(data)
+                self._filters_loaded = True
         return self._filters.get(symbol.upper(), {})
 
     def submit(self, intent: TradeIntent) -> ExecutionResult:
+        with order_lock:
+            return self._submit_locked(intent)
+
+    def _submit_locked(self, intent: TradeIntent) -> ExecutionResult:
         if intent.skip_reason or intent.qty <= 0:
             return ExecutionResult(
                 status="skipped",
@@ -428,6 +480,8 @@ class BinanceFuturesBroker:
                 qty = round_to_step(qty, flt["stepSize"])
             if price is not None and flt.get("tickSize"):
                 price = round_to_step(price, flt["tickSize"])
+                if intent.entry_type != "MARKET":
+                    price = gtx_inside_price(price, intent.order_side, flt["tickSize"])
             min_qty = float(flt.get("minQty") or 0.0)
             if qty <= 0 or (min_qty and qty < min_qty):
                 return ExecutionResult(
@@ -594,6 +648,55 @@ class BinanceFuturesBroker:
                 )
         return [self.cancel_open_orders(symbol) for symbol in names]
 
+    def cancel_working_entries(self) -> list[dict[str, Any]]:
+        """Cancel resting LIMIT/GTX entries. Leave STOP_MARKET protection in place."""
+        status, data = self._request("GET", "/fapi/v1/openOrders", signed=True)
+        if not (200 <= status < 300) or not isinstance(data, list):
+            return []
+        symbols = sorted(
+            {
+                str(row.get("symbol") or "").upper()
+                for row in data
+                if isinstance(row, dict) and row.get("symbol")
+            }
+        )
+        cancelled: list[dict[str, Any]] = []
+        for symbol in symbols:
+            cancelled.extend(self.cancel_open_limits(symbol))
+        return cancelled
+
+    def _close_stop_open(self, symbol: str) -> bool:
+        status, data = self._request(
+            "GET",
+            "/fapi/v1/openOrders",
+            params={"symbol": symbol.upper()},
+            signed=True,
+        )
+        if not (200 <= status < 300) or not isinstance(data, list):
+            return False
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("type") or "") not in CLOSE_STOP_TYPES:
+                continue
+            flag = row.get("closePosition")
+            if flag is True or str(flag).lower() == "true":
+                return True
+        return False
+
+    def ensure_stop_market(
+        self,
+        symbol: str,
+        *,
+        stop_price: float,
+        order_side: str = "SELL",
+    ) -> dict[str, Any]:
+        """Place a close-all stop if the exchange does not already have one."""
+        with order_lock:
+            if self._close_stop_open(symbol):
+                return {"http_status": 200, "body": {"skipped": "stop_exists"}, "stop_price": stop_price}
+            return self.place_stop_market(symbol, stop_price=stop_price, order_side=order_side)
+
     def place_stop_market(
         self,
         symbol: str,
@@ -613,13 +716,17 @@ class BinanceFuturesBroker:
             "type": "STOP_MARKET",
             "stopPrice": format_binance_decimal(price),
             "closePosition": "true",
-            "workingType": "CONTRACT_PRICE",
+            "workingType": "MARK_PRICE",
         }
         status, data = self._request("POST", "/fapi/v1/order", params=params, signed=True)
         self.invalidate_wallet()
         return {"http_status": status, "body": data}
 
     def flatten_all(self) -> dict[str, Any]:
+        with order_lock:
+            return self._flatten_all_locked()
+
+    def _flatten_all_locked(self) -> dict[str, Any]:
         cancelled = self.cancel_all_open_orders()
         wallet = self.fetch_wallet(ttl=0)
         closes: list[dict[str, Any]] = []
@@ -636,7 +743,7 @@ class BinanceFuturesBroker:
                 stop_distance=None,
                 entry_type="MARKET",
                 reduce_only=True,
-                client_order_id=_flatten_client_id(symbol),
+                client_order_id=client_order_id(symbol, "flatten"),
                 symbol=symbol,
                 risk_pct=0.0,
                 order_side="SELL" if side == "LONG" else "BUY",

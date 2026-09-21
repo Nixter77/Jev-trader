@@ -26,7 +26,7 @@ from jev_trader.public_market import (
 )
 from jev_trader.snapshot import load_snapshot
 from jev_trader.state import build_compact_state
-from jev_trader.status import clear_pid, other_bot_running, read_json, write_pid
+from jev_trader.status import clear_pid, other_bot_running, read_json, resolve_day_anchor, write_pid
 from jev_trader.telegram import notifier_from_settings
 
 
@@ -229,15 +229,22 @@ def _make_live_runner(args: argparse.Namespace, settings, ledger: Ledger, broker
     follow_jev = bool(getattr(args, "follow_jev", False))
     wallet_box: dict = {}
     fetch = getattr(broker, "fetch_wallet", None)
-    cancel_all = getattr(broker, "cancel_all_open_orders", None)
+    cancel_entries = getattr(broker, "cancel_working_entries", None)
     if callable(fetch):
         try:
-            if callable(cancel_all):
-                cancel_all()
+            # Drop leftover post-only entries. Keep STOP_MARKET so a restart
+            # does not leave an open long unprotected until the next bar.
+            if callable(cancel_entries):
+                cancel_entries()
             wallet = fetch(ttl=0)
             wallet_box["wallet"] = wallet
             if wallet.get("equity_usdt"):
-                wallet_box["start_equity_usdt"] = float(wallet["equity_usdt"])
+                equity = float(wallet["equity_usdt"])
+                wallet_box["start_equity_usdt"] = resolve_day_anchor(
+                    _sidecar(ledger, "risk-anchor.json"),
+                    venue=str(args.venue),
+                    equity=equity,
+                )
             ledger.sync_exchange_positions(wallet)
         except Exception as exc:  # noqa: BLE001
             wallet_box["wallet_error"] = f"{type(exc).__name__}: {exc}"

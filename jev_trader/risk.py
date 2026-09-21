@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import time
-
+from jev_trader.execution import client_order_id
 from jev_trader.models import (
     AccountState,
     Features,
@@ -14,8 +13,21 @@ ATR_STOP_MULT_MIN = 1.2
 ATR_STOP_MULT_MAX = 1.8
 
 
-def _client_order_id(symbol: str, action: str) -> str:
-    return f"jev1_{symbol}_{action}_{int(time.time() * 1000)}"
+def long_protective_stop(
+    snapshot: MarketSnapshot,
+    features: Features,
+    account: AccountState,
+) -> float | None:
+    """Stop for an open long: the stored one, or entry minus ATR. None if flat."""
+    if snapshot.position.side != "LONG" or snapshot.position.size <= 0:
+        return None
+    stop = snapshot.position.stop_price
+    if stop is None and features.atr and features.atr > 0 and snapshot.position.entry:
+        mult = min(max(account.atr_stop_mult, ATR_STOP_MULT_MIN), ATR_STOP_MULT_MAX)
+        stop = float(snapshot.position.entry) - mult * float(features.atr)
+    if stop is None or stop <= 0:
+        return None
+    return float(stop)
 
 
 def _stop_price(close: float, stop_distance: float) -> float:
@@ -63,7 +75,7 @@ def apply_risk(
             stop_distance=None,
             entry_type="NONE",
             reduce_only=False,
-            client_order_id=_client_order_id(symbol, action),
+            client_order_id=client_order_id(symbol, action),
             symbol=symbol,
             risk_pct=account.risk_pct,
             order_side=_order_side(action, snapshot.position.side),
@@ -85,7 +97,7 @@ def apply_risk(
             stop_distance=None,
             entry_type=entry_type,
             reduce_only=True,
-            client_order_id=_client_order_id(symbol, tag),
+            client_order_id=client_order_id(symbol, tag),
             symbol=symbol,
             risk_pct=account.risk_pct,
             order_side=side,
@@ -109,9 +121,7 @@ def apply_risk(
         return close_position(risk_event="no_short", entry_type="MARKET")
 
     if in_position and pos_side == "LONG":
-        stop = snapshot.position.stop_price
-        if stop is None and features.atr and features.atr > 0 and snapshot.position.entry:
-            stop = snapshot.position.entry - stop_mult * features.atr
+        stop = long_protective_stop(snapshot, features, account)
         if stop is not None and close <= stop:
             return close_position(risk_event="stop", entry_type="MARKET")
 
@@ -158,7 +168,7 @@ def apply_risk(
         stop_distance=stop_distance,
         entry_type="LIMIT_POST_ONLY",
         reduce_only=False,
-        client_order_id=_client_order_id(symbol, "buy_long"),
+        client_order_id=client_order_id(symbol, "buy_long"),
         symbol=symbol,
         risk_pct=account.risk_pct,
         order_side="BUY",

@@ -316,6 +316,18 @@ class Ledger:
             stop_price=stop_price,
         )
 
+    def set_stop(self, symbol: str, stop_price: float) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE positions
+                SET stop_price = ?, updated_ts = ?
+                WHERE symbol = ? AND side = 'LONG' AND size > 0
+                """,
+                (float(stop_price), _now(), symbol.upper()),
+            )
+            conn.commit()
+
     def count_open_positions(self) -> int:
         with self._connect() as conn:
             row = conn.execute(
@@ -456,6 +468,7 @@ class Ledger:
                     "unrealized_pnl_usdt": upnl,
                     "realized_pnl_usdt": pos.get("realized_pnl_usdt"),
                     "cash_usdt": pos.get("cash_usdt"),
+                    "stop_price": pos.get("stop_price"),
                     "updated_ts": pos.get("updated_ts"),
                 }
             )

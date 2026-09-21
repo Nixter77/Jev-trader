@@ -610,6 +610,7 @@ class LiveRunner:
             "last_error": self.last_error or self.wallet_box.get("wallet_error"),
             "last_decisions": self.last_decisions[:30],
             "wallet": self.wallet_box.get("wallet"),
+            "day_start_equity_usdt": self.wallet_box.get("start_equity_usdt"),
             "hint": "Jev на закрытии 5m. Вход только BUY/лонг; выход MARKET; стоп на бирже.",
         }
         try:

@@ -95,6 +95,10 @@ def dashboard_state(
         w_unreal = sum(float(p.get("unrealized_pnl_usdt") or 0.0) for p in wallet.get("positions") or [])
         if w_unreal:
             unrealized = w_unreal
+        stops = {
+            str(row.get("symbol") or "").upper(): row.get("stop_price")
+            for row in positions
+        }
         w_pos = [
             {
                 "symbol": p.get("symbol"),
@@ -102,6 +106,7 @@ def dashboard_state(
                 "size": p.get("size"),
                 "entry": p.get("entry"),
                 "last_mark": None,
+                "stop_price": stops.get(str(p.get("symbol") or "").upper()),
                 "unrealized_pnl_usdt": p.get("unrealized_pnl_usdt"),
             }
             for p in wallet.get("positions") or []
@@ -548,6 +553,7 @@ MONITOR_HTML = """<!DOCTYPE html>
           <div><span class="sym">${p.symbol}</span><span class="side">${p.side}</span></div>
           <div>qty ${fmt(p.size,4)}</div>
           <div>вход ${fmt(p.entry,4)} · mark ${fmt(p.last_mark,4)}</div>
+          <div>стоп ${p.stop_price==null?"—":fmt(p.stop_price,4)}</div>
           <div class="${clsPnl(p.unrealized_pnl_usdt)}">uPnL ${fmt(p.unrealized_pnl_usdt,2)}</div>
         </div>`).join("")}</div>` : '<div class="empty">Позиций нет. Jev пока держит. Следующий вопрос — на закрытии 5-минутной свечи.</div>';
       const fills = s.fills || [];

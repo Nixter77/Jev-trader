@@ -2,21 +2,21 @@
 
 from __future__ import annotations
 
-import threading
-import time
 from pathlib import Path
 from typing import Any
 
-from jev_trader.execution import PaperBroker, fill_price, fill_qty, is_real_fill
+from jev_trader.execution import (
+    PaperBroker,
+    bump_flatten_generation,
+    client_order_id,
+    fill_price,
+    fill_qty,
+    is_real_fill,
+    order_lock,
+)
 from jev_trader.ledger import Ledger
 from jev_trader.models import CycleResult, ExecutionResult, TradeIntent
 from jev_trader.status import read_json, utc_now, write_json
-
-_LOCK = threading.RLock()
-
-
-def _flatten_client_id(symbol: str) -> str:
-    return f"jev1_{symbol}_flatten_{int(time.time() * 1000)}"
 
 
 def _record_close(
@@ -74,7 +74,7 @@ def _flatten_ledger(broker: Any, ledger: Ledger) -> dict[str, Any]:
             mark_f = None if mark is None else float(mark)
         except (TypeError, ValueError):
             mark_f = None
-        cid = _flatten_client_id(symbol)
+        cid = client_order_id(symbol, "flatten")
         order_side = "SELL" if side == "LONG" else "BUY"
         intent = TradeIntent(
             action="close",
@@ -116,7 +116,8 @@ def _flatten_ledger(broker: Any, ledger: Ledger) -> dict[str, Any]:
 
 def flatten_open_positions(broker: Any, ledger: Ledger) -> dict[str, Any]:
     """Cancel working orders, MARKET-close everything, then match the ledger to it."""
-    with _LOCK:
+    with order_lock:
+        bump_flatten_generation()
         flatten = getattr(broker, "flatten_all", None)
         if callable(flatten) and not isinstance(broker, PaperBroker):
             raw = flatten() or {}
