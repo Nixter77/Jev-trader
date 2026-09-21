@@ -14,6 +14,8 @@ DEFAULT_PAPER_LEDGER = "data/ledger.sqlite"
 DEFAULT_TESTNET_LEDGER = "data/ledger-testnet.sqlite"
 from jev_trader.universe import DEFAULT_MIN_QUOTE_VOLUME, DEFAULT_UNIVERSE_SIZE
 from jev_trader.jev import JevClient, judgment_from_dict
+from jev_trader.judge import make_judge_client, normalize_backend
+from jev_trader.laya_client import DEFAULT_LAYA_CHECKPOINT
 from jev_trader.ledger import Ledger
 from jev_trader.live import LiveRunner, load_answers, load_json, make_run_cycle
 from jev_trader.models import AccountState
@@ -89,8 +91,64 @@ def _make_broker(args: argparse.Namespace, settings) -> PaperBroker | BinanceTes
     )
 
 
+
+def _apply_backend_args(settings, args):
+    """Overlay --backend / --laya-* CLI flags onto Settings (frozen dataclass)."""
+    from dataclasses import replace
+
+    updates = {}
+    backend = getattr(args, "backend", None)
+    if backend:
+        updates["decision_backend"] = normalize_backend(backend)
+    checkpoint = getattr(args, "laya_checkpoint", None)
+    if checkpoint:
+        updates["laya_checkpoint"] = checkpoint
+    device = getattr(args, "laya_device", None)
+    if device:
+        updates["laya_device"] = device
+    return replace(settings, **updates) if updates else settings
+
+
+
+
+def _judge_kwargs(settings, answers=None) -> dict:
+    """Kwargs for run_once / live loop: Jev key or Laya client."""
+    if answers is not None:
+        return {"typesafe_api_key": None, "jev_client": None}
+    from jev_trader.judge import normalize_backend, make_judge_client
+    if normalize_backend(settings.decision_backend) == "laya":
+        return {"typesafe_api_key": None, "jev_client": make_judge_client(settings)}
+    return {"typesafe_api_key": settings.typesafe_api_key, "jev_client": None}
+
+def _require_judge_ready(settings) -> str | None:
+    """Return an error string if the selected backend cannot run, else None."""
+    backend = normalize_backend(settings.decision_backend)
+    if backend == "jev" and not settings.typesafe_api_key:
+        return "TYPESAFE_API_KEY missing after env map (backend=jev)"
+    return None
+
+
+def _add_backend_flags(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--backend",
+        choices=("jev", "laya"),
+        default=None,
+        help="Decision model: jev (TypeSafe API) or laya (local HF). Overrides DECISION_BACKEND.",
+    )
+    p.add_argument(
+        "--laya-checkpoint",
+        default=None,
+        help="Laya checkpoint: multilingual (default), english, typed-decisions, router. Overrides LAYA_CHECKPOINT.",
+    )
+    p.add_argument(
+        "--laya-device",
+        default=None,
+        help="Optional torch device for Laya (cpu/cuda/mps). Overrides LAYA_DEVICE.",
+    )
+
 def cmd_once(args: argparse.Namespace) -> int:
     settings = load_settings(args.env, allow_production=args.venue == "live")
+    settings = _apply_backend_args(settings, args)
     snapshot = load_snapshot(args.snapshot)
     answers = load_answers(args.answers)
     missing = _require_binance_keys(settings, args.venue)
@@ -120,21 +178,23 @@ def cmd_once(args: argparse.Namespace) -> int:
         broker=broker,
         ledger=ledger,
         notifier=notifier,
-        typesafe_api_key=settings.typesafe_api_key,
+        typesafe_api_key=settings.typesafe_api_key if settings.decision_backend == "jev" else None,
+        jev_client=None if answers is not None or settings.decision_backend == "jev" else make_judge_client(settings),
     )
     print(dumps_decision(result))
     return 0
 
 
 def cmd_jev_live(args: argparse.Namespace) -> int:
-    settings = load_settings(args.env)
-    if not settings.typesafe_api_key:
-        print(json.dumps({"ok": False, "error": "TYPESAFE_API_KEY missing after env map"}))
+    settings = _apply_backend_args(load_settings(args.env), args)
+    err = _require_judge_ready(settings)
+    if err:
+        print(json.dumps({"ok": False, "error": err}))
         return 2
     snapshot = load_snapshot(args.snapshot)
     compact = build_compact_state(snapshot)
     try:
-        with JevClient(api_key=settings.typesafe_api_key) as client:
+        with make_judge_client(settings) as client:
             payload_model = client.model
             judgment = client.judge(compact)
     except Exception as exc:  # noqa: BLE001 — live probe must capture transport/API failures
@@ -248,6 +308,7 @@ def _make_live_runner(args: argparse.Namespace, settings, ledger: Ledger, broker
             ledger.sync_exchange_positions(wallet)
         except Exception as exc:  # noqa: BLE001
             wallet_box["wallet_error"] = f"{type(exc).__name__}: {exc}"
+    judge_kw = _judge_kwargs(settings, answers)
     run_cycle = make_run_cycle(
         judgment=judgment,
         account_kwargs={
@@ -258,7 +319,8 @@ def _make_live_runner(args: argparse.Namespace, settings, ledger: Ledger, broker
         broker=broker,
         ledger=ledger,
         notifier=notifier,
-        typesafe_api_key=settings.typesafe_api_key,
+        typesafe_api_key=judge_kw["typesafe_api_key"],
+        jev_client=judge_kw["jev_client"],
         follow_jev=follow_jev,
         min_should_trade=args.min_should_trade,
         max_positions=args.max_positions,
@@ -294,10 +356,14 @@ def _make_live_runner(args: argparse.Namespace, settings, ledger: Ledger, broker
 
 def cmd_live(args: argparse.Namespace) -> int:
     settings = load_settings(args.env, allow_production=args.venue == "live")
+    settings = _apply_backend_args(settings, args)
     answers = load_answers(args.answers)
-    if answers is None and not settings.typesafe_api_key:
-        print(json.dumps({"ok": False, "error": "TYPESAFE_API_KEY missing after env map"}))
-        return 2
+    settings = _apply_backend_args(settings, args)
+    if answers is None:
+        err = _require_judge_ready(settings)
+        if err:
+            print(json.dumps({"ok": False, "error": err}))
+            return 2
     missing = _require_binance_keys(settings, args.venue)
     if missing:
         print(json.dumps({"ok": False, "error": missing}))
@@ -369,10 +435,14 @@ def cmd_monitor(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     """Always-on paper/testnet loop + local trade blotter."""
     settings = load_settings(args.env, allow_production=args.venue == "live")
+    settings = _apply_backend_args(settings, args)
     answers = load_answers(args.answers)
-    if answers is None and not settings.typesafe_api_key:
-        print(json.dumps({"ok": False, "error": "TYPESAFE_API_KEY missing after env map"}))
-        return 2
+    settings = _apply_backend_args(settings, args)
+    if answers is None:
+        err = _require_judge_ready(settings)
+        if err:
+            print(json.dumps({"ok": False, "error": err}))
+            return 2
     missing = _require_binance_keys(settings, args.venue)
     if missing:
         print(json.dumps({"ok": False, "error": missing}))
@@ -651,11 +721,13 @@ def build_parser() -> argparse.ArgumentParser:
     once.add_argument("--kill-switch", action="store_true")
     once.add_argument("--daily-pnl-pct", type=float, default=0.0)
     once.add_argument("--no-telegram", action="store_true")
+    _add_backend_flags(once)
     once.set_defaults(func=cmd_once)
 
     live = sub.add_parser("jev-live", help="One live system_one call via the shipped Jev client")
     live.add_argument("--snapshot", required=True)
     live.add_argument("--env", default=".env")
+    _add_backend_flags(live)
     live.set_defaults(func=cmd_jev_live)
 
     ping = sub.add_parser("binance-ping", help="Ping Binance USD-M futures testnet")

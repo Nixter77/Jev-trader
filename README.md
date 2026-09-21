@@ -40,6 +40,33 @@ Jev может сказать `buy_long` и `сильный`, но если `sho
 
 Вход — LIMIT post-only (`GTX`) **BUY** по лучшему bid (иначе last close). Закрытие лонга — SELL + `reduceOnly`. SELL без `reduceOnly` брокер отвергает.
 
+
+## Выбор модели: Jev или Laya
+
+Бот умеет спрашивать либо **Jev** (TypeSafe API), либо локальную **Laya** ([convaiinnovations/laya](https://huggingface.co/convaiinnovations/laya)) — тот же System‑1 формат (choice / noul / score).
+
+| | Jev | Laya |
+|---|---|---|
+| Откуда | TypeSafe cloud API | локальные веса HF |
+| Ключ | `TYPESAFE_API_KEY` | не нужен |
+| Установка | уже в зависимостях | `pip install 'jev-trader[laya]'` (тянет torch) |
+| По умолчанию | да | нет |
+
+Переключение:
+
+```bash
+# .env
+DECISION_BACKEND=laya
+LAYA_CHECKPOINT=multilingual   # english | multilingual | typed-decisions | router
+# LAYA_DEVICE=cpu
+
+# или флагами CLI
+python -m jev_trader jev-live --snapshot data/snap.json --backend laya
+python -m jev_trader run --venue paper --backend laya --laya-checkpoint multilingual
+```
+
+Первый запуск Laya скачает чекпоинт с Hugging Face (~300–800 MB). Вопросы на русском → по умолчанию `multilingual`.
+
 ## Требования
 
 - Python **≥ 3.12**
