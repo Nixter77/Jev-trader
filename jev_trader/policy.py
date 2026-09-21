@@ -7,6 +7,10 @@ from jev_trader.models import (
 )
 
 SHOULD_TRADE_NOW_MIN = 0.72
+# Close needs a higher bar than entry (Laya typed-decisions was closing at ~0.35–0.50 under follow_jev).
+CLOSE_SHOULD_TRADE_MIN = 0.80
+# Soft confirm when action_probabilities present (Laya). Ignored if empty (classic Jev).
+CLOSE_ACTION_PROB_MIN = 0.75
 FALSE_BREAK_RISK_MAX = 0.35
 SIGNAL_STRENGTH_MIN = "рабочий"
 TREND_ALIGNED_MIN = 0.60
@@ -21,16 +25,30 @@ def signal_strength_rank(level: str) -> int:
         return -1
 
 
+def _close_action_prob(judgment: JevJudgment) -> float | None:
+    probs = judgment.action_probabilities or {}
+    if not probs:
+        return None
+    try:
+        return float(probs.get("close", 0.0))
+    except (TypeError, ValueError):
+        return None
+
+
 def apply_policy(
     judgment: JevJudgment,
     *,
     follow_jev: bool = False,
     min_should_trade: float = SHOULD_TRADE_NOW_MIN,
+    close_should_trade_min: float = CLOSE_SHOULD_TRADE_MIN,
+    close_action_prob_min: float = CLOSE_ACTION_PROB_MIN,
 ) -> PolicyDecision:
     """Confidence gates in code. Size/stop/leverage are never decided here.
 
-    `follow_jev=True` still ignores hold, but skips probability gates so Jev's
-    buy/close is the trade decision. Risk sizing stays in code.
+    `follow_jev=True` skips probability gates for **entries** (buy/short) so the
+    model's buy is the trade decision. **Close is always gated** (asymmetry):
+    Laya typed-decisions was dumping losers while should_trade_now sat ~0.4.
+    Risk flatten/stop still bypasses this via risk.py, not policy.
     """
     if judgment.action not in TRADE_ACTIONS:
         return PolicyDecision(
@@ -39,6 +57,47 @@ def apply_policy(
             skip_reason="hold",
             judgment=judgment,
         )
+
+    # --- close asymmetry (even under follow_jev) ---
+    if judgment.action == "close":
+        if judgment.should_trade_now < close_should_trade_min:
+            return PolicyDecision(
+                action="hold",
+                passed=False,
+                skip_reason="close_should_trade_now",
+                judgment=judgment,
+            )
+        close_p = _close_action_prob(judgment)
+        if close_p is not None and close_p < close_action_prob_min:
+            return PolicyDecision(
+                action="hold",
+                passed=False,
+                skip_reason="close_action_prob",
+                judgment=judgment,
+            )
+        if judgment.false_break_risk > FALSE_BREAK_RISK_MAX:
+            return PolicyDecision(
+                action="hold",
+                passed=False,
+                skip_reason="false_break",
+                judgment=judgment,
+            )
+        if signal_strength_rank(judgment.signal_strength) < signal_strength_rank(
+            SIGNAL_STRENGTH_MIN
+        ):
+            return PolicyDecision(
+                action="hold",
+                passed=False,
+                skip_reason="low_strength",
+                judgment=judgment,
+            )
+        return PolicyDecision(
+            action="close",
+            passed=True,
+            skip_reason=None,
+            judgment=judgment,
+        )
+
     if follow_jev:
         return PolicyDecision(
             action=judgment.action,

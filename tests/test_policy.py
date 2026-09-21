@@ -87,3 +87,60 @@ def test_close_relaxes_trend_aligned() -> None:
 @pytest.mark.parametrize("level", ["рабочий", "сильный"])
 def test_working_or_strong_passes_strength(level: str) -> None:
     assert apply_policy(_judgment(signal_strength=level)).passed is True
+
+
+def test_follow_jev_still_gates_weak_close() -> None:
+    """Desk defaults follow_jev; Laya was closing at should~0.4 — must hold."""
+    decision = apply_policy(
+        _judgment(action="close", should_trade_now=0.45, trend_aligned=0.10),
+        follow_jev=True,
+    )
+    assert decision.passed is False
+    assert decision.skip_reason == "close_should_trade_now"
+    assert decision.action == "hold"
+
+
+def test_close_requires_higher_should_than_entry() -> None:
+    # Entry bar 0.72 would pass buy; close needs CLOSE_SHOULD_TRADE_MIN (0.80).
+    decision = apply_policy(
+        _judgment(action="close", should_trade_now=0.75, trend_aligned=0.10)
+    )
+    assert decision.passed is False
+    assert decision.skip_reason == "close_should_trade_now"
+
+
+def test_strong_close_passes_asymmetry() -> None:
+    decision = apply_policy(
+        _judgment(
+            action="close",
+            should_trade_now=0.85,
+            trend_aligned=0.10,
+            action_probabilities={"close": 0.82, "hold": 0.18},
+        ),
+        follow_jev=True,
+    )
+    assert decision.passed is True
+    assert decision.action == "close"
+
+
+def test_close_action_prob_gate_when_probs_present() -> None:
+    decision = apply_policy(
+        _judgment(
+            action="close",
+            should_trade_now=0.90,
+            action_probabilities={"close": 0.60, "hold": 0.40},
+        ),
+        follow_jev=True,
+    )
+    assert decision.passed is False
+    assert decision.skip_reason == "close_action_prob"
+
+
+def test_close_without_probs_skips_prob_gate() -> None:
+    # Classic Jev may omit action_probabilities — should_trade gate is enough.
+    decision = apply_policy(
+        _judgment(action="close", should_trade_now=0.85, trend_aligned=0.10),
+        follow_jev=True,
+    )
+    assert decision.passed is True
+    assert decision.action == "close"
