@@ -834,6 +834,7 @@ def build_parser() -> argparse.ArgumentParser:
             help="Override should_trade_now gate (default 0.72 unless --follow-jev)",
         )
         p.add_argument("--status", default=None, help="Heartbeat JSON path (default next to ledger)")
+        _add_backend_flags(p)
 
     trade = sub.add_parser(
         "live",
