@@ -38,12 +38,43 @@ FORBIDDEN_QUESTION_TERMS = (
 )
 
 
-def build_questions() -> dict[str, Choice | Noul | Score]:
+
+def position_side_from_compact(compact: CompactState) -> str:
+    """Read FLAT / LONG / SHORT from compact payload (default FLAT)."""
+    payload = compact.as_dict() if hasattr(compact, "as_dict") else dict(getattr(compact, "payload", {}) or {})
+    pos = payload.get("position") or {}
+    side = str(pos.get("side") or "FLAT").upper()
+    if side in {"FLAT", "LONG", "SHORT"}:
+        return side
+    return "FLAT"
+
+
+def allowed_actions_for_position(side: str) -> tuple[str, ...]:
+    """Long-only desk: never ask to close when flat, never ask to short."""
+    side_u = (side or "FLAT").upper()
+    if side_u == "LONG":
+        return ("hold", "close")
+    if side_u == "SHORT":
+        return ("close",)  # flatten leftover shorts only
+    # FLAT (and unknown): entry or wait — close is meaningless and Laya over-picks it
+    return ("buy_long", "hold")
+
+
+def build_questions(
+    allowed_actions: tuple[str, ...] | list[str] | None = None,
+) -> dict[str, Choice | Noul | Score]:
     """Five v1 questions in one system_one call. No size/stop/leverage/rationale."""
+    if allowed_actions is None:
+        criteria = dict(ACTION_CRITERIA)
+    else:
+        wanted = {str(a) for a in allowed_actions}
+        criteria = {k: v for k, v in ACTION_CRITERIA.items() if k in wanted}
+        if not criteria:
+            raise ValueError(f"no ACTION_CRITERIA left for {allowed_actions!r}")
     return {
         "action": Choice(
             instructions=ACTION_INSTRUCTIONS,
-            criteria=dict(ACTION_CRITERIA),
+            criteria=criteria,
         ),
         "trend_aligned": Noul(
             instructions="Движение согласовано с режимом вышестоящего ТФ?",
@@ -67,12 +98,16 @@ def state_for_jev(compact: CompactState) -> dict[str, Any]:
     return payload
 
 
-def build_system_one_payload(compact: CompactState) -> dict[str, Any]:
+def build_system_one_payload(
+    compact: CompactState,
+    *,
+    allowed_actions: tuple[str, ...] | list[str] | None = None,
+) -> dict[str, Any]:
     """Objects handed to TypeSafeClient.system_one (model pinned, five questions)."""
     return {
         "model": JEV_MODEL,
         "state": state_for_jev(compact),
-        "questions": build_questions(),
+        "questions": build_questions(allowed_actions=allowed_actions),
     }
 
 
@@ -205,7 +240,8 @@ class JevClient:
         self._client = client or TypeSafeClient(api_key=api_key, model=self.model)
 
     def judge(self, compact: CompactState) -> JevJudgment:
-        payload = build_system_one_payload(compact)
+        allowed = allowed_actions_for_position(position_side_from_compact(compact))
+        payload = build_system_one_payload(compact, allowed_actions=allowed)
         response = self._client.system_one(
             state=payload["state"],
             questions=payload["questions"],

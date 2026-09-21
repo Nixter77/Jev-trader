@@ -5,7 +5,13 @@ from __future__ import annotations
 import os
 from typing import Any, Mapping
 
-from jev_trader.jev import build_questions, coerce_signal_level, state_for_jev
+from jev_trader.jev import (
+    allowed_actions_for_position,
+    build_questions,
+    coerce_signal_level,
+    position_side_from_compact,
+    state_for_jev,
+)
 from jev_trader.models import ACTIONS, CompactState, JevJudgment
 
 # Avoid TensorFlow import deadlocks when transformers probes TF (Laya docs).
@@ -43,10 +49,12 @@ DEFAULT_LAYA_CHECKPOINT = "multilingual"
 
 
 
-def build_laya_questions() -> dict[str, dict[str, Any]]:
+def build_laya_questions(
+    allowed_actions: tuple[str, ...] | list[str] | None = None,
+) -> dict[str, dict[str, Any]]:
     """Same five v1 questions as Jev, in Laya's dict schema (choice / noul / score)."""
     out: dict[str, dict[str, Any]] = {}
-    for name, question in build_questions().items():
+    for name, question in build_questions(allowed_actions=allowed_actions).items():
         qtype = type(question).__name__.lower()  # Choice / Noul / Score
         if qtype == "choice":
             out[name] = {
@@ -208,7 +216,8 @@ class LayaClient:
     def judge(self, compact: CompactState) -> JevJudgment:
         agent = self._ensure_agent()
         state = state_for_jev(compact)
-        questions = build_laya_questions()
+        allowed = allowed_actions_for_position(position_side_from_compact(compact))
+        questions = build_laya_questions(allowed_actions=allowed)
         predict = getattr(agent, "predict", None) or agent.system_one
         result = predict(state, questions)
         label = self._model_label
@@ -216,7 +225,25 @@ class LayaClient:
             routing = result.get("routing") or {}
             if isinstance(routing, Mapping) and routing.get("model"):
                 label = f"laya:{routing.get('model')}"
-        return judgment_from_laya_result(result, model_label=label)
+
+        judgment = judgment_from_laya_result(result, model_label=label)
+        allowed_set = set(allowed)
+        if judgment.action not in allowed_set:
+            # Model picked a label we did not offer (or stale); wait instead of closing flat.
+            from jev_trader.models import JevJudgment as _JJ
+            judgment = _JJ(
+                action="hold",
+                trend_aligned=judgment.trend_aligned,
+                false_break_risk=judgment.false_break_risk,
+                signal_strength=judgment.signal_strength,
+                should_trade_now=judgment.should_trade_now,
+                action_probabilities=judgment.action_probabilities,
+                signal_strength_score=judgment.signal_strength_score,
+                model=judgment.model,
+                raw={**(judgment.raw or {}), "remapped_from": judgment.action, "allowed": sorted(allowed_set)},
+            )
+        return judgment
+
 
     def close(self) -> None:
         if not self._owns_agent:

@@ -46,6 +46,7 @@ def test_build_laya_questions_mirrors_jev_schema() -> None:
         "should_trade_now",
     ]
     assert qs["action"]["type"] == "choice"
+    # Default (no filter) still exposes the full v1 action set.
     assert set(qs["action"]["criteria"]) == {"buy_long", "sell_short", "close", "hold"}
     assert qs["trend_aligned"]["type"] == "noul"
     assert qs["signal_strength"]["type"] == "score"
