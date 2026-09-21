@@ -277,6 +277,7 @@ def make_run_cycle(
     ledger: Ledger | None,
     notifier: TelegramNotifier | None,
     typesafe_api_key: str | None,
+    jev_client: Any | None = None,
     follow_jev: bool = False,
     min_should_trade: float | None = None,
     max_positions: int = 3,
@@ -342,7 +343,8 @@ def make_run_cycle(
             broker=broker,
             ledger=ledger,
             notifier=notifier,
-            typesafe_api_key=typesafe_api_key if judgment is None else None,
+            typesafe_api_key=typesafe_api_key if judgment is None and jev_client is None else None,
+            jev_client=jev_client if judgment is None else None,
             follow_jev=follow_jev,
             min_should_trade=min_should_trade,
         )

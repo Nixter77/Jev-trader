@@ -31,6 +31,9 @@ class Settings:
     telegram_chat_id: str
     telegram_notify: bool
     jev_model: str = "jev-1.13.0"
+    decision_backend: str = "jev"
+    laya_checkpoint: str = "multilingual"
+    laya_device: str = ""
 
 
 def _truthy(value: str | None) -> bool:
@@ -107,4 +110,7 @@ def load_settings(
         telegram_chat_id=(os.environ.get("TELEGRAM_CHAT_ID") or "").strip(),
         telegram_notify=_truthy(notify_raw),
         jev_model="jev-1.13.0",
+        decision_backend=(os.environ.get("DECISION_BACKEND") or "jev").strip().lower() or "jev",
+        laya_checkpoint=(os.environ.get("LAYA_CHECKPOINT") or "multilingual").strip() or "multilingual",
+        laya_device=(os.environ.get("LAYA_DEVICE") or "").strip(),
     )

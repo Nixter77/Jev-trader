@@ -114,7 +114,7 @@ def run_once(
     snapshot: MarketSnapshot,
     *,
     judgment: JevJudgment | None = None,
-    jev_client: JevClient | None = None,
+    jev_client: Any | None = None,  # JudgeClient protocol (JevClient | LayaClient)
     account: AccountState | None = None,
     broker: PaperBroker | BinanceTestnetBroker | BinanceFuturesBroker | None = None,
     ledger: Ledger | None = None,
