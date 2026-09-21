@@ -549,7 +549,10 @@ def _judgment_dict(judgment: JevJudgment | None) -> dict[str, Any]:
         "false_break_risk": judgment.false_break_risk,
         "signal_strength": judgment.signal_strength,
         "should_trade_now": judgment.should_trade_now,
+        "action_probabilities": dict(judgment.action_probabilities or {}),
+        "signal_strength_score": judgment.signal_strength_score,
         "model": judgment.model,
+        "raw": dict(judgment.raw or {}),
     }
 
 

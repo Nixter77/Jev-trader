@@ -57,7 +57,7 @@ Jev может сказать `buy_long` и `сильный`, но если `sho
 ```bash
 # .env
 DECISION_BACKEND=laya
-LAYA_CHECKPOINT=multilingual   # english | multilingual | typed-decisions | router
+LAYA_CHECKPOINT=typed-decisions   # english | multilingual | typed-decisions | router
 # LAYA_DEVICE=cpu
 
 # или флагами CLI

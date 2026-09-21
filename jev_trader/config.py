@@ -32,7 +32,7 @@ class Settings:
     telegram_notify: bool
     jev_model: str = "jev-1.13.0"
     decision_backend: str = "jev"
-    laya_checkpoint: str = "multilingual"
+    laya_checkpoint: str = "typed-decisions"
     laya_device: str = ""
 
 
@@ -111,6 +111,6 @@ def load_settings(
         telegram_notify=_truthy(notify_raw),
         jev_model="jev-1.13.0",
         decision_backend=(os.environ.get("DECISION_BACKEND") or "jev").strip().lower() or "jev",
-        laya_checkpoint=(os.environ.get("LAYA_CHECKPOINT") or "multilingual").strip() or "multilingual",
+        laya_checkpoint=(os.environ.get("LAYA_CHECKPOINT") or "typed-decisions").strip() or "typed-decisions",
         laya_device=(os.environ.get("LAYA_DEVICE") or "").strip(),
     )

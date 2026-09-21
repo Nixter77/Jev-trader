@@ -45,7 +45,7 @@ LAYA_CHECKPOINTS: dict[str, tuple[str, str | None]] = {
     "multilingual": (LAYA_REPO, "multilingual"),
     "typed-decisions": (LAYA_REPO, "typed-decisions"),
 }
-DEFAULT_LAYA_CHECKPOINT = "multilingual"
+DEFAULT_LAYA_CHECKPOINT = "typed-decisions"
 
 
 

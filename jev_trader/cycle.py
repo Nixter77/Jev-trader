@@ -71,6 +71,7 @@ def decision_payload(result: CycleResult) -> dict[str, Any]:
             "false_break_risk": result.judgment.false_break_risk,
             "signal_strength": result.judgment.signal_strength,
             "should_trade_now": result.judgment.should_trade_now,
+            "action_probabilities": dict(result.judgment.action_probabilities or {}),
             "model": result.judgment.model,
         },
         "state_text": result.state_text,
