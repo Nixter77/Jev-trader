@@ -138,7 +138,7 @@ def _add_backend_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--laya-checkpoint",
         default=None,
-        help="Laya checkpoint: multilingual (default), english, typed-decisions, router. Overrides LAYA_CHECKPOINT.",
+        help="Laya checkpoint: typed-decisions (default), multilingual, english, router. Overrides LAYA_CHECKPOINT.",
     )
     p.add_argument(
         "--laya-device",
