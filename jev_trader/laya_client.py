@@ -11,6 +11,28 @@ from jev_trader.models import ACTIONS, CompactState, JevJudgment
 # Avoid TensorFlow import deadlocks when transformers probes TF (Laya docs).
 os.environ.setdefault("USE_TF", "0")
 
+
+def _patch_torch_compile_if_needed() -> None:
+    """Intel Mac + torch 2.2 + Python 3.12: ModernBert import hits unsupported Dynamo.
+
+    Make torch.compile a no-op before transformers.models.modernbert loads.
+    """
+    try:
+        import torch
+    except ImportError:
+        return
+    # Dynamo unsupported on py3.12 with older torch; also harmless no-op elsewhere.
+    ver = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+    import sys
+    if sys.version_info >= (3, 12) and ver < (2, 5):
+        def _noop_compile(fn=None, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if fn is None:
+                return lambda f: f
+            return fn
+        torch.compile = _noop_compile  # type: ignore[assignment]
+
+
+
 LAYA_REPO = "convaiinnovations/laya"
 LAYA_CHECKPOINTS: dict[str, tuple[str, str | None]] = {
     "english": (LAYA_REPO, None),
@@ -149,6 +171,7 @@ class LayaClient:
         if self._agent is not None:
             return self._agent
         try:
+            _patch_torch_compile_if_needed()
             import laya
         except ImportError as exc:  # pragma: no cover
             raise ImportError(
