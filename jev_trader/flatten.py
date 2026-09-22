@@ -15,7 +15,7 @@ from jev_trader.execution import (
     order_lock,
 )
 from jev_trader.ledger import Ledger
-from jev_trader.models import CycleResult, ExecutionResult, TradeIntent
+from jev_trader.models import CycleResult, ExecutionResult, market_close_intent
 from jev_trader.status import read_json, utc_now, write_json
 
 
@@ -32,19 +32,13 @@ def _record_close(
     if not symbol or not is_real_fill(execution):
         return
     price = fill_price(execution, mark)
-    intent = TradeIntent(
-        action="close",
-        qty=fill_qty(execution, qty),
-        stop_price=None,
-        stop_distance=None,
-        entry_type="MARKET",
-        reduce_only=True,
-        client_order_id=client_order_id,
+    intent = market_close_intent(
         symbol=symbol,
-        risk_pct=0.0,
+        qty=fill_qty(execution, qty),
         order_side=order_side,
-        limit_price=price,
+        client_order_id=client_order_id,
         risk_event="flatten",
+        limit_price=price,
     )
     ledger.record(
         CycleResult(
@@ -76,19 +70,13 @@ def _flatten_ledger(broker: Any, ledger: Ledger) -> dict[str, Any]:
             mark_f = None
         cid = client_order_id(symbol, "flatten")
         order_side = "SELL" if side == "LONG" else "BUY"
-        intent = TradeIntent(
-            action="close",
-            qty=size,
-            stop_price=None,
-            stop_distance=None,
-            entry_type="MARKET",
-            reduce_only=True,
-            client_order_id=cid,
+        intent = market_close_intent(
             symbol=symbol,
-            risk_pct=0.0,
+            qty=size,
             order_side=order_side,
-            limit_price=mark_f,
+            client_order_id=cid,
             risk_event="flatten",
+            limit_price=mark_f,
         )
         execution = broker.submit(intent)
         _record_close(

@@ -19,7 +19,7 @@ from jev_trader.config import (
     is_testnet_base,
 )
 from jev_trader.http import ssl_context
-from jev_trader.models import ExecutionResult, TradeIntent
+from jev_trader.models import ExecutionResult, TradeIntent, market_close_intent
 
 SELL_ONLY_CLOSES_LONG = "sell_only_closes_long"
 RECV_WINDOW_MS = 60_000
@@ -44,7 +44,8 @@ def bump_flatten_generation() -> int:
 
 
 def current_flatten_generation() -> int:
-    return flatten_generation
+    with order_lock:
+        return flatten_generation
 
 
 def client_order_id(symbol: str, action: str) -> str:
@@ -179,6 +180,39 @@ def open_sell_error(intent: TradeIntent) -> str | None:
     return None
 
 
+def blocked_execution(intent: TradeIntent, venue: str) -> ExecutionResult | None:
+    """Skip or reject before any venue sees the order. None means the order may proceed."""
+    if intent.skip_reason or intent.qty <= 0:
+        return ExecutionResult(
+            status="skipped",
+            venue=venue,
+            client_order_id=intent.client_order_id,
+            reduce_only=intent.reduce_only,
+            detail={"skip_reason": intent.skip_reason},
+        )
+    blocked = open_sell_error(intent)
+    if blocked:
+        return ExecutionResult(
+            status="rejected",
+            venue=venue,
+            client_order_id=intent.client_order_id,
+            reduce_only=intent.reduce_only,
+            detail={"error": blocked},
+        )
+    return None
+
+
+def _detail(execution: ExecutionResult) -> dict[str, Any]:
+    return execution.detail if isinstance(execution.detail, dict) else {}
+
+
+def _body(execution: ExecutionResult) -> Any:
+    detail = execution.detail if isinstance(execution.detail, dict) else None
+    if detail is None:
+        return None
+    return detail.get("body")
+
+
 def order_executed_qty(body: Any) -> float:
     if not isinstance(body, dict):
         return 0.0
@@ -219,18 +253,17 @@ def is_real_fill(execution: ExecutionResult | None) -> bool:
         return True
     if execution.status not in {"filled", "accepted"}:
         return False
-    body = execution.detail.get("body") if isinstance(execution.detail, dict) else None
+    body = _body(execution)
     if execution.status == "filled" and not isinstance(body, dict):
         return True
     if order_is_filled(body):
         return True
-    if execution.status == "filled":
-        detail = execution.detail if isinstance(execution.detail, dict) else {}
-        try:
-            return float(detail.get("filled_qty") or 0.0) > 0
-        except (TypeError, ValueError):
-            return False
-    return False
+    if execution.status != "filled":
+        return False
+    try:
+        return float(_detail(execution).get("filled_qty") or 0.0) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def fill_qty(execution: ExecutionResult | None, fallback: float = 0.0) -> float:
@@ -238,34 +271,30 @@ def fill_qty(execution: ExecutionResult | None, fallback: float = 0.0) -> float:
         return 0.0
     if execution.status == "paper_recorded":
         return fallback
-    body = execution.detail.get("body") if isinstance(execution.detail, dict) else None
-    qty = order_executed_qty(body)
+    qty = order_executed_qty(_body(execution))
     if qty > 0:
         return qty
-    if isinstance(execution.detail, dict):
-        try:
-            extra = float(execution.detail.get("filled_qty") or 0.0)
-        except (TypeError, ValueError):
-            extra = 0.0
-        if extra > 0:
-            return extra
+    try:
+        extra = float(_detail(execution).get("filled_qty") or 0.0)
+    except (TypeError, ValueError):
+        extra = 0.0
+    if extra > 0:
+        return extra
     return fallback if execution.status == "filled" else 0.0
 
 
 def fill_price(execution: ExecutionResult | None, fallback: float | None) -> float | None:
     if execution is None:
         return fallback
-    body = execution.detail.get("body") if isinstance(execution.detail, dict) else None
-    px = order_fill_price(body)
+    px = order_fill_price(_body(execution))
     if px is not None:
         return px
-    if isinstance(execution.detail, dict):
-        try:
-            extra = float(execution.detail.get("fill_price") or 0.0)
-        except (TypeError, ValueError):
-            extra = 0.0
-        if extra > 0:
-            return extra
+    try:
+        extra = float(_detail(execution).get("fill_price") or 0.0)
+    except (TypeError, ValueError):
+        extra = 0.0
+    if extra > 0:
+        return extra
     return fallback
 
 
@@ -273,23 +302,9 @@ class PaperBroker:
     venue = "paper"
 
     def submit(self, intent: TradeIntent) -> ExecutionResult:
-        if intent.skip_reason or intent.qty <= 0:
-            return ExecutionResult(
-                status="skipped",
-                venue=self.venue,
-                client_order_id=intent.client_order_id,
-                reduce_only=intent.reduce_only,
-                detail={"skip_reason": intent.skip_reason},
-            )
-        blocked = open_sell_error(intent)
-        if blocked:
-            return ExecutionResult(
-                status="rejected",
-                venue=self.venue,
-                client_order_id=intent.client_order_id,
-                reduce_only=intent.reduce_only,
-                detail={"error": blocked},
-            )
+        blocked = blocked_execution(intent, self.venue)
+        if blocked is not None:
+            return blocked
         return ExecutionResult(
             status="paper_recorded",
             venue=self.venue,
@@ -455,23 +470,9 @@ class BinanceFuturesBroker:
             return self._submit_locked(intent)
 
     def _submit_locked(self, intent: TradeIntent) -> ExecutionResult:
-        if intent.skip_reason or intent.qty <= 0:
-            return ExecutionResult(
-                status="skipped",
-                venue=self.venue,
-                client_order_id=intent.client_order_id,
-                reduce_only=intent.reduce_only,
-                detail={"skip_reason": intent.skip_reason},
-            )
-        blocked = open_sell_error(intent)
-        if blocked:
-            return ExecutionResult(
-                status="rejected",
-                venue=self.venue,
-                client_order_id=intent.client_order_id,
-                reduce_only=intent.reduce_only,
-                detail={"error": blocked},
-            )
+        blocked = blocked_execution(intent, self.venue)
+        if blocked is not None:
+            return blocked
         qty = intent.qty
         price = intent.limit_price
         flt = self.filters_for(intent.symbol)
@@ -736,17 +737,12 @@ class BinanceFuturesBroker:
             side = str(pos.get("side") or "")
             if not symbol or size <= 0:
                 continue
-            intent = TradeIntent(
-                action="close",
-                qty=size,
-                stop_price=None,
-                stop_distance=None,
-                entry_type="MARKET",
-                reduce_only=True,
-                client_order_id=client_order_id(symbol, "flatten"),
+            intent = market_close_intent(
                 symbol=symbol,
-                risk_pct=0.0,
+                qty=size,
                 order_side="SELL" if side == "LONG" else "BUY",
+                client_order_id=client_order_id(symbol, "flatten"),
+                risk_event="flatten",
             )
             result = self.submit(intent)
             closes.append(

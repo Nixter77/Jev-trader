@@ -269,6 +269,76 @@ def overlay_wallet_position(snapshot: MarketSnapshot, wallet: dict[str, Any]) ->
     )
 
 
+def _pull_wallet(broker: Any, wallet_box: dict[str, Any] | None) -> dict[str, Any] | None:
+    fetch = getattr(broker, "fetch_wallet", None)
+    if not callable(fetch):
+        return None
+    try:
+        wallet = fetch()
+    except Exception as exc:  # noqa: BLE001
+        if wallet_box is not None:
+            wallet_box["wallet_error"] = f"{type(exc).__name__}: {exc}"
+        return None
+    if wallet_box is not None:
+        wallet_box["wallet"] = wallet
+        wallet_box.pop("wallet_error", None)
+    return wallet
+
+
+def _account_for_cycle(
+    snapshot: MarketSnapshot,
+    wallet: dict[str, Any] | None,
+    *,
+    ledger: Ledger | None,
+    wallet_box: dict[str, Any] | None,
+    account_kwargs: dict[str, Any],
+    max_positions: int,
+) -> tuple[MarketSnapshot, AccountState]:
+    """Wallet is the position. Ledger only supplies a stop the exchange row does not carry."""
+    cash = snapshot.position.cash_usdt
+    available = None
+    daily_pnl_pct = float(account_kwargs.get("daily_pnl_pct", 0.0))
+    if wallet is not None:
+        snapshot = overlay_wallet_position(snapshot, wallet)
+        cash = float(wallet.get("equity_usdt") or cash)
+        if wallet.get("available_usdt") is not None:
+            available = float(wallet["available_usdt"])
+        if wallet_box is not None:
+            start = wallet_box.get("start_equity_usdt")
+            if not start and cash:
+                wallet_box["start_equity_usdt"] = cash
+                start = cash
+            if start:
+                daily_pnl_pct = (cash - float(start)) / float(start)
+        if ledger is not None:
+            try:
+                ledger.sync_exchange_positions(wallet)
+                if snapshot.position.stop_price is None and snapshot.position.side == "LONG":
+                    loaded = ledger.load_position(snapshot.symbol, default_cash=cash)
+                    if loaded.stop_price is not None:
+                        snapshot = replace(
+                            snapshot,
+                            position=replace(snapshot.position, stop_price=loaded.stop_price),
+                        )
+            except Exception:  # noqa: BLE001 — trading must not die on ledger sync
+                pass
+    if ledger is not None:
+        open_n = ledger.count_open_positions()
+    else:
+        open_n = 0 if snapshot.position.side == "FLAT" else 1
+    if wallet is not None and wallet.get("open_positions") is not None:
+        open_n = int(wallet["open_positions"])
+    account = AccountState(
+        equity_usdt=cash,
+        daily_pnl_pct=daily_pnl_pct,
+        kill_switch=bool(account_kwargs.get("kill_switch", False)),
+        open_positions=open_n,
+        max_positions=int(account_kwargs.get("max_positions", max_positions)),
+        available_usdt=available,
+    )
+    return snapshot, account
+
+
 def make_run_cycle(
     *,
     judgment: JevJudgment | None,
@@ -284,57 +354,14 @@ def make_run_cycle(
     wallet_box: dict[str, Any] | None = None,
 ) -> RunCycle:
     def run_cycle(snapshot: MarketSnapshot) -> CycleResult:
-        wallet = None
-        fetch = getattr(broker, "fetch_wallet", None)
-        if callable(fetch):
-            try:
-                wallet = fetch()
-                if wallet_box is not None:
-                    wallet_box["wallet"] = wallet
-                    wallet_box.pop("wallet_error", None)
-            except Exception as exc:  # noqa: BLE001
-                if wallet_box is not None:
-                    wallet_box["wallet_error"] = f"{type(exc).__name__}: {exc}"
-        cash = snapshot.position.cash_usdt
-        available = None
-        daily_pnl_pct = float(account_kwargs.get("daily_pnl_pct", 0.0))
-        if wallet is not None:
-            snapshot = overlay_wallet_position(snapshot, wallet)
-            cash = float(wallet.get("equity_usdt") or cash)
-            if wallet.get("available_usdt") is not None:
-                available = float(wallet["available_usdt"])
-            if wallet_box is not None:
-                start = wallet_box.get("start_equity_usdt")
-                if not start and cash:
-                    wallet_box["start_equity_usdt"] = cash
-                    start = cash
-                if start:
-                    daily_pnl_pct = (cash - float(start)) / float(start)
-            if ledger is not None:
-                try:
-                    ledger.sync_exchange_positions(wallet)
-                    if snapshot.position.stop_price is None and snapshot.position.side == "LONG":
-                        loaded = ledger.load_position(snapshot.symbol, default_cash=cash)
-                        if loaded.stop_price is not None:
-                            snapshot = replace(
-                                snapshot,
-                                position=replace(snapshot.position, stop_price=loaded.stop_price),
-                            )
-                except Exception:  # noqa: BLE001 — trading must not die on ledger sync
-                    pass
-        if ledger is not None:
-            open_n = ledger.count_open_positions()
-        else:
-            open_n = 0 if snapshot.position.side == "FLAT" else 1
-        if wallet is not None and wallet.get("open_positions") is not None:
-            open_n = int(wallet["open_positions"])
-        account = AccountState(
-            equity_usdt=cash,
-            daily_pnl_pct=daily_pnl_pct,
-            kill_switch=bool(account_kwargs.get("kill_switch", False)),
-            open_positions=open_n,
-            max_positions=int(account_kwargs.get("max_positions", max_positions)),
-            available_usdt=available,
+        wallet = _pull_wallet(broker, wallet_box)
+        snapshot, account = _account_for_cycle(
+            snapshot,
+            wallet,
+            ledger=ledger,
+            wallet_box=wallet_box,
+            account_kwargs=account_kwargs,
+            max_positions=max_positions,
         )
         return run_once(
             snapshot,
@@ -651,7 +678,6 @@ class LiveRunner:
         started = time.monotonic()
         last_summary = 0.0
         backoff = 1.0
-        rest_offline_done = False
         self.write_status()
         while True:
             if self.max_runtime is not None and time.monotonic() - started >= self.max_runtime:
@@ -679,10 +705,6 @@ class LiveRunner:
                 return 0
             if not results:
                 self.emit_heartbeat()
-            if self.recorded_klines is not None and not self.recorded_closes:
-                rest_offline_done = True
-            if rest_offline_done:
-                return 0 if self.cycles else 1
             if self.offline and not self.recorded_closes:
                 return 0 if self.cycles else 1
             now = time.monotonic()

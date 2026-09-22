@@ -35,6 +35,26 @@ def _close_action_prob(judgment: JevJudgment) -> float | None:
         return None
 
 
+def _hold(judgment: JevJudgment, reason: str) -> PolicyDecision:
+    return PolicyDecision(action="hold", passed=False, skip_reason=reason, judgment=judgment)
+
+
+def _allow(judgment: JevJudgment) -> PolicyDecision:
+    return PolicyDecision(
+        action=judgment.action, passed=True, skip_reason=None, judgment=judgment
+    )
+
+
+def _quality_skip(judgment: JevJudgment) -> str | None:
+    """Shared false-break and strength bar. Close and entry both use it."""
+    if judgment.false_break_risk > FALSE_BREAK_RISK_MAX:
+        return "false_break"
+    floor = signal_strength_rank(SIGNAL_STRENGTH_MIN)
+    if signal_strength_rank(judgment.signal_strength) < floor:
+        return "low_strength"
+    return None
+
+
 def apply_policy(
     judgment: JevJudgment,
     *,
@@ -51,93 +71,27 @@ def apply_policy(
     Risk flatten/stop still bypasses this via risk.py, not policy.
     """
     if judgment.action not in TRADE_ACTIONS:
-        return PolicyDecision(
-            action="hold",
-            passed=False,
-            skip_reason="hold",
-            judgment=judgment,
-        )
+        return _hold(judgment, "hold")
 
-    # --- close asymmetry (even under follow_jev) ---
+    # Close stays gated under follow_jev. Entries may skip the probability bar.
     if judgment.action == "close":
         if judgment.should_trade_now < close_should_trade_min:
-            return PolicyDecision(
-                action="hold",
-                passed=False,
-                skip_reason="close_should_trade_now",
-                judgment=judgment,
-            )
+            return _hold(judgment, "close_should_trade_now")
         close_p = _close_action_prob(judgment)
         if close_p is not None and close_p < close_action_prob_min:
-            return PolicyDecision(
-                action="hold",
-                passed=False,
-                skip_reason="close_action_prob",
-                judgment=judgment,
-            )
-        if judgment.false_break_risk > FALSE_BREAK_RISK_MAX:
-            return PolicyDecision(
-                action="hold",
-                passed=False,
-                skip_reason="false_break",
-                judgment=judgment,
-            )
-        if signal_strength_rank(judgment.signal_strength) < signal_strength_rank(
-            SIGNAL_STRENGTH_MIN
-        ):
-            return PolicyDecision(
-                action="hold",
-                passed=False,
-                skip_reason="low_strength",
-                judgment=judgment,
-            )
-        return PolicyDecision(
-            action="close",
-            passed=True,
-            skip_reason=None,
-            judgment=judgment,
-        )
+            return _hold(judgment, "close_action_prob")
+        quality = _quality_skip(judgment)
+        if quality:
+            return _hold(judgment, quality)
+        return _allow(judgment)
 
     if follow_jev:
-        return PolicyDecision(
-            action=judgment.action,
-            passed=True,
-            skip_reason=None,
-            judgment=judgment,
-        )
+        return _allow(judgment)
     if judgment.should_trade_now < min_should_trade:
-        return PolicyDecision(
-            action="hold",
-            passed=False,
-            skip_reason="should_trade_now",
-            judgment=judgment,
-        )
-    if judgment.false_break_risk > FALSE_BREAK_RISK_MAX:
-        return PolicyDecision(
-            action="hold",
-            passed=False,
-            skip_reason="false_break",
-            judgment=judgment,
-        )
-    if signal_strength_rank(judgment.signal_strength) < signal_strength_rank(
-        SIGNAL_STRENGTH_MIN
-    ):
-        return PolicyDecision(
-            action="hold",
-            passed=False,
-            skip_reason="low_strength",
-            judgment=judgment,
-        )
+        return _hold(judgment, "should_trade_now")
+    quality = _quality_skip(judgment)
+    if quality:
+        return _hold(judgment, quality)
     if judgment.action in ENTRY_ACTIONS and judgment.trend_aligned < TREND_ALIGNED_MIN:
-        return PolicyDecision(
-            action="hold",
-            passed=False,
-            skip_reason="trend_aligned",
-            judgment=judgment,
-        )
-    return PolicyDecision(
-        action=judgment.action,
-        passed=True,
-        skip_reason=None,
-        judgment=judgment,
-    )
+        return _hold(judgment, "trend_aligned")
+    return _allow(judgment)

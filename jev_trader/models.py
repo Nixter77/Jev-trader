@@ -130,6 +130,35 @@ class TradeIntent:
     risk_event: str | None = None
 
 
+def market_close_intent(
+    *,
+    symbol: str,
+    qty: float,
+    order_side: str,
+    client_order_id: str,
+    risk_event: str | None,
+    risk_pct: float = 0.0,
+    limit_price: float | None = None,
+    entry_type: str = "MARKET",
+) -> TradeIntent:
+    """Reduce-only close. Every caller (risk, flatten, exchange) builds the same order."""
+    return TradeIntent(
+        action="close",
+        qty=qty,
+        stop_price=None,
+        stop_distance=None,
+        entry_type=entry_type,
+        reduce_only=True,
+        client_order_id=client_order_id,
+        symbol=symbol,
+        risk_pct=risk_pct,
+        order_side=order_side,
+        limit_price=limit_price,
+        skip_reason=None,
+        risk_event=risk_event,
+    )
+
+
 @dataclass(frozen=True)
 class AccountState:
     equity_usdt: float

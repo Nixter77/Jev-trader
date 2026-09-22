@@ -7,6 +7,7 @@ from jev_trader.models import (
     MarketSnapshot,
     PolicyDecision,
     TradeIntent,
+    market_close_intent,
 )
 
 ATR_STOP_MULT_MIN = 1.2
@@ -90,20 +91,15 @@ def apply_risk(
         side = _order_side("close", pos_side)
         limit = None if entry_type == "MARKET" else post_only_limit_price(side, close, snapshot)
         tag = "flatten" if entry_type == "MARKET" else "close"
-        return TradeIntent(
-            action="close",
-            qty=snapshot.position.size,
-            stop_price=None,
-            stop_distance=None,
-            entry_type=entry_type,
-            reduce_only=True,
-            client_order_id=client_order_id(symbol, tag),
+        return market_close_intent(
             symbol=symbol,
-            risk_pct=account.risk_pct,
+            qty=snapshot.position.size,
             order_side=side,
-            limit_price=limit,
-            skip_reason=None,
+            client_order_id=client_order_id(symbol, tag),
             risk_event=risk_event,
+            risk_pct=account.risk_pct,
+            limit_price=limit,
+            entry_type=entry_type,
         )
 
     if account.kill_switch:

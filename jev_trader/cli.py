@@ -13,7 +13,7 @@ from jev_trader.execution import BinanceFuturesBroker, BinanceTestnetBroker, Pap
 DEFAULT_PAPER_LEDGER = "data/ledger.sqlite"
 DEFAULT_TESTNET_LEDGER = "data/ledger-testnet.sqlite"
 from jev_trader.universe import DEFAULT_MIN_QUOTE_VOLUME, DEFAULT_UNIVERSE_SIZE
-from jev_trader.jev import JevClient, judgment_from_dict
+from jev_trader.jev import judgment_from_dict
 from jev_trader.judge import make_judge_client, normalize_backend
 from jev_trader.laya_client import DEFAULT_LAYA_CHECKPOINT
 from jev_trader.ledger import Ledger
@@ -115,10 +115,39 @@ def _judge_kwargs(settings, answers=None) -> dict:
     """Kwargs for run_once / live loop: Jev key or Laya client."""
     if answers is not None:
         return {"typesafe_api_key": None, "jev_client": None}
-    from jev_trader.judge import normalize_backend, make_judge_client
     if normalize_backend(settings.decision_backend) == "laya":
         return {"typesafe_api_key": None, "jev_client": make_judge_client(settings)}
     return {"typesafe_api_key": settings.typesafe_api_key, "jev_client": None}
+
+
+def _prepare_trading(args: argparse.Namespace):
+    """Settings plus an exit code when the process must not send orders."""
+    settings = _apply_backend_args(
+        load_settings(args.env, allow_production=args.venue == "live"),
+        args,
+    )
+    if load_answers(getattr(args, "answers", None)) is None:
+        err = _require_judge_ready(settings)
+        if err:
+            print(json.dumps({"ok": False, "error": err}))
+            return settings, 2
+    missing = _require_binance_keys(settings, args.venue)
+    if missing:
+        print(json.dumps({"ok": False, "error": missing}))
+        return settings, 2
+    if args.venue == "live":
+        print(
+            json.dumps(
+                {
+                    "warning": "live venue sends SIGNED orders to Binance production",
+                    "confirm": LIVE_CONFIRM_VALUE,
+                    "base": settings.binance_fapi_base,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    return settings, None
 
 def _require_judge_ready(settings) -> str | None:
     """Return an error string if the selected backend cannot run, else None."""
@@ -171,6 +200,7 @@ def cmd_once(args: argparse.Namespace) -> int:
         open_positions=open_n,
     )
     notifier = notifier_from_settings(settings, force_off=args.no_telegram)
+    judge_kw = _judge_kwargs(settings, answers)
     result = run_once(
         snapshot,
         judgment=None if answers is None else judgment_from_dict(answers),
@@ -178,8 +208,8 @@ def cmd_once(args: argparse.Namespace) -> int:
         broker=broker,
         ledger=ledger,
         notifier=notifier,
-        typesafe_api_key=settings.typesafe_api_key if settings.decision_backend == "jev" else None,
-        jev_client=None if answers is not None or settings.decision_backend == "jev" else make_judge_client(settings),
+        typesafe_api_key=judge_kw["typesafe_api_key"],
+        jev_client=judge_kw["jev_client"],
     )
     print(dumps_decision(result))
     return 0
@@ -355,31 +385,9 @@ def _make_live_runner(args: argparse.Namespace, settings, ledger: Ledger, broker
 
 
 def cmd_live(args: argparse.Namespace) -> int:
-    settings = load_settings(args.env, allow_production=args.venue == "live")
-    settings = _apply_backend_args(settings, args)
-    answers = load_answers(args.answers)
-    settings = _apply_backend_args(settings, args)
-    if answers is None:
-        err = _require_judge_ready(settings)
-        if err:
-            print(json.dumps({"ok": False, "error": err}))
-            return 2
-    missing = _require_binance_keys(settings, args.venue)
-    if missing:
-        print(json.dumps({"ok": False, "error": missing}))
-        return 2
-    if args.venue == "live":
-        print(
-            json.dumps(
-                {
-                    "warning": "live venue sends SIGNED orders to Binance production",
-                    "confirm": LIVE_CONFIRM_VALUE,
-                    "base": settings.binance_fapi_base,
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
-        )
+    settings, code = _prepare_trading(args)
+    if code:
+        return code
     ledger = Ledger(_ledger_path(args))
     broker = _make_broker(args, settings)
     notifier = notifier_from_settings(settings, force_off=args.no_telegram)
@@ -434,31 +442,9 @@ def cmd_monitor(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     """Always-on paper/testnet loop + local trade blotter."""
-    settings = load_settings(args.env, allow_production=args.venue == "live")
-    settings = _apply_backend_args(settings, args)
-    answers = load_answers(args.answers)
-    settings = _apply_backend_args(settings, args)
-    if answers is None:
-        err = _require_judge_ready(settings)
-        if err:
-            print(json.dumps({"ok": False, "error": err}))
-            return 2
-    missing = _require_binance_keys(settings, args.venue)
-    if missing:
-        print(json.dumps({"ok": False, "error": missing}))
-        return 2
-    if args.venue == "live":
-        print(
-            json.dumps(
-                {
-                    "warning": "live venue sends SIGNED orders to Binance production",
-                    "confirm": LIVE_CONFIRM_VALUE,
-                    "base": settings.binance_fapi_base,
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
-        )
+    settings, code = _prepare_trading(args)
+    if code:
+        return code
     ledger = Ledger(_ledger_path(args))
     status_path = _sidecar(ledger, "bot-status.json", args.status)
     pid_path = _sidecar(ledger, "bot.pid", args.pid)
