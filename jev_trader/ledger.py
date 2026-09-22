@@ -328,6 +328,28 @@ class Ledger:
             )
             conn.commit()
 
+    def seconds_since_last_close(self, symbol: str) -> float | None:
+        """Seconds since the latest close fill for symbol, or None if never closed."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT ts FROM fills
+                WHERE symbol = ? AND action = 'close'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (symbol.upper(),),
+            ).fetchone()
+        if row is None:
+            return None
+        raw = str(row["ts"])
+        try:
+            ts = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - ts).total_seconds())
+
     def count_open_positions(self) -> int:
         with self._connect() as conn:
             row = conn.execute(
