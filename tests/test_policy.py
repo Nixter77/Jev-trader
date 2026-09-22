@@ -32,39 +32,19 @@ def test_hold_action_skips() -> None:
     assert decision.skip_reason == "hold"
 
 
-def test_follow_jev_rejects_weak_entry_should() -> None:
-    decision = apply_policy(
-        _judgment(should_trade_now=0.36, trend_aligned=0.9),
-        follow_jev=True,
-    )
-    assert decision.passed is False
-    assert decision.skip_reason == "follow_should_trade_now"
-
-
-def test_follow_jev_rejects_weak_entry_prob() -> None:
+def test_follow_jev_buys_at_live_laya_scores() -> None:
+    """Live typed-decisions buy_long is ~0.43 should and ~0.34 trend. That is an entry."""
     decision = apply_policy(
         _judgment(
-            should_trade_now=0.55,
-            trend_aligned=0.9,
-            action_probabilities={"buy_long": 0.52, "hold": 0.48},
+            should_trade_now=0.43,
+            trend_aligned=0.34,
+            action_probabilities={"buy_long": 0.56, "hold": 0.44},
         ),
         follow_jev=True,
     )
-    assert decision.passed is False
-    assert decision.skip_reason == "follow_action_prob"
-
-
-def test_follow_jev_rejects_unaligned_entry() -> None:
-    decision = apply_policy(
-        _judgment(
-            should_trade_now=0.55,
-            trend_aligned=0.40,
-            action_probabilities={"buy_long": 0.70, "hold": 0.30},
-        ),
-        follow_jev=True,
-    )
-    assert decision.passed is False
-    assert decision.skip_reason == "trend_aligned"
+    assert decision.passed is True
+    assert decision.action == "buy_long"
+    assert decision.skip_reason is None
 
 
 def test_follow_jev_allows_soft_floor_entry() -> None:

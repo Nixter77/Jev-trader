@@ -14,9 +14,6 @@ CLOSE_ACTION_PROB_MIN = 0.75
 FALSE_BREAK_RISK_MAX = 0.35
 SIGNAL_STRENGTH_MIN = "рабочий"
 TREND_ALIGNED_MIN = 0.60
-# Soft floor under follow_jev: Laya buy_long was ~0.44/0.56 and still traded.
-FOLLOW_ENTRY_SHOULD_MIN = 0.50
-FOLLOW_ENTRY_ACTION_PROB_MIN = 0.58
 ENTRY_ACTIONS = frozenset({"buy_long"})
 TRADE_ACTIONS = frozenset({"buy_long", "sell_short", "close"})
 
@@ -72,10 +69,11 @@ def apply_policy(
 ) -> PolicyDecision:
     """Confidence gates in code. Size/stop/leverage are never decided here.
 
-    `follow_jev=True` softens **entry** gates (not a free pass): buy still needs a
-    soft should/prob/trend floor. **Close is always gated** (asymmetry):
-    Laya typed-decisions was dumping losers while should_trade_now sat ~0.4.
-    Risk flatten/stop still bypasses this via risk.py, not policy.
+    `follow_jev=True` skips probability gates for **entries**. Live Laya
+    buy_long sits near should 0.43 and trend 0.34, so a 0.50/0.60 floor
+    admits nothing. **Close is always gated** (asymmetry): Laya was dumping
+    losers while should_trade_now sat ~0.4. Risk flatten/stop still bypasses
+    this via risk.py, not policy.
     """
     if judgment.action not in TRADE_ACTIONS:
         return _hold(judgment, "hold")
@@ -93,15 +91,6 @@ def apply_policy(
         return _allow(judgment)
 
     if follow_jev:
-        # Soft entry floor: still follow the model, but reject coin-flip buys.
-        if judgment.action in ENTRY_ACTIONS:
-            if judgment.should_trade_now < FOLLOW_ENTRY_SHOULD_MIN:
-                return _hold(judgment, "follow_should_trade_now")
-            buy_p = _action_prob(judgment, "buy_long")
-            if buy_p is not None and buy_p < FOLLOW_ENTRY_ACTION_PROB_MIN:
-                return _hold(judgment, "follow_action_prob")
-            if judgment.trend_aligned < TREND_ALIGNED_MIN:
-                return _hold(judgment, "trend_aligned")
         return _allow(judgment)
     if judgment.should_trade_now < min_should_trade:
         return _hold(judgment, "should_trade_now")
