@@ -32,9 +32,50 @@ def test_hold_action_skips() -> None:
     assert decision.skip_reason == "hold"
 
 
-def test_follow_jev_skips_probability_gates() -> None:
+def test_follow_jev_rejects_weak_entry_should() -> None:
     decision = apply_policy(
-        _judgment(should_trade_now=0.36, false_break_risk=0.9, signal_strength="слабый"),
+        _judgment(should_trade_now=0.36, trend_aligned=0.9),
+        follow_jev=True,
+    )
+    assert decision.passed is False
+    assert decision.skip_reason == "follow_should_trade_now"
+
+
+def test_follow_jev_rejects_weak_entry_prob() -> None:
+    decision = apply_policy(
+        _judgment(
+            should_trade_now=0.55,
+            trend_aligned=0.9,
+            action_probabilities={"buy_long": 0.52, "hold": 0.48},
+        ),
+        follow_jev=True,
+    )
+    assert decision.passed is False
+    assert decision.skip_reason == "follow_action_prob"
+
+
+def test_follow_jev_rejects_unaligned_entry() -> None:
+    decision = apply_policy(
+        _judgment(
+            should_trade_now=0.55,
+            trend_aligned=0.40,
+            action_probabilities={"buy_long": 0.70, "hold": 0.30},
+        ),
+        follow_jev=True,
+    )
+    assert decision.passed is False
+    assert decision.skip_reason == "trend_aligned"
+
+
+def test_follow_jev_allows_soft_floor_entry() -> None:
+    decision = apply_policy(
+        _judgment(
+            should_trade_now=0.52,
+            trend_aligned=0.70,
+            false_break_risk=0.9,
+            signal_strength="слабый",
+            action_probabilities={"buy_long": 0.60, "hold": 0.40},
+        ),
         follow_jev=True,
     )
     assert decision.passed is True

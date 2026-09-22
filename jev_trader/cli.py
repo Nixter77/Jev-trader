@@ -799,7 +799,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
         p.add_argument("--universe-size", type=int, default=DEFAULT_UNIVERSE_SIZE)
         p.add_argument("--min-quote-volume", type=float, default=DEFAULT_MIN_QUOTE_VOLUME)
-        p.add_argument("--max-positions", type=int, default=5)
+        p.add_argument("--max-positions", type=int, default=3)
         p.add_argument(
             "--follow-jev",
             dest="follow_jev",

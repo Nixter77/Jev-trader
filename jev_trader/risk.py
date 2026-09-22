@@ -13,6 +13,9 @@ from jev_trader.models import (
 ATR_STOP_MULT_MIN = 1.2
 ATR_STOP_MULT_MAX = 1.8
 
+# After a close, wait before re-entering the same symbol (anti-chop).
+REENTRY_COOLDOWN_SEC = 1800.0
+
 
 def long_protective_stop(
     snapshot: MarketSnapshot,
@@ -62,6 +65,9 @@ def apply_risk(
     features: Features,
     snapshot: MarketSnapshot,
     account: AccountState,
+    *,
+    seconds_since_last_close: float | None = None,
+    reentry_cooldown_sec: float = REENTRY_COOLDOWN_SEC,
 ) -> TradeIntent:
     """Size = risk% / ATR-stop. Jev probabilities never enter the size formula."""
     symbol = snapshot.symbol
@@ -137,6 +143,13 @@ def apply_risk(
 
     if in_position and pos_side == "LONG":
         return skip("already_long")
+
+    if (
+        seconds_since_last_close is not None
+        and reentry_cooldown_sec > 0
+        and seconds_since_last_close < reentry_cooldown_sec
+    ):
+        return skip("reentry_cooldown")
 
     if account.open_positions >= account.max_positions:
         return skip("max_positions")

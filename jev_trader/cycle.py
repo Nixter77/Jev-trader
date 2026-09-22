@@ -190,7 +190,16 @@ def run_once(
     if min_should_trade is not None:
         policy_kwargs["min_should_trade"] = min_should_trade
     policy = apply_policy(resolved, **policy_kwargs)
-    intent = apply_risk(policy, features, snapshot, acct)
+    seconds_since_close = None
+    if ledger is not None:
+        seconds_since_close = ledger.seconds_since_last_close(snapshot.symbol)
+    intent = apply_risk(
+        policy,
+        features,
+        snapshot,
+        acct,
+        seconds_since_last_close=seconds_since_close,
+    )
     with order_lock:
         if (
             intent.action == "buy_long"
