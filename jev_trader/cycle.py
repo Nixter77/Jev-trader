@@ -183,7 +183,20 @@ def run_once(
 
     action = intent.action if intent.skip_reason is None else "hold"
     skip_reason = intent.skip_reason
-    if policy.passed and intent.skip_reason is None:
+    # Risk owns its close independently of the model policy.  In particular,
+    # stop/daily-loss/kill-switch can produce a filled close while a weak model
+    # close fails policy.  Preserve the actual filled action so Ledger records
+    # the fill; discretionary model closes still require policy.passed.
+    filled_risk_close = (
+        intent.action == "close"
+        and intent.risk_event is not None
+        and is_real_fill(execution)
+        and fill_qty(execution, intent.qty) > 0
+    )
+    if filled_risk_close:
+        action = "close"
+        skip_reason = None
+    elif policy.passed and intent.skip_reason is None:
         action = intent.action
         skip_reason = None
     elif not policy.passed:
