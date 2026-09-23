@@ -96,6 +96,22 @@ def _patch_urlopen(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
             return _FakeResponse({"serverTime": 1_000_000_000_000})
         if path.endswith("/exchangeInfo"):
             return _FakeResponse({"symbols": []})
+        if path.endswith("/account") or path.endswith("/balance"):
+            # Default open LONG so reduce-only close tests can align side/qty.
+            return _FakeResponse(
+                {
+                    "totalWalletBalance": "1000",
+                    "availableBalance": "1000",
+                    "positions": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "positionAmt": "0.25",
+                            "entryPrice": "100",
+                            "unrealizedProfit": "0",
+                        }
+                    ],
+                }
+            )
         if path.endswith("/openOrders"):
             return _FakeResponse([])
         if method == "DELETE":
@@ -516,3 +532,157 @@ def test_flatten_all_market_closes_wallet_positions(monkeypatch: pytest.MonkeyPa
     assert params["reduceOnly"] == ["true"]
     assert params["side"] == ["SELL"]
     assert result["closes"][0]["status"] == "filled"
+
+
+def test_short_close_sends_buy_reduce_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Closing a SHORT must BUY with reduceOnly (one-way mode)."""
+    captured: list[Any] = []
+
+    def fake_urlopen(req: Any, timeout: float | None = None, context: Any = None) -> _FakeResponse:
+        captured.append({"req": req})
+        parsed = urllib.parse.urlparse(req.full_url)
+        path = parsed.path
+        method = req.get_method()
+        params = urllib.parse.parse_qs(parsed.query)
+        if path.endswith("/time"):
+            return _FakeResponse({"serverTime": 1_000_000_000_000})
+        if path.endswith("/exchangeInfo"):
+            return _FakeResponse({"symbols": []})
+        if path.endswith("/account") or path.endswith("/balance"):
+            return _FakeResponse(
+                {
+                    "totalWalletBalance": "1000",
+                    "availableBalance": "900",
+                    "positions": [
+                        {
+                            "symbol": "SOLUSDT",
+                            "positionAmt": "-1.40",
+                            "entryPrice": "119.04",
+                            "unrealizedProfit": "1",
+                        }
+                    ],
+                }
+            )
+        if path.endswith("/openOrders"):
+            return _FakeResponse([])
+        if method == "DELETE":
+            return _FakeResponse({"code": 200})
+        if method == "POST" and path.endswith("/order"):
+            return _FakeResponse(
+                {
+                    "orderId": 7,
+                    "status": "FILLED",
+                    "executedQty": (params.get("quantity") or ["1.4"])[0],
+                    "avgPrice": "118",
+                    "symbol": "SOLUSDT",
+                }
+            )
+        return _FakeResponse()
+
+    monkeypatch.setattr("jev_trader.execution.urllib.request.urlopen", fake_urlopen)
+    broker = BinanceTestnetBroker("k", "s", "https://testnet.binancefuture.com")
+    intent = _intent(
+        action="close",
+        symbol="SOLUSDT",
+        qty=1.4,
+        entry_type="MARKET",
+        reduce_only=True,
+        order_side="BUY",
+        limit_price=None,
+        stop_price=None,
+        stop_distance=None,
+    )
+    result = broker.submit(intent)
+    assert result.status == "filled"
+    posts = [c["req"] for c in captured if c["req"].get_method() == "POST"]
+    assert posts
+    params = urllib.parse.parse_qs(urllib.parse.urlparse(posts[0].full_url).query)
+    assert params["side"] == ["BUY"]
+    assert params["reduceOnly"] == ["true"]
+    assert params["type"] == ["MARKET"]
+    assert float(params["quantity"][0]) == pytest.approx(1.4)
+
+
+def test_short_close_retries_without_reduce_only_on_2022(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Binance testnet often returns -2022 for BUY+reduceOnly on a real SHORT; fall back."""
+    captured: list[Any] = []
+    posts = {"n": 0}
+
+    def fake_urlopen(req: Any, timeout: float | None = None, context: Any = None) -> _FakeResponse:
+        captured.append({"req": req})
+        parsed = urllib.parse.urlparse(req.full_url)
+        path = parsed.path
+        method = req.get_method()
+        params = urllib.parse.parse_qs(parsed.query)
+        if path.endswith("/time"):
+            return _FakeResponse({"serverTime": 1_000_000_000_000})
+        if path.endswith("/exchangeInfo"):
+            return _FakeResponse({"symbols": []})
+        if path.endswith("/account") or path.endswith("/balance"):
+            return _FakeResponse(
+                {
+                    "totalWalletBalance": "1000",
+                    "availableBalance": "900",
+                    "positions": [
+                        {
+                            "symbol": "SOLUSDT",
+                            "positionAmt": "-1.40",
+                            "entryPrice": "119.04",
+                            "unrealizedProfit": "1",
+                        }
+                    ],
+                }
+            )
+        if path.endswith("/openOrders"):
+            return _FakeResponse([])
+        if method == "DELETE":
+            return _FakeResponse({"code": 200})
+        if method == "POST" and path.endswith("/order"):
+            posts["n"] += 1
+            if params.get("reduceOnly") == ["true"]:
+                return _FakeResponse({"code": -2022, "msg": "ReduceOnly Order is rejected."}, status=400)
+            return _FakeResponse(
+                {
+                    "orderId": 8,
+                    "status": "FILLED",
+                    "executedQty": (params.get("quantity") or ["1.4"])[0],
+                    "avgPrice": "118",
+                    "symbol": "SOLUSDT",
+                    "reduceOnly": False,
+                    "side": "BUY",
+                }
+            )
+        return _FakeResponse()
+
+    monkeypatch.setattr("jev_trader.execution.urllib.request.urlopen", fake_urlopen)
+    broker = BinanceTestnetBroker("k", "s", "https://testnet.binancefuture.com")
+    intent = _intent(
+        action="close",
+        symbol="SOLUSDT",
+        qty=1.4,
+        entry_type="MARKET",
+        reduce_only=True,
+        order_side="BUY",
+        limit_price=None,
+        stop_price=None,
+        stop_distance=None,
+    )
+    result = broker.submit(intent)
+    assert result.status == "filled"
+    assert result.detail.get("fallback") == "cover_without_reduce_only"
+    assert posts["n"] == 2
+    buy_posts = [
+        urllib.parse.parse_qs(urllib.parse.urlparse(c["req"].full_url).query)
+        for c in captured
+        if c["req"].get_method() == "POST"
+    ]
+    assert buy_posts[0]["side"] == ["BUY"] and buy_posts[0]["reduceOnly"] == ["true"]
+    assert buy_posts[1]["side"] == ["BUY"] and "reduceOnly" not in buy_posts[1]
+    assert float(buy_posts[1]["quantity"][0]) == pytest.approx(1.4)
+
+
+def test_close_side_for_position_helper() -> None:
+    from jev_trader.execution import close_side_for_position
+
+    assert close_side_for_position("SHORT") == "BUY"
+    assert close_side_for_position("LONG") == "SELL"

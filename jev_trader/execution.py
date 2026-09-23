@@ -10,6 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
+from dataclasses import replace
 from typing import Any
 
 from jev_trader.config import (
@@ -178,6 +179,16 @@ def open_sell_error(intent: TradeIntent) -> str | None:
     if intent.action == "sell_short" and not intent.reduce_only:
         return SELL_ONLY_CLOSES_LONG
     return None
+
+
+
+def close_side_for_position(position_side: str) -> str:
+    """One-way mode: SELL closes LONG, BUY covers SHORT."""
+    return "BUY" if position_side == "SHORT" else "SELL"
+
+
+def is_reduce_only_rejected(body: Any) -> bool:
+    return isinstance(body, dict) and body.get("code") == -2022
 
 
 def blocked_execution(intent: TradeIntent, venue: str) -> ExecutionResult | None:
@@ -465,6 +476,138 @@ class BinanceFuturesBroker:
                 self._filters_loaded = True
         return self._filters.get(symbol.upper(), {})
 
+    def _live_position(self, symbol: str) -> dict[str, Any] | None:
+        """Fresh exchange position for symbol, or None if flat / missing."""
+        self.invalidate_wallet()
+        wallet = self.fetch_wallet(ttl=0)
+        sym = symbol.upper()
+        for row in wallet.get("positions") or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("symbol") or "").upper() != sym:
+                continue
+            size = float(row.get("size") or 0.0)
+            side = str(row.get("side") or "")
+            if size > 0 and side in {"LONG", "SHORT"}:
+                return row
+        return None
+
+    def _align_reduce_close(self, intent: TradeIntent) -> TradeIntent | ExecutionResult:
+        """Force close side/qty from live exchange position (fixes stale SHORT/LONG)."""
+        pos = self._live_position(intent.symbol)
+        if pos is None:
+            return ExecutionResult(
+                status="rejected",
+                venue=self.venue,
+                client_order_id=intent.client_order_id,
+                reduce_only=intent.reduce_only,
+                detail={
+                    "error": "no_position_to_reduce",
+                    "http_status": 400,
+                    "body": {"code": -2022, "msg": "ReduceOnly Order is rejected."},
+                },
+            )
+        side = str(pos["side"])
+        size = float(pos["size"])
+        order_side = close_side_for_position(side)
+        return replace(intent, order_side=order_side, qty=size)
+
+    def _cover_short_without_reduce_only(
+        self, intent: TradeIntent, qty: float
+    ) -> ExecutionResult:
+        """Binance testnet often rejects BUY+reduceOnly (-2022) even on a real SHORT.
+
+        Cover with a plain BUY sized to the live short. Qty is clamped so we do not flip long.
+        """
+        pos = self._live_position(intent.symbol)
+        if pos is None or str(pos.get("side")) != "SHORT":
+            return ExecutionResult(
+                status="rejected",
+                venue=self.venue,
+                client_order_id=intent.client_order_id,
+                reduce_only=False,
+                detail={
+                    "error": "short_already_flat",
+                    "http_status": 400,
+                    "body": {"code": -2022, "msg": "ReduceOnly Order is rejected."},
+                    "fallback": "cover_without_reduce_only",
+                },
+            )
+        live_qty = float(pos["size"])
+        qty = min(qty, live_qty) if qty > 0 else live_qty
+        flt = self.filters_for(intent.symbol)
+        if flt.get("stepSize"):
+            qty = round_to_step(qty, flt["stepSize"])
+        min_qty = float(flt.get("minQty") or 0.0)
+        if qty <= 0 or (min_qty and qty < min_qty):
+            return ExecutionResult(
+                status="rejected",
+                venue=self.venue,
+                client_order_id=intent.client_order_id,
+                reduce_only=False,
+                detail={"error": "qty below LOT_SIZE", "qty": qty, "filters": flt},
+            )
+        cid = client_order_id(intent.symbol, "flatten")
+        params: dict[str, Any] = {
+            "symbol": intent.symbol,
+            "side": "BUY",
+            "type": "MARKET",
+            "quantity": format_binance_decimal(qty),
+            "newClientOrderId": cid,
+        }
+        self.cancel_open_orders(intent.symbol)
+        status, data = self._request("POST", "/fapi/v1/order", params=params, signed=True)
+        ok = 200 <= status < 300
+        if not ok:
+            return ExecutionResult(
+                status="rejected",
+                venue=self.venue,
+                client_order_id=cid,
+                reduce_only=False,
+                detail={
+                    "http_status": status,
+                    "body": data,
+                    "fallback": "cover_without_reduce_only",
+                    "original_client_order_id": intent.client_order_id,
+                },
+            )
+        filled_qty = order_executed_qty(data)
+        fill_px = order_fill_price(data)
+        if not order_is_filled(data):
+            data = self._poll_order(intent.symbol, cid, data)
+            filled_qty = order_executed_qty(data)
+            fill_px = order_fill_price(data)
+        self.invalidate_wallet()
+        if order_is_filled(data):
+            return ExecutionResult(
+                status="filled",
+                venue=self.venue,
+                client_order_id=cid,
+                reduce_only=False,
+                detail={
+                    "http_status": status,
+                    "body": data,
+                    "filled_qty": filled_qty,
+                    "fill_price": fill_px,
+                    "fallback": "cover_without_reduce_only",
+                    "original_client_order_id": intent.client_order_id,
+                },
+            )
+        self.cancel_order(intent.symbol, cid)
+        self.invalidate_wallet()
+        return ExecutionResult(
+            status="unfilled",
+            venue=self.venue,
+            client_order_id=cid,
+            reduce_only=False,
+            detail={
+                "http_status": status,
+                "body": data,
+                "error": "not_filled",
+                "fallback": "cover_without_reduce_only",
+            },
+        )
+
     def submit(self, intent: TradeIntent) -> ExecutionResult:
         with order_lock:
             return self._submit_locked(intent)
@@ -473,6 +616,11 @@ class BinanceFuturesBroker:
         blocked = blocked_execution(intent, self.venue)
         if blocked is not None:
             return blocked
+        if intent.reduce_only and intent.action == "close" and intent.entry_type == "MARKET":
+            aligned = self._align_reduce_close(intent)
+            if isinstance(aligned, ExecutionResult):
+                return aligned
+            intent = aligned
         qty = intent.qty
         price = intent.limit_price
         flt = self.filters_for(intent.symbol)
@@ -528,6 +676,16 @@ class BinanceFuturesBroker:
         status, data = self._request("POST", "/fapi/v1/order", params=params, signed=True)
         ok = 200 <= status < 300
         if not ok:
+            # Testnet (and some one-way states) reject BUY+reduceOnly on a real SHORT
+            # with -2022. Cover via plain BUY clamped to abs(live short).
+            if (
+                intent.reduce_only
+                and intent.action == "close"
+                and intent.order_side == "BUY"
+                and intent.entry_type == "MARKET"
+                and is_reduce_only_rejected(data)
+            ):
+                return self._cover_short_without_reduce_only(intent, qty)
             return ExecutionResult(
                 status="rejected",
                 venue=self.venue,
