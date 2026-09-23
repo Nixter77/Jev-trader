@@ -12,7 +12,7 @@ from jev_trader.execution import BinanceFuturesBroker, BinanceTestnetBroker, Pap
 
 DEFAULT_PAPER_LEDGER = "data/ledger.sqlite"
 DEFAULT_TESTNET_LEDGER = "data/ledger-testnet.sqlite"
-from jev_trader.universe import DEFAULT_MIN_QUOTE_VOLUME, DEFAULT_UNIVERSE_SIZE
+from jev_trader.universe import DEFAULT_MIN_QUOTE_VOLUME, DEFAULT_UNIVERSE_SIZE, resolve_universe_size
 from jev_trader.jev import judgment_from_dict
 from jev_trader.judge import make_judge_client, normalize_backend
 from jev_trader.laya_client import DEFAULT_LAYA_CHECKPOINT
@@ -377,7 +377,10 @@ def _make_live_runner(args: argparse.Namespace, settings, ledger: Ledger, broker
         fire_latest=args.fire_latest,
         ledger=ledger,
         universe=universe,
-        universe_size=args.universe_size,
+        universe_size=resolve_universe_size(
+            backend=settings.decision_backend,
+            explicit=getattr(args, "universe_size", None),
+        ),
         min_quote_volume=args.min_quote_volume,
         status_path=status_path,
         venue=args.venue,
@@ -799,7 +802,15 @@ def build_parser() -> argparse.ArgumentParser:
             action="store_false",
             help="Only --symbol / --symbols (old single-coin mode)",
         )
-        p.add_argument("--universe-size", type=int, default=DEFAULT_UNIVERSE_SIZE)
+        p.add_argument(
+            "--universe-size",
+            type=int,
+            default=None,
+            help=(
+                f"Watch-list size (default {DEFAULT_UNIVERSE_SIZE}; "
+                "under DECISION_BACKEND=laya default is 5 / LAYA_UNIVERSE_SIZE)"
+            ),
+        )
         p.add_argument("--min-quote-volume", type=float, default=DEFAULT_MIN_QUOTE_VOLUME)
         p.add_argument("--max-positions", type=int, default=3)
         p.add_argument(

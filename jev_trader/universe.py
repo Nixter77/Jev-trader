@@ -2,17 +2,70 @@
 
 The bot *sees* every listed USD-M symbol. Jev is only asked about a short
 liquid list plus already-open positions — not 700+ calls every 5 minutes.
+
+Local Laya (~20s/symbol on CPU) cannot finish a 15-symbol pass inside one 5m
+bar, so when DECISION_BACKEND=laya the default watch size shrinks to
+DEFAULT_LAYA_UNIVERSE_SIZE (override with LAYA_UNIVERSE_SIZE or --universe-size).
+Jev cloud stays on DEFAULT_UNIVERSE_SIZE.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import os
+from collections.abc import Iterable, Sequence
 
 from jev_trader.public_market import UniverseTicker
 
 DEFAULT_UNIVERSE_SIZE = 15
+# Local Laya typed-decisions is ~22s/symbol on Intel CPU → 5 symbols ≈ 110s < 5m.
+DEFAULT_LAYA_UNIVERSE_SIZE = 5
 DEFAULT_MIN_QUOTE_VOLUME = 5_000_000.0
 HARD_CAP = 40
+
+
+def resolve_universe_size(
+    *,
+    backend: str = "jev",
+    explicit: int | None = None,
+    environ: dict[str, str] | None = None,
+) -> int:
+    """Pick watch-list size: explicit CLI wins, else Laya-aware default / env."""
+    if explicit is not None:
+        return min(HARD_CAP, max(1, int(explicit)))
+    env = os.environ if environ is None else environ
+    backend_n = (backend or "jev").strip().lower()
+    if backend_n == "laya":
+        raw = (env.get("LAYA_UNIVERSE_SIZE") or "").strip()
+        if raw:
+            return min(HARD_CAP, max(1, int(raw)))
+        return DEFAULT_LAYA_UNIVERSE_SIZE
+    return DEFAULT_UNIVERSE_SIZE
+
+
+def order_symbols_open_first(
+    symbols: Sequence[str],
+    open_symbols: Iterable[str] = (),
+) -> list[str]:
+    """Stable reorder: open positions first (open list order), then the rest.
+
+    Used each live poll pass so exits/management for open books are judged
+    before scanning cold watch symbols — safer when a full pass is slow.
+    """
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for raw in open_symbols:
+        symbol = str(raw or "").upper()
+        if not symbol or symbol in seen:
+            continue
+        ordered.append(symbol)
+        seen.add(symbol)
+    for raw in symbols:
+        symbol = str(raw or "").upper()
+        if not symbol or symbol in seen:
+            continue
+        ordered.append(symbol)
+        seen.add(symbol)
+    return ordered
 
 
 def is_usdt_perp(symbol: str) -> bool:

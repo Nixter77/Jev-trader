@@ -51,6 +51,7 @@ from jev_trader.public_market import (
 from jev_trader.universe import (
     DEFAULT_MIN_QUOTE_VOLUME,
     DEFAULT_UNIVERSE_SIZE,
+    order_symbols_open_first,
     select_trade_universe,
 )
 from jev_trader.telegram import TelegramNotifier
@@ -514,6 +515,43 @@ class LiveRunner:
             self._ensure_loop(symbol)
         return selected
 
+    def _open_priority_symbols(self) -> list[str]:
+        """Ledger + exchange wallet opens, then in-memory loop positions."""
+        ordered: list[str] = []
+        seen: set[str] = set()
+
+        def add(symbol: str) -> None:
+            s = str(symbol or "").upper()
+            if not s or s in seen:
+                return
+            ordered.append(s)
+            seen.add(s)
+
+        if self.ledger is not None:
+            try:
+                for symbol in self.ledger.open_symbols():
+                    add(symbol)
+            except Exception:  # noqa: BLE001 — ordering must not break the poll
+                pass
+        wallet = self.wallet_box.get("wallet") if isinstance(self.wallet_box, dict) else None
+        if isinstance(wallet, dict):
+            for row in wallet.get("positions") or []:
+                if not isinstance(row, dict):
+                    continue
+                side = str(row.get("side") or "FLAT").upper()
+                size = float(row.get("size") or 0.0)
+                if side in {"LONG", "SHORT"} and size > 0:
+                    add(str(row.get("symbol") or ""))
+        for symbol, loop in self.loops.items():
+            pos = loop.position
+            if pos.side in {"LONG", "SHORT"} and float(pos.size or 0.0) > 0:
+                add(symbol)
+        return ordered
+
+    def _symbols_for_pass(self) -> list[str]:
+        """Open positions first each poll so management is not starved by Laya latency."""
+        return order_symbols_open_first(self.symbols, self._open_priority_symbols())
+
     def poll_live_symbol(self, symbol: str) -> CycleResult | None:
         loop = self._ensure_loop(symbol)
         rows = fetch_klines(symbol, interval=self.interval, limit=self.kline_limit)
@@ -565,14 +603,14 @@ class LiveRunner:
             take(self.loops[symbol].handle_ws_event(event))
             return results
         if self.recorded_klines is not None:
-            for symbol in self.symbols:
+            for symbol in self._symbols_for_pass():
                 if remaining is not None and len(results) >= remaining:
                     break
                 self._ensure_loop(symbol)
                 payload = _kline_payload_for_symbol(self.recorded_klines, symbol)
                 take(self.loops[symbol].handle_rest_klines(payload, now_ms=self.now_ms))
             return results
-        for symbol in self.symbols:
+        for symbol in self._symbols_for_pass():
             if remaining is not None and len(results) >= remaining:
                 break
             take(self.poll_live_symbol(symbol))
@@ -626,6 +664,7 @@ class LiveRunner:
             "qty": intent.get("qty"),
             "price": intent.get("limit_price"),
             "venue": None if payload.get("execution") is None else payload["execution"].get("venue"),
+            "judge_ms": payload.get("judge_ms"),
         }
 
     def write_status(self, *, last_error: str | None = None) -> None:

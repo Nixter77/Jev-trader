@@ -192,3 +192,4 @@ class CycleResult:
     state_text: str
     state: dict[str, Any]
     risk_event: str | None = None
+    judge_ms: float | None = None

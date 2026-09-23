@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import replace
 from typing import Any
 
@@ -78,6 +79,8 @@ def decision_payload(result: CycleResult) -> dict[str, Any]:
         },
         "state_text": result.state_text,
     }
+    if result.judge_ms is not None:
+        payload["judge_ms"] = round(float(result.judge_ms), 1)
     return payload
 
 
@@ -176,6 +179,7 @@ def run_once(
     if protective is not None and protective < features.close:
         arm_exchange_stop(exec_broker, ledger, snapshot.symbol, protective, None)
     resolved = judgment
+    judge_ms: float | None = None
     if resolved is None:
         client = jev_client
         owns = False
@@ -185,7 +189,9 @@ def run_once(
             client = JevClient(api_key=typesafe_api_key)
             owns = True
         try:
+            t0 = time.perf_counter()
             resolved = client.judge(compact)
+            judge_ms = (time.perf_counter() - t0) * 1000.0
         finally:
             if owns:
                 client.close()
@@ -246,6 +252,7 @@ def run_once(
         state_text=compact.as_text(),
         state=compact.as_dict(),
         risk_event=intent.risk_event,
+        judge_ms=judge_ms,
     )
     if ledger is not None:
         ledger.record(result)
