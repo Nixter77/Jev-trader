@@ -328,10 +328,12 @@ def _make_live_runner(args: argparse.Namespace, settings, ledger: Ledger, broker
                 cancel_entries()
             wallet = fetch(ttl=0)
             wallet_box["wallet"] = wallet
+            wallet_box["risk_anchor_path"] = str(_sidecar(ledger, "risk-anchor.json"))
+            wallet_box["venue"] = str(args.venue)
             if wallet.get("equity_usdt"):
                 equity = float(wallet["equity_usdt"])
                 wallet_box["start_equity_usdt"] = resolve_day_anchor(
-                    _sidecar(ledger, "risk-anchor.json"),
+                    wallet_box["risk_anchor_path"],
                     venue=str(args.venue),
                     equity=equity,
                 )

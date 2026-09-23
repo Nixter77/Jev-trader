@@ -289,5 +289,5 @@ def test_unfilled_risk_close_does_not_override_model_policy(
     )
     assert result.intent is not None and result.intent.risk_event == "stop"
     assert result.action == "hold"
-    assert result.skip_reason == "close_should_trade_now"
+    assert result.skip_reason == "unfilled"
     assert ledger.book()["fills"] == []

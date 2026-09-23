@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -196,6 +197,40 @@ def test_failing_should_trade_now_holds_on_live_close() -> None:
     assert payload["skip_reason"] == "should_trade_now"
     assert payload["intent"] is None
     assert payload["judgment"]["action"] == "buy_long"
+
+
+def test_utc_day_rolls_the_loss_anchor_without_a_restart(
+    tmp_path: Path, market_snapshot, passing_answers
+) -> None:
+    anchor = tmp_path / "risk-anchor.json"
+    anchor.write_text(
+        '{"utc_date":"2026-09-22","venue":"testnet","equity_usdt":10000}',
+        encoding="utf-8",
+    )
+
+    class WalletBroker:
+        def fetch_wallet(self):
+            return {"equity_usdt": 2700.0, "available_usdt": 2700.0, "open_positions": 0}
+
+        def submit(self, intent):
+            return PaperBroker().submit(intent)
+
+    box = {"risk_anchor_path": str(anchor), "venue": "testnet", "start_equity_usdt": 10000.0}
+    cycle = make_run_cycle(
+        judgment=judgment_from_dict(passing_answers),
+        account_kwargs={"daily_pnl_pct": -0.73, "kill_switch": False, "max_positions": 5},
+        broker=WalletBroker(),
+        ledger=Ledger(tmp_path / "ledger.sqlite"),
+        notifier=None,
+        typesafe_api_key=None,
+        wallet_box=box,
+    )
+    result = cycle(market_snapshot)
+    saved = json.loads(anchor.read_text(encoding="utf-8"))
+    assert saved["utc_date"] == datetime.now(timezone.utc).date().isoformat()
+    assert saved["equity_usdt"] == pytest.approx(2700.0)
+    assert box["start_equity_usdt"] == pytest.approx(2700.0)
+    assert result.skip_reason != "daily_loss"
 
 
 def test_run_cycle_sizes_from_binance_wallet_not_paper_10k(

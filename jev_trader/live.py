@@ -24,7 +24,7 @@ from jev_trader.execution import (
     is_real_fill,
 )
 from jev_trader.ledger import Ledger
-from jev_trader.status import seconds_to_next_5m, utc_now, write_json
+from jev_trader.status import resolve_day_anchor, seconds_to_next_5m, utc_now, write_json
 from jev_trader.models import (
     AccountState,
     Candle,
@@ -303,11 +303,19 @@ def _account_for_cycle(
         cash = float(wallet.get("equity_usdt") or cash)
         if wallet.get("available_usdt") is not None:
             available = float(wallet["available_usdt"])
-        if wallet_box is not None:
-            start = wallet_box.get("start_equity_usdt")
-            if not start and cash:
-                wallet_box["start_equity_usdt"] = cash
-                start = cash
+        if wallet_box is not None and cash:
+            anchor_path = wallet_box.get("risk_anchor_path")
+            venue = wallet_box.get("venue")
+            if anchor_path and venue:
+                # A process that stays up past UTC midnight must roll the day,
+                # otherwise yesterday's loss keeps blocking entries.
+                start = resolve_day_anchor(anchor_path, venue=str(venue), equity=float(cash))
+                wallet_box["start_equity_usdt"] = start
+            else:
+                start = wallet_box.get("start_equity_usdt")
+                if not start:
+                    wallet_box["start_equity_usdt"] = cash
+                    start = cash
             if start:
                 daily_pnl_pct = (cash - float(start)) / float(start)
         if ledger is not None:

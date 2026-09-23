@@ -7,9 +7,9 @@ from jev_trader.models import (
 )
 
 SHOULD_TRADE_NOW_MIN = 0.72
-# Close needs a higher bar than entry (Laya typed-decisions was closing at ~0.35–0.50 under follow_jev).
+# Strict mode only. The profitable Jev desk closed at should ~0.34; follow_jev does too.
 CLOSE_SHOULD_TRADE_MIN = 0.80
-# Soft confirm when action_probabilities present (Laya). Ignored if empty (classic Jev).
+# Soft confirm when action_probabilities present. Ignored if empty, and ignored under follow_jev.
 CLOSE_ACTION_PROB_MIN = 0.75
 FALSE_BREAK_RISK_MAX = 0.35
 SIGNAL_STRENGTH_MIN = "рабочий"
@@ -69,16 +69,19 @@ def apply_policy(
 ) -> PolicyDecision:
     """Confidence gates in code. Size/stop/leverage are never decided here.
 
-    `follow_jev=True` skips probability gates for **entries**. Live Laya
-    buy_long sits near should 0.43 and trend 0.34, so a 0.50/0.60 floor
-    admits nothing. **Close is always gated** (asymmetry): Laya was dumping
-    losers while should_trade_now sat ~0.4. Risk flatten/stop still bypasses
-    this via risk.py, not policy.
+    `follow_jev=True` is the desk Jev actually traded: buy and close both
+    follow the model. Live Jev closes sat near should 0.34 (never 0.80) and
+    that exit was the profitable part. A 0.80 close floor blocks it.
+    `--strict-gates` still requires close should >= 0.80 and, when present,
+    close probability >= 0.75. Risk flatten/stop bypasses policy via risk.py.
     """
     if judgment.action not in TRADE_ACTIONS:
         return _hold(judgment, "hold")
 
-    # Close stays gated under follow_jev. Entries may skip the probability bar.
+    # Same rule as the 20–21 Sep Jev book: the model's close is the exit.
+    if follow_jev:
+        return _allow(judgment)
+
     if judgment.action == "close":
         if judgment.should_trade_now < close_should_trade_min:
             return _hold(judgment, "close_should_trade_now")
@@ -90,8 +93,6 @@ def apply_policy(
             return _hold(judgment, quality)
         return _allow(judgment)
 
-    if follow_jev:
-        return _allow(judgment)
     if judgment.should_trade_now < min_should_trade:
         return _hold(judgment, "should_trade_now")
     quality = _quality_skip(judgment)
