@@ -7,9 +7,9 @@ from jev_trader.models import (
 )
 
 SHOULD_TRADE_NOW_MIN = 0.72
-# Strict mode only. The profitable Jev desk closed at should ~0.34; follow_jev does too.
+# Laya + strict mode. Jev under follow_jev keeps soft closes (desk PnL).
 CLOSE_SHOULD_TRADE_MIN = 0.80
-# Soft confirm when action_probabilities present. Ignored if empty, and ignored under follow_jev.
+# Soft confirm when action_probabilities present (typical for Laya).
 CLOSE_ACTION_PROB_MIN = 0.75
 FALSE_BREAK_RISK_MAX = 0.35
 SIGNAL_STRENGTH_MIN = "рабочий"
@@ -23,6 +23,11 @@ def signal_strength_rank(level: str) -> int:
         return SIGNAL_STRENGTH_LEVELS.index(level)
     except ValueError:
         return -1
+
+
+def is_laya_model(judgment: JevJudgment) -> bool:
+    """True for local Laya backends (`laya:…`). Jev cloud ids stay False."""
+    return str(judgment.model or "").strip().lower().startswith("laya")
 
 
 def _action_prob(judgment: JevJudgment, action: str) -> float | None:
@@ -59,6 +64,23 @@ def _quality_skip(judgment: JevJudgment) -> str | None:
     return None
 
 
+def _gated_close(
+    judgment: JevJudgment,
+    *,
+    close_should_trade_min: float,
+    close_action_prob_min: float,
+) -> PolicyDecision:
+    if judgment.should_trade_now < close_should_trade_min:
+        return _hold(judgment, "close_should_trade_now")
+    close_p = _close_action_prob(judgment)
+    if close_p is not None and close_p < close_action_prob_min:
+        return _hold(judgment, "close_action_prob")
+    quality = _quality_skip(judgment)
+    if quality:
+        return _hold(judgment, quality)
+    return _allow(judgment)
+
+
 def apply_policy(
     judgment: JevJudgment,
     *,
@@ -69,28 +91,27 @@ def apply_policy(
 ) -> PolicyDecision:
     """Confidence gates in code. Size/stop/leverage are never decided here.
 
-    `follow_jev=True` is the desk Jev actually traded: buy and close both
-    follow the model. Live Jev closes sat near should 0.34 (never 0.80) and
-    that exit was the profitable part. A 0.80 close floor blocks it.
-    `--strict-gates` still requires close should >= 0.80 and, when present,
-    close probability >= 0.75. Risk flatten/stop bypasses policy via risk.py.
+    Ledger (testnet): Laya soft closes bled (~should 0.35–0.50); Jev soft closes
+    at ~0.34 were the profitable exit. So under `follow_jev`:
+      - Jev: buy and close follow the model (desk book).
+      - Laya: entries follow the model; **close stays gated** (asymmetry).
+    `--strict-gates` / follow_jev=False gates both backends the same way.
+    Risk flatten/stop bypasses policy via risk.py.
     """
     if judgment.action not in TRADE_ACTIONS:
         return _hold(judgment, "hold")
 
-    # Same rule as the 20–21 Sep Jev book: the model's close is the exit.
-    if follow_jev:
-        return _allow(judgment)
-
     if judgment.action == "close":
-        if judgment.should_trade_now < close_should_trade_min:
-            return _hold(judgment, "close_should_trade_now")
-        close_p = _close_action_prob(judgment)
-        if close_p is not None and close_p < close_action_prob_min:
-            return _hold(judgment, "close_action_prob")
-        quality = _quality_skip(judgment)
-        if quality:
-            return _hold(judgment, quality)
+        # Backend-aware asymmetry under follow_jev.
+        if follow_jev and not is_laya_model(judgment):
+            return _allow(judgment)
+        return _gated_close(
+            judgment,
+            close_should_trade_min=close_should_trade_min,
+            close_action_prob_min=close_action_prob_min,
+        )
+
+    if follow_jev:
         return _allow(judgment)
 
     if judgment.should_trade_now < min_should_trade:

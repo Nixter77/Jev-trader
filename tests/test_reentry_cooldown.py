@@ -72,3 +72,76 @@ def test_reentry_allowed_when_never_closed(market_snapshot) -> None:
     )
     assert intent.action == "buy_long"
     assert intent.skip_reason is None
+
+
+
+def _pass_close_policy():
+    return apply_policy(
+        judgment_from_dict(
+            {
+                "action": "close",
+                "trend_aligned": 0.9,
+                "false_break_risk": 0.1,
+                "signal_strength": "сильный",
+                "should_trade_now": 0.95,
+            }
+        )
+    )
+
+
+def test_min_hold_blocks_discretionary_close(market_snapshot) -> None:
+    from dataclasses import replace
+
+    from jev_trader.models import Position
+    from jev_trader.risk import MIN_HOLD_SEC
+
+    long_snap = replace(
+        market_snapshot,
+        position=Position(
+            side="LONG",
+            size=1.0,
+            cash_usdt=10_000.0,
+            entry=float(market_snapshot.candles[-1].close),
+        ),
+    )
+    features = compute_features(long_snap)
+    intent = apply_risk(
+        _pass_close_policy(),
+        features,
+        long_snap,
+        _account(),
+        seconds_since_last_entry=60.0,
+        min_hold_sec=MIN_HOLD_SEC,
+    )
+    assert intent.action == "hold"
+    assert intent.skip_reason == "min_hold"
+    assert intent.qty == 0
+
+
+def test_min_hold_allows_close_after_age(market_snapshot) -> None:
+    from dataclasses import replace
+
+    from jev_trader.models import Position
+    from jev_trader.risk import MIN_HOLD_SEC
+
+    long_snap = replace(
+        market_snapshot,
+        position=Position(
+            side="LONG",
+            size=1.0,
+            cash_usdt=10_000.0,
+            entry=float(market_snapshot.candles[-1].close),
+        ),
+    )
+    features = compute_features(long_snap)
+    intent = apply_risk(
+        _pass_close_policy(),
+        features,
+        long_snap,
+        _account(),
+        seconds_since_last_entry=MIN_HOLD_SEC + 1.0,
+        min_hold_sec=MIN_HOLD_SEC,
+    )
+    assert intent.action == "close"
+    assert intent.skip_reason is None
+    assert intent.qty > 0

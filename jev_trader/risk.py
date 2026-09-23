@@ -15,6 +15,9 @@ ATR_STOP_MULT_MAX = 1.8
 
 # After a close, wait before re-entering the same symbol (anti-chop).
 REENTRY_COOLDOWN_SEC = 1800.0
+# Block discretionary model closes until the entry has aged (3×5m bars).
+# Exchange stop / kill / daily_loss still fire immediately above.
+MIN_HOLD_SEC = 900.0
 
 
 def long_protective_stop(
@@ -68,6 +71,8 @@ def apply_risk(
     *,
     seconds_since_last_close: float | None = None,
     reentry_cooldown_sec: float = REENTRY_COOLDOWN_SEC,
+    seconds_since_last_entry: float | None = None,
+    min_hold_sec: float = MIN_HOLD_SEC,
 ) -> TradeIntent:
     """Size = risk% / ATR-stop. Jev probabilities never enter the size formula."""
     symbol = snapshot.symbol
@@ -136,6 +141,12 @@ def apply_risk(
     if policy.action == "close":
         if not in_position or pos_side != "LONG":
             return skip("flat")
+        if (
+            seconds_since_last_entry is not None
+            and min_hold_sec > 0
+            and seconds_since_last_entry < min_hold_sec
+        ):
+            return skip("min_hold")
         return close_position(risk_event=None, entry_type="MARKET")
 
     if policy.action != "buy_long":

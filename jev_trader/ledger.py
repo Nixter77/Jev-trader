@@ -330,14 +330,21 @@ class Ledger:
 
     def seconds_since_last_close(self, symbol: str) -> float | None:
         """Seconds since the latest close fill for symbol, or None if never closed."""
+        return self._seconds_since_fill(symbol, action="close")
+
+    def seconds_since_last_entry(self, symbol: str) -> float | None:
+        """Seconds since the latest buy_long fill for symbol, or None if never entered."""
+        return self._seconds_since_fill(symbol, action="buy_long")
+
+    def _seconds_since_fill(self, symbol: str, *, action: str) -> float | None:
         with self._connect() as conn:
             row = conn.execute(
                 """
                 SELECT ts FROM fills
-                WHERE symbol = ? AND action = 'close'
+                WHERE symbol = ? AND action = ?
                 ORDER BY id DESC LIMIT 1
                 """,
-                (symbol.upper(),),
+                (symbol.upper(), action),
             ).fetchone()
         if row is None:
             return None

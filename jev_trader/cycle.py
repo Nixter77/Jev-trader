@@ -138,6 +138,9 @@ def recorded_outcome(
         action, skip = intent.action, None
     status = None if execution is None else execution.status
     if status == "unfilled":
+        # Risk exits that never filled should not surface a policy skip reason.
+        if intent.risk_event is not None:
+            return "hold", "unfilled"
         return "hold", skip or "unfilled"
     if status == "working":
         return action, skip or "working"
@@ -156,6 +159,7 @@ def run_once(
     typesafe_api_key: str | None = None,
     follow_jev: bool = False,
     min_should_trade: float | None = None,
+    min_hold_sec: float | None = None,
 ) -> CycleResult:
     """One paper/testnet decision cycle: features → state → Jev → policy → risk → exec."""
     features = compute_features(snapshot)
@@ -191,14 +195,22 @@ def run_once(
         policy_kwargs["min_should_trade"] = min_should_trade
     policy = apply_policy(resolved, **policy_kwargs)
     seconds_since_close = None
+    seconds_since_entry = None
     if ledger is not None:
         seconds_since_close = ledger.seconds_since_last_close(snapshot.symbol)
+        seconds_since_entry = ledger.seconds_since_last_entry(snapshot.symbol)
+    risk_kwargs: dict[str, Any] = {
+        "seconds_since_last_close": seconds_since_close,
+        "seconds_since_last_entry": seconds_since_entry,
+    }
+    if min_hold_sec is not None:
+        risk_kwargs["min_hold_sec"] = min_hold_sec
     intent = apply_risk(
         policy,
         features,
         snapshot,
         acct,
-        seconds_since_last_close=seconds_since_close,
+        **risk_kwargs,
     )
     with order_lock:
         if (

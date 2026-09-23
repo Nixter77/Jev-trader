@@ -20,3 +20,16 @@ All 18 post-cut closes fail `should_trade_now >= 0.80` and almost all fail `clos
 
 ## edge?
 no claim — gate only. Live restart needs Chief GO.
+
+---
+
+## Tip 2026-09-23 — backend-aware asymmetry (shipped)
+
+**Evidence (ledger-testnet closes, discretionary only):**
+- Gate soft Laya closes (`should < 0.80` or `close_p < 0.75`): would block 24 fills, sum ≈ **−62 USDT** (good).
+- Same gate on Jev: would block 107 fills, sum ≈ **+539 USDT** (destroys the desk exit).
+
+**Code:** `policy.apply_policy` — under `follow_jev`, Jev soft-closes; Laya close stays gated. `risk.MIN_HOLD_SEC=900` blocks discretionary close until entry ages; stop/kill/daily unchanged.
+
+**Ops:** restart live/`desk` to load code. Prefer `DECISION_BACKEND=jev` until Laya close quality improves; Laya is safe to A/B with this gate.
+

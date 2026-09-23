@@ -83,7 +83,11 @@ def test_paper_buy_then_close_records_realized_pnl(
     close_answers = dict(passing_answers)
     close_answers["action"] = "close"
     closed = run_once_from_answers(
-        long_snap, close_answers, broker=PaperBroker(), ledger=ledger
+        long_snap,
+        close_answers,
+        broker=PaperBroker(),
+        ledger=ledger,
+        min_hold_sec=0.0,
     )
     assert closed.action == "close"
     flat = ledger.load_position("BTCUSDT")
