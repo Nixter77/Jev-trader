@@ -8,10 +8,13 @@ from jev_trader.models import (
 
 SHOULD_TRADE_NOW_MIN = 0.72
 # Laya + strict mode. Jev under follow_jev keeps soft closes (desk PnL).
-CLOSE_SHOULD_TRADE_MIN = 0.80
+# Trial 2026-09-23: 0.80 left Laya unable to exit (0 fills); lowered for multi-hour A/B.
+CLOSE_SHOULD_TRADE_MIN = 0.45
 # Soft confirm when action_probabilities present (typical for Laya).
-CLOSE_ACTION_PROB_MIN = 0.75
+CLOSE_ACTION_PROB_MIN = 0.55
 FALSE_BREAK_RISK_MAX = 0.35
+# Laya closes often sit just above entry false-break; slightly looser on gated close only.
+CLOSE_FALSE_BREAK_RISK_MAX = 0.45
 SIGNAL_STRENGTH_MIN = "рабочий"
 TREND_ALIGNED_MIN = 0.60
 ENTRY_ACTIONS = frozenset({"buy_long"})
@@ -69,15 +72,18 @@ def _gated_close(
     *,
     close_should_trade_min: float,
     close_action_prob_min: float,
+    close_false_break_max: float = CLOSE_FALSE_BREAK_RISK_MAX,
 ) -> PolicyDecision:
     if judgment.should_trade_now < close_should_trade_min:
         return _hold(judgment, "close_should_trade_now")
     close_p = _close_action_prob(judgment)
     if close_p is not None and close_p < close_action_prob_min:
         return _hold(judgment, "close_action_prob")
-    quality = _quality_skip(judgment)
-    if quality:
-        return _hold(judgment, quality)
+    if judgment.false_break_risk > close_false_break_max:
+        return _hold(judgment, "false_break")
+    floor = signal_strength_rank(SIGNAL_STRENGTH_MIN)
+    if signal_strength_rank(judgment.signal_strength) < floor:
+        return _hold(judgment, "low_strength")
     return _allow(judgment)
 
 
@@ -91,10 +97,11 @@ def apply_policy(
 ) -> PolicyDecision:
     """Confidence gates in code. Size/stop/leverage are never decided here.
 
-    Ledger (testnet): Laya soft closes bled (~should 0.35–0.50); Jev soft closes
-    at ~0.34 were the profitable exit. So under `follow_jev`:
+    Ledger (testnet): Laya soft closes bled at should~0.35; Jev soft closes at
+    ~0.34 were profitable. Under `follow_jev`:
       - Jev: buy and close follow the model (desk book).
-      - Laya: entries follow the model; **close stays gated** (asymmetry).
+      - Laya: entries follow the model; close stays gated but trial floors
+        are 0.45 / 0.55 / false_break 0.45 so the desk can actually exit.
     `--strict-gates` / follow_jev=False gates both backends the same way.
     Risk flatten/stop bypasses policy via risk.py.
     """

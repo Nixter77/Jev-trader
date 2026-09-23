@@ -33,3 +33,13 @@ no claim — gate only. Live restart needs Chief GO.
 
 **Ops:** restart live/`desk` to load code. Prefer `DECISION_BACKEND=jev` until Laya close quality improves; Laya is safe to A/B with this gate.
 
+## Tip 2026-09-23b — trial lower Laya close floors (multi-hour A/B)
+
+Live after Jev→Laya switch: Laya judgment ~80% buy / 0% hold; all closes blocked at 0.80 → 0 fills + max_positions lock.
+
+**Trial floors** (Laya / strict gated close only; Jev under follow_jev unchanged):
+- `CLOSE_SHOULD_TRADE_MIN = 0.45` (was 0.80)
+- `CLOSE_ACTION_PROB_MIN = 0.55` (was 0.75)
+- `CLOSE_FALSE_BREAK_RISK_MAX = 0.45` on gated close (entry quality still 0.35)
+
+Counterfactual on post-switch Laya closes: ~16/45 would pass. Restart desk to load. Revisit after hourly compares.

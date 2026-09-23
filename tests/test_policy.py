@@ -128,11 +128,11 @@ def test_follow_jev_closes_at_live_jev_scores() -> None:
 
 
 def test_follow_jev_blocks_soft_laya_close() -> None:
-    """Laya soft closes bled the book; gate even under follow_jev."""
+    """Still gate Laya closes below the trial floor (0.45)."""
     decision = apply_policy(
         _judgment(
             action="close",
-            should_trade_now=0.44,
+            should_trade_now=0.40,
             trend_aligned=0.55,
             false_break_risk=0.22,
             signal_strength="рабочий",
@@ -143,6 +143,24 @@ def test_follow_jev_blocks_soft_laya_close() -> None:
     )
     assert decision.passed is False
     assert decision.skip_reason == "close_should_trade_now"
+
+
+def test_follow_jev_allows_trial_laya_close() -> None:
+    """Trial floors: should>=0.45, close_p>=0.55, false_break<=0.45."""
+    decision = apply_policy(
+        _judgment(
+            action="close",
+            should_trade_now=0.46,
+            trend_aligned=0.55,
+            false_break_risk=0.42,
+            signal_strength="рабочий",
+            model="laya:typed-decisions",
+            action_probabilities={"close": 0.60, "hold": 0.40},
+        ),
+        follow_jev=True,
+    )
+    assert decision.passed is True
+    assert decision.action == "close"
 
 
 def test_follow_jev_allows_strong_laya_close() -> None:
@@ -161,9 +179,9 @@ def test_follow_jev_allows_strong_laya_close() -> None:
 
 
 def test_close_requires_higher_should_than_entry() -> None:
-    # Entry bar 0.72 would pass buy; close needs CLOSE_SHOULD_TRADE_MIN (0.80).
+    # Entry bar 0.72 would pass buy; close needs CLOSE_SHOULD_TRADE_MIN (0.45).
     decision = apply_policy(
-        _judgment(action="close", should_trade_now=0.75, trend_aligned=0.10)
+        _judgment(action="close", should_trade_now=0.40, trend_aligned=0.10)
     )
     assert decision.passed is False
     assert decision.skip_reason == "close_should_trade_now"
@@ -174,7 +192,7 @@ def test_close_action_prob_gate_when_probs_present() -> None:
         _judgment(
             action="close",
             should_trade_now=0.90,
-            action_probabilities={"close": 0.60, "hold": 0.40},
+            action_probabilities={"close": 0.50, "hold": 0.50},
         ),
     )
     assert decision.passed is False
