@@ -357,6 +357,48 @@ class Ledger:
             ts = ts.replace(tzinfo=timezone.utc)
         return max(0.0, (datetime.now(timezone.utc) - ts).total_seconds())
 
+    def count_entries_since(self, since: datetime) -> int:
+        """Count buy_long fills (any symbol) at or after `since` (UTC)."""
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        bound = since.astimezone(timezone.utc).isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM fills
+                WHERE action = 'buy_long' AND ts >= ?
+                """,
+                (bound,),
+            ).fetchone()
+        return int(row["n"] if row is not None else 0)
+
+    def recent_close_pnls(self, *, limit: int = 64) -> list[tuple[datetime, float]]:
+        """Newest-first close fills with realized PnL. Break-even is 0.0 when null."""
+        lim = max(1, int(limit))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT ts, realized_pnl_usdt FROM fills
+                WHERE action = 'close'
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (lim,),
+            ).fetchall()
+        out: list[tuple[datetime, float]] = []
+        for row in rows:
+            raw = str(row["ts"])
+            try:
+                ts = datetime.fromisoformat(raw)
+            except ValueError:
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            pnl_raw = row["realized_pnl_usdt"]
+            pnl = 0.0 if pnl_raw is None else float(pnl_raw)
+            out.append((ts, pnl))
+        return out
+
     def count_open_positions(self) -> int:
         with self._connect() as conn:
             row = conn.execute(

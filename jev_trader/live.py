@@ -13,6 +13,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,11 @@ from jev_trader.execution import (
     is_real_fill,
 )
 from jev_trader.ledger import Ledger
+from jev_trader.risk import (
+    build_entry_guard_state,
+    load_entry_guard_config,
+    loss_streak_from_closes,
+)
 from jev_trader.status import resolve_day_anchor, seconds_to_next_5m, utc_now, write_json
 from jev_trader.models import (
     AccountState,
@@ -672,6 +678,27 @@ class LiveRunner:
             self.last_error = last_error
         if self.status_path is None:
             return
+        entry_guards = None
+        try:
+            cfg = load_entry_guard_config()
+            now = datetime.now(timezone.utc)
+            entries_last_hour = 0
+            loss_streak = 0
+            last_loss_ts = None
+            if self.ledger is not None:
+                entries_last_hour = self.ledger.count_entries_since(now - timedelta(hours=1))
+                loss_streak, last_loss_ts = loss_streak_from_closes(
+                    self.ledger.recent_close_pnls(limit=64)
+                )
+            entry_guards = build_entry_guard_state(
+                config=cfg,
+                now=now,
+                entries_last_hour=entries_last_hour,
+                loss_streak=loss_streak,
+                last_loss_ts=last_loss_ts,
+            ).as_dict()
+        except Exception:  # noqa: BLE001 — status must not die on guard math
+            entry_guards = None
         payload = {
             "ok": True,
             "running": True,
@@ -687,6 +714,7 @@ class LiveRunner:
             "last_decisions": self.last_decisions[:30],
             "wallet": self.wallet_box.get("wallet"),
             "day_start_equity_usdt": self.wallet_box.get("start_equity_usdt"),
+            "entry_guards": entry_guards,
             "hint": "Jev на закрытии 5m. Вход только BUY/лонг; выход MARKET; стоп на бирже.",
         }
         try:

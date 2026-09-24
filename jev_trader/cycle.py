@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from jev_trader.execution import (
@@ -27,7 +28,13 @@ from jev_trader.models import (
     TradeIntent,
 )
 from jev_trader.policy import apply_policy
-from jev_trader.risk import apply_risk, long_protective_stop
+from jev_trader.risk import (
+    apply_risk,
+    build_entry_guard_state,
+    load_entry_guard_config,
+    long_protective_stop,
+    loss_streak_from_closes,
+)
 from jev_trader.state import build_compact_state
 from jev_trader.telegram import TelegramNotifier
 
@@ -202,12 +209,31 @@ def run_once(
     policy = apply_policy(resolved, **policy_kwargs)
     seconds_since_close = None
     seconds_since_entry = None
+    now = datetime.now(timezone.utc)
+    entry_guard_config = load_entry_guard_config()
+    entries_last_hour = 0
+    loss_streak = 0
+    last_loss_ts = None
     if ledger is not None:
         seconds_since_close = ledger.seconds_since_last_close(snapshot.symbol)
         seconds_since_entry = ledger.seconds_since_last_entry(snapshot.symbol)
+        entries_last_hour = ledger.count_entries_since(now - timedelta(hours=1))
+        loss_streak, last_loss_ts = loss_streak_from_closes(
+            ledger.recent_close_pnls(limit=64)
+        )
+    entry_guard_state = build_entry_guard_state(
+        config=entry_guard_config,
+        now=now,
+        entries_last_hour=entries_last_hour,
+        loss_streak=loss_streak,
+        last_loss_ts=last_loss_ts,
+    )
     risk_kwargs: dict[str, Any] = {
         "seconds_since_last_close": seconds_since_close,
         "seconds_since_last_entry": seconds_since_entry,
+        "entry_guard_config": entry_guard_config,
+        "entry_guard_state": entry_guard_state,
+        "now": now,
     }
     if min_hold_sec is not None:
         risk_kwargs["min_hold_sec"] = min_hold_sec
