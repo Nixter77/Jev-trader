@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 Action = Literal["buy_long", "sell_short", "close", "hold"]
 PositionSide = Literal["FLAT", "LONG", "SHORT"]
+# Flat account is blocked when day PnL / day-start equity is at or under this.
+DAILY_LOSS_LIMIT_PCT = 0.025
 SIGNAL_STRENGTH_LEVELS: tuple[str, ...] = ("нет края", "слабый", "рабочий", "сильный")
 ACTIONS: tuple[str, ...] = ("buy_long", "sell_short", "close", "hold")
 
@@ -168,7 +170,7 @@ class AccountState:
     max_positions: int = 3
     risk_pct: float = 0.005
     atr_stop_mult: float = 1.5
-    daily_loss_limit_pct: float = 0.025
+    daily_loss_limit_pct: float = DAILY_LOSS_LIMIT_PCT
     leverage: float = 3.0
     available_usdt: float | None = None
 

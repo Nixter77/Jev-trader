@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
@@ -276,20 +277,76 @@ def overlay_wallet_position(snapshot: MarketSnapshot, wallet: dict[str, Any]) ->
     )
 
 
+def _box_lock(box: dict[str, Any]) -> threading.Lock:
+    # threading.Lock is a factory, not a type. setdefault keeps one lock if two threads arrive together.
+    lock = box.get("_lock")
+    if lock is not None:
+        return lock
+    return box.setdefault("_lock", threading.Lock())
+
+
+def begin_wallet_pull(box: dict[str, Any]) -> int:
+    """Generation observed before a slow exchange fetch."""
+    with _box_lock(box):
+        return int(box.get("_wallet_gen") or 0)
+
+
+def finish_wallet_pull(
+    box: dict[str, Any],
+    gen: int,
+    wallet: dict[str, Any] | None,
+    *,
+    error: str | None = None,
+) -> dict[str, Any] | None:
+    """Publish `wallet` only if nobody force-published a newer snapshot while we fetched.
+
+    Returns the snapshot the caller should trade on. After a flatten that is the
+    flat wallet, not the positions this fetch observed before the close.
+    """
+    with _box_lock(box):
+        if int(box.get("_wallet_gen") or 0) != gen:
+            current = box.get("wallet")
+            return current if isinstance(current, dict) else None
+        if error is not None:
+            box["wallet_error"] = error
+            return None
+        box["wallet"] = wallet
+        box.pop("wallet_error", None)
+        return wallet
+
+
+def force_wallet(box: dict[str, Any], wallet: dict[str, Any]) -> None:
+    """Flatten (HTTP thread) wins over an in-flight fetch on the bot thread."""
+    with _box_lock(box):
+        box["_wallet_gen"] = int(box.get("_wallet_gen") or 0) + 1
+        box["wallet"] = wallet
+        box.pop("wallet_error", None)
+
+
+def wallet_view(box: dict[str, Any]) -> tuple[Any, Any, Any]:
+    with _box_lock(box):
+        return box.get("wallet"), box.get("start_equity_usdt"), box.get("wallet_error")
+
+
 def _pull_wallet(broker: Any, wallet_box: dict[str, Any] | None) -> dict[str, Any] | None:
     fetch = getattr(broker, "fetch_wallet", None)
     if not callable(fetch):
         return None
+    gen = 0 if wallet_box is None else begin_wallet_pull(wallet_box)
     try:
         wallet = fetch()
     except Exception as exc:  # noqa: BLE001
-        if wallet_box is not None:
-            wallet_box["wallet_error"] = f"{type(exc).__name__}: {exc}"
-        return None
-    if wallet_box is not None:
-        wallet_box["wallet"] = wallet
-        wallet_box.pop("wallet_error", None)
-    return wallet
+        if wallet_box is None:
+            return None
+        return finish_wallet_pull(
+            wallet_box,
+            gen,
+            None,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    if wallet_box is None:
+        return wallet
+    return finish_wallet_pull(wallet_box, gen, wallet)
 
 
 def _account_for_cycle(
@@ -317,12 +374,14 @@ def _account_for_cycle(
                 # A process that stays up past UTC midnight must roll the day,
                 # otherwise yesterday's loss keeps blocking entries.
                 start = resolve_day_anchor(anchor_path, venue=str(venue), equity=float(cash))
-                wallet_box["start_equity_usdt"] = start
+                with _box_lock(wallet_box):
+                    wallet_box["start_equity_usdt"] = start
             else:
-                start = wallet_box.get("start_equity_usdt")
-                if not start:
-                    wallet_box["start_equity_usdt"] = cash
-                    start = cash
+                with _box_lock(wallet_box):
+                    start = wallet_box.get("start_equity_usdt")
+                    if not start:
+                        wallet_box["start_equity_usdt"] = cash
+                        start = cash
             if start:
                 daily_pnl_pct = (cash - float(start)) / float(start)
         if ledger is not None:
@@ -454,6 +513,7 @@ class LiveRunner:
         self.venue = venue
         self.follow_jev = bool(follow_jev)
         self.wallet_box = wallet_box if wallet_box is not None else {}
+        self._state_lock = threading.Lock()
         self.decision_backend = (decision_backend or "jev").strip().lower() or "jev"
         self.laya_checkpoint = (laya_checkpoint or "typed-decisions").strip() or "typed-decisions"
         self.last_decisions: list[dict[str, Any]] = []
@@ -573,10 +633,12 @@ class LiveRunner:
 
     def _record_result(self, result: CycleResult) -> None:
         print(dumps_decision(result), flush=True)
-        self.last_decisions.insert(0, self._compact_decision(result))
-        self.last_decisions = self.last_decisions[:30]
-        self.last_error = None
-        self.cycles += 1
+        compact = self._compact_decision(result)
+        with self._state_lock:
+            self.last_decisions.insert(0, compact)
+            del self.last_decisions[30:]
+            self.last_error = None
+            self.cycles += 1
         self.write_status()
 
     def poll_once(self, *, emit: bool = True) -> list[CycleResult]:
@@ -679,7 +741,8 @@ class LiveRunner:
 
     def write_status(self, *, last_error: str | None = None) -> None:
         if last_error is not None:
-            self.last_error = last_error
+            with self._state_lock:
+                self.last_error = last_error
         if self.status_path is None:
             return
         entry_guards = None
@@ -703,6 +766,12 @@ class LiveRunner:
             ).as_dict()
         except Exception:  # noqa: BLE001 — status must not die on guard math
             entry_guards = None
+        with self._state_lock:
+            cycles = self.cycles
+            symbols = list(self.symbols)
+            decisions = list(self.last_decisions[:30])
+            last_error = self.last_error
+        wallet, day_start, wallet_error = wallet_view(self.wallet_box)
         payload = {
             "ok": True,
             "running": True,
@@ -710,14 +779,14 @@ class LiveRunner:
             "ts": utc_now(),
             "venue": self.venue,
             "follow_jev": self.follow_jev,
-            "cycles": self.cycles,
-            "watch": list(self.symbols),
+            "cycles": cycles,
+            "watch": symbols,
             "universe": self.universe,
             "seconds_to_next_5m": seconds_to_next_5m(),
-            "last_error": self.last_error or self.wallet_box.get("wallet_error"),
-            "last_decisions": self.last_decisions[:30],
-            "wallet": self.wallet_box.get("wallet"),
-            "day_start_equity_usdt": self.wallet_box.get("start_equity_usdt"),
+            "last_error": last_error or wallet_error,
+            "last_decisions": decisions,
+            "wallet": wallet,
+            "day_start_equity_usdt": day_start,
             "entry_guards": entry_guards,
             "decision_backend": self.decision_backend,
             "laya_checkpoint": self.laya_checkpoint if self.decision_backend == "laya" else None,

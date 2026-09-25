@@ -15,6 +15,7 @@ from jev_trader.execution import (
     order_lock,
 )
 from jev_trader.ledger import Ledger
+from jev_trader.live import force_wallet
 from jev_trader.models import CycleResult, ExecutionResult, market_close_intent
 from jev_trader.status import read_json, utc_now, write_json
 
@@ -169,7 +170,7 @@ def run_flatten(
     if runner is not None:
         wallet = result.get("wallet")
         if isinstance(wallet, dict):
-            runner.wallet_box["wallet"] = wallet
+            force_wallet(runner.wallet_box, wallet)
         try:
             runner.write_status()
         except Exception:  # noqa: BLE001 — blotter must still refresh from disk

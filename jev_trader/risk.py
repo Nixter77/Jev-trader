@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 from jev_trader.execution import client_order_id
 from jev_trader.models import (
+    DAILY_LOSS_LIMIT_PCT,
     AccountState,
     Features,
     MarketSnapshot,
@@ -44,14 +45,36 @@ class EntryGuardConfig:
     loss_streak_pause_min: float = DEFAULT_LOSS_STREAK_PAUSE_MIN
 
 
+def window_label(config: EntryGuardConfig) -> str:
+    """Hours the blotter can show without re-reading env."""
+    window = config.no_entry_window
+    if window is None:
+        return "выкл"
+    start, end = window
+    tz = "IL" if config.no_entry_tz == DEFAULT_NO_ENTRY_TZ else config.no_entry_tz
+    return f"{start.strftime('%H:%M')}–{end.strftime('%H:%M')} {tz}"
+
+
+def daily_loss_hit(day_pnl_pct: float, limit_pct: float = DAILY_LOSS_LIMIT_PCT) -> bool:
+    """True when day PnL percent is at or past the loss limit (default −2.5%)."""
+    return float(day_pnl_pct) <= -abs(float(limit_pct))
+
+
 @dataclass(frozen=True)
 class EntryGuardState:
-    """Snapshot of guard inputs + derived flags for risk + bot-status."""
+    """Snapshot of guard inputs + derived flags for risk + bot-status.
+
+    Caps live on the snapshot so the blotter does not reload env and disagree
+    with the process that actually blocked the entry.
+    """
 
     window_active: bool
     entries_last_hour: int
     loss_streak: int
     pause_until: datetime | None
+    max_entries_per_hour: int = DEFAULT_MAX_ENTRIES_PER_HOUR
+    loss_streak_pause_n: int = DEFAULT_LOSS_STREAK_PAUSE_N
+    window_label: str = "03:00–09:00 IL"
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -61,6 +84,9 @@ class EntryGuardState:
             "pause_until": None
             if self.pause_until is None
             else self.pause_until.astimezone(timezone.utc).isoformat(),
+            "max_entries_per_hour": self.max_entries_per_hour,
+            "loss_streak_pause_n": self.loss_streak_pause_n,
+            "window_label": self.window_label,
         }
 
 
@@ -196,6 +222,9 @@ def build_entry_guard_state(
         entries_last_hour=int(entries_last_hour),
         loss_streak=int(loss_streak),
         pause_until=pause_until,
+        max_entries_per_hour=int(config.max_entries_per_hour),
+        loss_streak_pause_n=int(config.loss_streak_pause_n),
+        window_label=window_label(config),
     )
 
 
@@ -320,7 +349,7 @@ def apply_risk(
             return close_position(risk_event="kill_switch", entry_type="MARKET")
         return skip("kill_switch")
 
-    if account.daily_pnl_pct <= -abs(account.daily_loss_limit_pct):
+    if daily_loss_hit(account.daily_pnl_pct, account.daily_loss_limit_pct):
         if in_position:
             return close_position(risk_event="daily_loss", entry_type="MARKET")
         return skip("daily_loss")

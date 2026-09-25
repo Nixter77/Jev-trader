@@ -368,4 +368,7 @@ def test_guard_state_as_dict_shape() -> None:
         "entries_last_hour": 1,
         "loss_streak": 2,
         "pause_until": None,
+        "max_entries_per_hour": 2,
+        "loss_streak_pause_n": 3,
+        "window_label": "выкл",
     }

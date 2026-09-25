@@ -12,12 +12,13 @@ from urllib.request import Request, urlopen
 import pytest
 
 from jev_trader.cycle import decision_payload, run_once_from_answers
+from jev_trader.desk import build_restrictions, compute_daily_loss
 from jev_trader.execution import PaperBroker
+from jev_trader.flatten import flatten_open_positions
 from jev_trader.jev import judgment_from_dict
 from jev_trader.ledger import Ledger
 from jev_trader.live import LiveRunner, make_run_cycle
-from jev_trader.flatten import flatten_open_positions
-from jev_trader.monitor import bind_monitor, compute_daily_loss, dashboard_state, render_html
+from jev_trader.monitor import bind_monitor, dashboard_state, json_text, render_html
 from jev_trader.status import read_json, resolve_day_anchor, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -324,6 +325,52 @@ def test_flatten_post_without_callback_is_unavailable(tmp_path: Path) -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_hourly_cap_follows_the_bot_snapshot_not_monitor_env(monkeypatch) -> None:
+    monkeypatch.setenv("MAX_ENTRIES_PER_HOUR", "1")
+    restrictions = build_restrictions(
+        {
+            "entry_guards": {
+                "window_active": False,
+                "entries_last_hour": 2,
+                "loss_streak": 0,
+                "pause_until": None,
+                "max_entries_per_hour": 5,
+            }
+        },
+        daily_loss={"active": False, "detail": "день −1.00%"},
+    )
+    cap = next(item for item in restrictions["items"] if item["id"] == "hourly_entry_cap")
+    assert cap["active"] is False
+    assert cap["max_entries_per_hour"] == 5
+
+
+def test_desk_rejects_nonfinite_money_and_markup_labels() -> None:
+    assert compute_daily_loss(day_start_equity_usdt=1000.0, equity_usdt=float("nan"))["known"] is False
+    assert compute_daily_loss(day_start_equity_usdt=1000.0, equity_usdt=float("inf"))["known"] is False
+    restrictions = build_restrictions(
+        {
+            "entry_guards": {
+                "window_label": "<img src=x onerror=alert(1)>",
+                "window_active": "false",
+                "pause_until": "<script>alert(1)</script>",
+            }
+        },
+        daily_loss={"active": False, "detail": "ok"},
+    )
+    window = next(item for item in restrictions["items"] if item["id"] == "no_entry_window")
+    pause = next(item for item in restrictions["items"] if item["id"] == "loss_streak_pause")
+    assert window["active"] is False
+    assert "<" not in window["label"]
+    assert window["label"] == "Ночное окно 03:00–09:00 IL"
+    assert "<" not in pause["detail"]
+    assert pause["pause_until"] is None
+    text = json_text({"n": float("nan"), "i": float("inf")})
+    assert json.loads(text) == {"n": None, "i": None}
+    html = render_html({"open_positions": [{"symbol": "<img>", "side": "LONG"}]})
+    assert "function esc" in html
+    assert "\\u003cimg>" in html
 
 
 def test_compute_daily_loss_active_and_inactive() -> None:

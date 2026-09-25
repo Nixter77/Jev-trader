@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,7 +17,15 @@ from jev_trader.execution import PaperBroker, bump_flatten_generation
 from jev_trader.features import compute_features
 from jev_trader.jev import judgment_from_dict
 from jev_trader.ledger import Ledger
-from jev_trader.live import FiveMinuteCloseLoop, make_run_cycle, overlay_wallet_position
+from jev_trader.live import (
+    FiveMinuteCloseLoop,
+    begin_wallet_pull,
+    finish_wallet_pull,
+    force_wallet,
+    make_run_cycle,
+    overlay_wallet_position,
+)
+from jev_trader.status import read_json, write_json
 from jev_trader.public_market import parse_rest_klines
 from jev_trader.state import build_compact_state
 
@@ -351,3 +360,50 @@ def test_overlay_wallet_uses_exchange_position(market_snapshot) -> None:
     assert flat.position.side == "FLAT"
     assert flat.position.size == 0.0
     assert flat.position.stop_price is None
+
+
+def test_fetch_started_before_flatten_does_not_restore_the_position() -> None:
+    box: dict = {}
+    gen = begin_wallet_pull(box)
+    force_wallet(box, {"equity_usdt": 1.0, "positions": []})
+    published = finish_wallet_pull(
+        box,
+        gen,
+        {"equity_usdt": 9.0, "positions": [{"symbol": "BTCUSDT", "side": "LONG", "size": 1}]},
+    )
+    assert published is not None
+    assert published["equity_usdt"] == pytest.approx(1.0)
+    assert box["wallet"]["positions"] == []
+    later = begin_wallet_pull(box)
+    refreshed = finish_wallet_pull(box, later, {"equity_usdt": 2.0, "positions": []})
+    assert refreshed is not None
+    assert refreshed["equity_usdt"] == pytest.approx(2.0)
+
+
+def test_concurrent_status_writes_stay_valid_json(tmp_path: Path) -> None:
+    path = tmp_path / "bot-status.json"
+    errors: list[BaseException] = []
+
+    def writer(n: int) -> None:
+        try:
+            for i in range(40):
+                write_json(path, {"n": n, "i": i, "pad": "x" * 4000})
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(n,)) for n in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    saved = read_json(path)
+    assert saved is not None
+    assert saved["n"] in {0, 1, 2, 3}
+
+
+def test_ledger_uses_wal_so_the_blotter_can_read_during_a_write(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    with ledger._connect() as conn:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    assert str(mode).lower() == "wal"

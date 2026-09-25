@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,11 +47,15 @@ def resolve_day_anchor(
 
 
 def write_json(path: str | Path, payload: dict[str, Any]) -> None:
+    """Atomic replace. Each writer gets its own temp file so two threads cannot truncate one `.tmp`."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(target.name + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    tmp.replace(target)
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        tmp.replace(target)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def read_json(path: str | Path | None) -> dict[str, Any] | None:

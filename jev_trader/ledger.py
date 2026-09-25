@@ -25,8 +25,13 @@ class Ledger:
         self._init()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        # The blotter thread reads while the bot thread writes. WAL lets the
+        # reader proceed; busy_timeout waits out the single writer instead of
+        # raising "database is locked".
+        conn = sqlite3.connect(self.path, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
     def _init(self) -> None:
