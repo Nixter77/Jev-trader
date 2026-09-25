@@ -17,7 +17,7 @@ from jev_trader.jev import judgment_from_dict
 from jev_trader.ledger import Ledger
 from jev_trader.live import LiveRunner, make_run_cycle
 from jev_trader.flatten import flatten_open_positions
-from jev_trader.monitor import bind_monitor, dashboard_state, render_html
+from jev_trader.monitor import bind_monitor, compute_daily_loss, dashboard_state, render_html
 from jev_trader.status import read_json, resolve_day_anchor, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -190,6 +190,8 @@ def test_live_runner_writes_status(tmp_path: Path, passing_answers) -> None:
     assert status["follow_jev"] is True
     assert status["last_decisions"]
     assert status["last_decisions"][0]["symbol"] == "BTCUSDT"
+    assert status.get("decision_backend") == "jev"
+    assert status.get("entry_guards") is not None
 
 
 def test_monitor_http_serves_blotter(tmp_path: Path, market_snapshot, passing_answers) -> None:
@@ -322,3 +324,104 @@ def test_flatten_post_without_callback_is_unavailable(tmp_path: Path) -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_compute_daily_loss_active_and_inactive() -> None:
+    inactive = compute_daily_loss(day_start_equity_usdt=1000.0, equity_usdt=980.0)
+    assert inactive["known"] is True
+    assert inactive["active"] is False
+    assert inactive["day_pnl_pct"] == pytest.approx(-0.02)
+    # Exactly at -2.5% is active (<=)
+    edge = compute_daily_loss(day_start_equity_usdt=1000.0, equity_usdt=975.0)
+    assert edge["active"] is True
+    deep = compute_daily_loss(day_start_equity_usdt=2000.0, equity_usdt=1900.0)
+    assert deep["active"] is True
+    assert deep["day_pnl_usdt"] == pytest.approx(-100.0)
+    unknown = compute_daily_loss(day_start_equity_usdt=None, equity_usdt=100.0)
+    assert unknown["known"] is False
+    assert unknown["active"] is False
+
+
+def test_dashboard_exposes_backend_guards_and_daily_loss(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    status_path = tmp_path / "bot-status.json"
+    write_json(
+        status_path,
+        {
+            "ts": "2099-01-01T00:00:00+00:00",
+            "pid": os.getpid(),
+            "venue": "testnet",
+            "decision_backend": "laya",
+            "laya_checkpoint": "typed-decisions",
+            "day_start_equity_usdt": 1000.0,
+            "wallet": {"equity_usdt": 960.0, "positions": []},
+            "entry_guards": {
+                "window_active": True,
+                "entries_last_hour": 2,
+                "loss_streak": 3,
+                "pause_until": "2099-01-01T12:00:00+00:00",
+            },
+            "last_decisions": [
+                {"skip_reason": "daily_loss", "judge_ms": 50},
+                {"skip_reason": "no_entry_window", "judge_ms": 40},
+                {"skip_reason": "hourly_entry_cap", "judge_ms": 40},
+                {"skip_reason": "loss_streak_pause", "judge_ms": 40},
+            ],
+        },
+    )
+    state = dashboard_state(ledger, status_path=status_path)
+    assert state["decision_backend"] == "laya"
+    assert state["laya_checkpoint"] == "typed-decisions"
+    assert state["decision_model"]["source"] == "status"
+    assert state["entry_guards"]["window_active"] is True
+    assert state["entry_guards"]["entries_last_hour"] == 2
+    assert state["daily_loss"]["active"] is True
+    assert state["daily_loss"]["day_pnl_pct"] == pytest.approx(-0.04)
+    assert state["day_start_equity_usdt"] == pytest.approx(1000.0)
+    ids = {i["id"]: i for i in state["restrictions"]["items"]}
+    assert ids["daily_loss"]["active"] is True
+    assert ids["no_entry_window"]["active"] is True
+    assert ids["hourly_entry_cap"]["active"] is True
+    assert ids["loss_streak_pause"]["active"] is True
+    assert state["skip_reason_counts"]["daily_loss"] == 1
+    assert state["skip_reason_counts"]["loss_streak_pause"] == 1
+    html = render_html(state)
+    assert "Ограничения сейчас" in html
+    assert "Модель" in html
+    assert "restriction-chips" in html
+
+
+def test_dashboard_infers_laya_from_judge_ms_when_backend_missing(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    status_path = tmp_path / "bot-status.json"
+    write_json(
+        status_path,
+        {
+            "ts": "2099-01-01T00:00:00+00:00",
+            "pid": os.getpid(),
+            "venue": "testnet",
+            "day_start_equity_usdt": 2500.0,
+            "wallet": {"equity_usdt": 2480.0, "positions": []},
+            "entry_guards": {
+                "window_active": False,
+                "entries_last_hour": 0,
+                "loss_streak": 0,
+                "pause_until": None,
+            },
+            "last_decisions": [
+                {"skip_reason": "reentry_cooldown", "judge_ms": 17000},
+                {"skip_reason": "reentry_cooldown", "judge_ms": 18000},
+            ],
+        },
+    )
+    # Ensure process env does not force a backend for this test.
+    os.environ.pop("DECISION_BACKEND", None)
+    state = dashboard_state(ledger, status_path=status_path)
+    assert state["decision_backend"] == "laya"
+    assert state["decision_model"]["source"] == "judge_ms_hint"
+    assert "рестарт" in (state["decision_model"]["note"] or "")
+    assert state["daily_loss"]["active"] is False
+    ids = {i["id"]: i for i in state["restrictions"]["items"]}
+    assert ids["loss_streak_pause"]["active"] is False
+    assert ids["no_entry_window"]["active"] is False
+

@@ -12,10 +12,17 @@ from typing import Any
 from urllib.parse import urlparse
 
 from jev_trader.ledger import Ledger
+from jev_trader.risk import DEFAULT_MAX_ENTRIES_PER_HOUR, load_entry_guard_config
 from jev_trader.status import pid_alive, read_json, read_pid, seconds_to_next_5m
 
 STARTING_CASH_USDT = 10_000.0
 STALE_AFTER_SEC = 90.0
+# Same default as AccountState.daily_loss_limit_pct — daily_loss blocks when
+# (equity - day_start) / day_start <= -DAILY_LOSS_LIMIT_PCT.
+DAILY_LOSS_LIMIT_PCT = 0.025
+IL_TZ_NAME = "Asia/Jerusalem"
+# judge_ms above this (with no decision_backend in status) → likely Laya local HF.
+LAYA_JUDGE_MS_HINT = 2000.0
 
 
 def _parse_ts(raw: Any) -> datetime | None:
@@ -29,6 +36,236 @@ def _parse_ts(raw: Any) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _as_float(raw: Any) -> float | None:
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def compute_daily_loss(
+    *,
+    day_start_equity_usdt: Any,
+    equity_usdt: Any,
+    limit_pct: float = DAILY_LOSS_LIMIT_PCT,
+) -> dict[str, Any]:
+    """Daily loss gate from day-start equity vs current wallet equity.
+
+    Active when day PnL percent <= -limit_pct (default 2.5% of day_start).
+    Formula: day_pnl = equity - day_start; day_pnl_pct = day_pnl / day_start.
+    """
+    start = _as_float(day_start_equity_usdt)
+    equity = _as_float(equity_usdt)
+    limit = abs(float(limit_pct))
+    if start is None or start <= 0 or equity is None:
+        return {
+            "active": False,
+            "known": False,
+            "limit_pct": limit,
+            "day_start_equity_usdt": start,
+            "equity_usdt": equity,
+            "day_pnl_usdt": None,
+            "day_pnl_pct": None,
+            "detail": "нет day_start / equity",
+        }
+    day_pnl = equity - start
+    day_pnl_pct = day_pnl / start
+    active = day_pnl_pct <= -limit
+    return {
+        "active": bool(active),
+        "known": True,
+        "limit_pct": limit,
+        "day_start_equity_usdt": start,
+        "equity_usdt": equity,
+        "day_pnl_usdt": round(day_pnl, 4),
+        "day_pnl_pct": round(day_pnl_pct, 6),
+        "detail": (
+            f"день {day_pnl_pct * 100:.2f}% "
+            f"(лимит −{limit * 100:.1f}%; "
+            f"PnL {day_pnl:+.2f} USDT)"
+        ),
+    }
+
+
+def _skip_reason_counts(decisions: list[Any] | None) -> dict[str, int]:
+    keys = (
+        "daily_loss",
+        "no_entry_window",
+        "hourly_entry_cap",
+        "loss_streak_pause",
+        "reentry_cooldown",
+    )
+    counts = {k: 0 for k in keys}
+    for row in decisions or []:
+        if not isinstance(row, dict):
+            continue
+        reason = row.get("skip_reason")
+        if isinstance(reason, str) and reason in counts:
+            counts[reason] += 1
+    return counts
+
+
+def _median_judge_ms(decisions: list[Any] | None) -> float | None:
+    vals: list[float] = []
+    for row in decisions or []:
+        if not isinstance(row, dict):
+            continue
+        ms = _as_float(row.get("judge_ms"))
+        if ms is not None and ms > 0:
+            vals.append(ms)
+    if not vals:
+        return None
+    vals.sort()
+    mid = len(vals) // 2
+    if len(vals) % 2:
+        return vals[mid]
+    return (vals[mid - 1] + vals[mid]) / 2.0
+
+
+def resolve_decision_backend(status: dict[str, Any] | None) -> dict[str, Any]:
+    """Prefer status.decision_backend; else process env; else judge_ms hint."""
+    import os
+
+    status = status or {}
+    raw = status.get("decision_backend")
+    checkpoint = status.get("laya_checkpoint")
+    source = "status"
+    backend: str | None = None
+    note: str | None = None
+
+    if isinstance(raw, str) and raw.strip():
+        backend = raw.strip().lower()
+    else:
+        env_backend = (os.environ.get("DECISION_BACKEND") or "").strip().lower()
+        if env_backend in {"jev", "laya"}:
+            backend = env_backend
+            source = "env"
+            if not checkpoint and backend == "laya":
+                checkpoint = (os.environ.get("LAYA_CHECKPOINT") or "").strip() or None
+        else:
+            med = _median_judge_ms(status.get("last_decisions"))
+            if med is not None and med >= LAYA_JUDGE_MS_HINT:
+                backend = "laya"
+                source = "judge_ms_hint"
+                note = (
+                    f"не указано в статусе; по judge_ms≈{med:.0f} мс похоже на Laya "
+                    "(нужен рестарт бота чтобы писать decision_backend)"
+                )
+            else:
+                backend = None
+                source = "unknown"
+                note = (
+                    "не указано в статусе "
+                    "(нужен рестарт бота чтобы писать decision_backend)"
+                )
+
+    if backend == "laya" and not checkpoint and source == "status":
+        checkpoint = status.get("laya_checkpoint")
+    if backend == "laya" and isinstance(checkpoint, str) and not checkpoint.strip():
+        checkpoint = None
+    if backend != "laya":
+        checkpoint = checkpoint if backend == "laya" else None
+
+    label = {
+        "jev": "Jev",
+        "laya": "Laya",
+    }.get(backend or "", "не указано")
+
+    return {
+        "backend": backend,
+        "label": label,
+        "laya_checkpoint": checkpoint if backend == "laya" else None,
+        "source": source,
+        "note": note,
+    }
+
+
+def _format_il(raw: Any) -> str | None:
+    dt = _parse_ts(raw)
+    if dt is None:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+
+        local = dt.astimezone(ZoneInfo(IL_TZ_NAME))
+    except Exception:  # noqa: BLE001
+        local = dt
+    return local.strftime("%Y-%m-%d %H:%M:%S IL")
+
+
+def build_restrictions(
+    status: dict[str, Any] | None,
+    *,
+    daily_loss: dict[str, Any],
+) -> dict[str, Any]:
+    """UI-ready restriction chips from entry_guards + daily_loss."""
+    status = status or {}
+    guards = status.get("entry_guards") if isinstance(status.get("entry_guards"), dict) else {}
+    try:
+        cfg = load_entry_guard_config()
+        max_entries = int(cfg.max_entries_per_hour)
+    except Exception:  # noqa: BLE001
+        max_entries = DEFAULT_MAX_ENTRIES_PER_HOUR
+
+    window_active = bool(guards.get("window_active"))
+    entries_last_hour = int(guards.get("entries_last_hour") or 0)
+    loss_streak = int(guards.get("loss_streak") or 0)
+    pause_until_raw = guards.get("pause_until")
+    pause_until_dt = _parse_ts(pause_until_raw)
+    now = datetime.now(timezone.utc)
+    pause_active = pause_until_dt is not None and now < pause_until_dt
+    hourly_active = max_entries > 0 and entries_last_hour >= max_entries
+
+    items = [
+        {
+            "id": "daily_loss",
+            "label": "Daily loss",
+            "active": bool(daily_loss.get("active")),
+            "detail": daily_loss.get("detail") or "—",
+        },
+        {
+            "id": "no_entry_window",
+            "label": "Ночное окно 03–09 IL",
+            "active": window_active,
+            "detail": "активно — входы закрыты" if window_active else "нет (вне окна)",
+        },
+        {
+            "id": "hourly_entry_cap",
+            "label": "Лимит входов в час",
+            "active": hourly_active,
+            "detail": f"{entries_last_hour} / {max_entries}",
+            "entries_last_hour": entries_last_hour,
+            "max_entries_per_hour": max_entries,
+        },
+        {
+            "id": "loss_streak_pause",
+            "label": "Пауза после 3 убытков",
+            "active": pause_active,
+            "detail": (
+                f"streak {loss_streak}; до {_format_il(pause_until_raw) or pause_until_raw}"
+                if pause_active
+                else f"нет (streak {loss_streak})"
+            ),
+            "loss_streak": loss_streak,
+            "pause_until": pause_until_raw,
+            "pause_until_il": _format_il(pause_until_raw),
+        },
+    ]
+    return {
+        "items": items,
+        "entry_guards": {
+            "window_active": window_active,
+            "entries_last_hour": entries_last_hour,
+            "loss_streak": loss_streak,
+            "pause_until": pause_until_raw,
+            "max_entries_per_hour": max_entries,
+        },
+        "any_active": any(bool(i.get("active")) for i in items),
+    }
 
 
 def bot_view(status: dict[str, Any] | None, *, pid_path: str | Path | None = None) -> dict[str, Any]:
@@ -114,6 +351,20 @@ def dashboard_state(
         ]
         if w_pos:
             open_positions = w_pos
+    day_start = None if status is None else status.get("day_start_equity_usdt")
+    # Prefer live wallet equity for the daily-loss gate (same numbers risk uses).
+    wallet_equity = None
+    if isinstance(wallet, dict):
+        wallet_equity = wallet.get("equity_usdt")
+    if wallet_equity is None:
+        wallet_equity = equity
+    daily_loss = compute_daily_loss(
+        day_start_equity_usdt=day_start,
+        equity_usdt=wallet_equity,
+    )
+    decision = resolve_decision_backend(status)
+    restrictions = build_restrictions(status, daily_loss=daily_loss)
+    status_decisions = list((status or {}).get("last_decisions") or [])
     return {
         "ok": True,
         "ledger": str(ledger.path),
@@ -123,13 +374,21 @@ def dashboard_state(
         "unrealized_pnl_usdt": unrealized,
         "equity_usdt": equity,
         "wallet": wallet,
+        "day_start_equity_usdt": day_start,
+        "decision_backend": decision.get("backend"),
+        "laya_checkpoint": decision.get("laya_checkpoint"),
+        "decision_model": decision,
+        "entry_guards": restrictions.get("entry_guards"),
+        "daily_loss": daily_loss,
+        "restrictions": restrictions,
+        "skip_reason_counts": _skip_reason_counts(status_decisions),
         "open_count": len(open_positions),
         "can_flatten": bool(can_flatten),
         "open_positions": open_positions,
         "positions": positions,
         "fills": book.get("fills") or [],
         "recent_decisions": book.get("recent_decisions") or [],
-        "status_decisions": list((status or {}).get("last_decisions") or []),
+        "status_decisions": status_decisions,
     }
 
 
@@ -477,6 +736,74 @@ MONITOR_HTML = """<!DOCTYPE html>
       padding-top: 12px;
     }
     .watch { color: var(--blotter); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+    .model-panel {
+      background: var(--panel);
+      border: 1px solid var(--rule);
+      border-left: 4px solid var(--copper);
+      padding: 16px 18px;
+      margin-bottom: 22px;
+    }
+    .model-panel .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 18px;
+      align-items: baseline;
+      margin-bottom: 12px;
+    }
+    .model-panel .lbl {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--mute);
+    }
+    .model-panel .model-name {
+      font-size: 22px;
+      font-weight: 600;
+      color: #f4ecd8;
+    }
+    .model-panel .model-note {
+      font-size: 13px;
+      color: var(--mute);
+      margin-top: 4px;
+    }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .chip {
+      border: 1px solid var(--rule);
+      background: #0f2436;
+      padding: 8px 12px;
+      min-width: 160px;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px;
+      color: var(--mute);
+      opacity: 0.72;
+    }
+    .chip .chip-label {
+      display: block;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-size: 10px;
+      margin-bottom: 4px;
+    }
+    .chip .chip-state { font-size: 14px; font-weight: 600; color: var(--blotter); }
+    .chip .chip-detail { margin-top: 4px; font-size: 11px; color: var(--mute); }
+    .chip.active {
+      opacity: 1;
+      border-color: var(--copper);
+      background: #2a1a10;
+      color: #f0d2b0;
+      box-shadow: inset 0 0 0 1px rgba(196,122,58,0.35);
+    }
+    .chip.active .chip-state { color: #e7a39d; }
+    .chip.active.loss {
+      border-color: var(--loss);
+      background: #2a1210;
+    }
     @media (max-width: 800px) {
       .kpis { grid-template-columns: 1fr 1fr; }
       header.mast { grid-template-columns: 1fr; }
@@ -501,6 +828,17 @@ MONITOR_HTML = """<!DOCTYPE html>
       </div>
     </header>
     <section class="kpis" id="kpis"></section>
+    <section class="model-panel" id="model-panel" aria-label="Модель и ограничения">
+      <div class="row">
+        <div>
+          <div class="lbl">Модель</div>
+          <div class="model-name" id="model-name">—</div>
+          <div class="model-note" id="model-note"></div>
+        </div>
+      </div>
+      <div class="lbl">Ограничения сейчас</div>
+      <div class="chips" id="restriction-chips"></div>
+    </section>
     <div class="pos-head">
       <h2>Открытые позиции</h2>
       <button type="button" id="flatten" class="flatten" disabled>Закрыть все</button>
@@ -547,6 +885,35 @@ MONITOR_HTML = """<!DOCTYPE html>
         ["Нереал. PnL", money(s.unrealized_pnl_usdt), clsPnl(s.unrealized_pnl_usdt)],
         ["Открыто", String(s.open_count||0), ""]
       ].map(([k,v,c]) => `<div class="kpi"><label>${k}</label><b class="${c}">${v}</b></div>`).join("");
+      const dm = s.decision_model || {};
+      let modelTitle = dm.label || "не указано";
+      if ((dm.backend || s.decision_backend) === "laya" && (dm.laya_checkpoint || s.laya_checkpoint)) {
+        modelTitle = "Laya · " + (dm.laya_checkpoint || s.laya_checkpoint);
+      } else if ((dm.backend || s.decision_backend) === "jev") {
+        modelTitle = "Jev";
+      } else if ((dm.backend || s.decision_backend) === "laya") {
+        modelTitle = "Laya";
+      }
+      document.getElementById("model-name").textContent = modelTitle;
+      document.getElementById("model-note").textContent = dm.note || (
+        dm.source === "status" ? "" :
+        dm.source === "env" ? "из окружения процесса монитора" :
+        dm.source === "judge_ms_hint" ? (dm.note || "") :
+        (dm.note || "")
+      );
+      const items = ((s.restrictions || {}).items) || [];
+      const chips = document.getElementById("restriction-chips");
+      if (!items.length) {
+        chips.innerHTML = '<div class="chip"><span class="chip-label">статус</span><span class="chip-state">нет данных</span></div>';
+      } else {
+        chips.innerHTML = items.map(it => {
+          const active = !!it.active;
+          const lossish = it.id === "daily_loss" || it.id === "loss_streak_pause";
+          const state = active ? "активен" : "нет";
+          const cls = "chip" + (active ? " active" : "") + (active && lossish ? " loss" : "");
+          return `<div class="${cls}"><span class="chip-label">${it.label||it.id}</span><span class="chip-state">${state}</span><div class="chip-detail">${it.detail||""}</div></div>`;
+        }).join("");
+      }
       const opens = s.open_positions || [];
       document.getElementById("positions").innerHTML = opens.length ? `<div class="tickets">${opens.map(p => `
         <div class="ticket">

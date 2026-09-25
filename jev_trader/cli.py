@@ -386,6 +386,8 @@ def _make_live_runner(args: argparse.Namespace, settings, ledger: Ledger, broker
         venue=args.venue,
         follow_jev=follow_jev,
         wallet_box=wallet_box,
+        decision_backend=settings.decision_backend,
+        laya_checkpoint=settings.laya_checkpoint,
     )
 
 

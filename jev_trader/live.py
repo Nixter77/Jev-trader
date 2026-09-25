@@ -428,6 +428,8 @@ class LiveRunner:
         venue: str = "paper",
         follow_jev: bool = False,
         wallet_box: dict[str, Any] | None = None,
+        decision_backend: str = "jev",
+        laya_checkpoint: str = "typed-decisions",
     ) -> None:
         self.run_cycle = run_cycle
         self.symbols = [s.upper() for s in symbols]
@@ -452,6 +454,8 @@ class LiveRunner:
         self.venue = venue
         self.follow_jev = bool(follow_jev)
         self.wallet_box = wallet_box if wallet_box is not None else {}
+        self.decision_backend = (decision_backend or "jev").strip().lower() or "jev"
+        self.laya_checkpoint = (laya_checkpoint or "typed-decisions").strip() or "typed-decisions"
         self.last_decisions: list[dict[str, Any]] = []
         self.last_error: str | None = None
         self.cycles = 0
@@ -715,6 +719,8 @@ class LiveRunner:
             "wallet": self.wallet_box.get("wallet"),
             "day_start_equity_usdt": self.wallet_box.get("start_equity_usdt"),
             "entry_guards": entry_guards,
+            "decision_backend": self.decision_backend,
+            "laya_checkpoint": self.laya_checkpoint if self.decision_backend == "laya" else None,
             "hint": "Jev на закрытии 5m. Вход только BUY/лонг; выход MARKET; стоп на бирже.",
         }
         try:
