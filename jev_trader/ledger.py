@@ -692,6 +692,19 @@ class Ledger:
             ).fetchone()
         return None if row is None else dict(row)
 
+    def close_ts_before(self, symbol: str, ts: str) -> str | None:
+        """ts of the latest close fill for symbol strictly before ts."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT ts FROM fills
+                WHERE symbol = ? AND action = 'close' AND ts < ?
+                ORDER BY ts DESC, id DESC LIMIT 1
+                """,
+                (symbol.upper(), ts),
+            ).fetchone()
+        return None if row is None else str(row["ts"])
+
     def open_entries(self, since: datetime) -> list[dict[str, Any]]:
         """Per symbol, the latest fill when it is a buy_long placed since `since`
         (an entry the ledger has no close for yet)."""

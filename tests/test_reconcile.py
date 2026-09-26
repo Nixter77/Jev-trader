@@ -479,3 +479,80 @@ def test_bot_fill_with_known_order_id_is_not_recorded_twice(tmp_path) -> None:
     assert [c["client_order_id"] for c in closes] == ["x777"]
     streak, _ = loss_streak_from_closes(ledger.recent_close_pnls())
     assert streak == 1
+
+
+def test_close_is_not_charged_an_earlier_round_trips_entry_fee(tmp_path) -> None:
+    # Round trip 1 is settled. Round trip 2's entry never became a fill, so
+    # entry_fill_before() finds round trip 1's buy_long: its fee must not be
+    # charged again and funding must not reach back into round trip 1.
+    ledger = Ledger(tmp_path / "l.sqlite")
+    broker = FakeBroker()
+    windows: list[tuple[int, int]] = []
+
+    def funding(symbol, start_ms, end_ms):
+        windows.append((start_ms, end_ms))
+        return -0.2
+
+    broker.funding_income = funding  # type: ignore[method-assign]
+    t0 = datetime.now(timezone.utc) - timedelta(hours=5)
+    t1 = t0 + timedelta(hours=1)
+    ledger.record_exchange_fill(
+        ts=t0.isoformat(), client_order_id="jev1_in1", exchange_order_id=1, symbol=SYM,
+        action="buy_long", qty=1.0, price=100.0, venue="binance_testnet", commission_usdt=0.5,
+    )
+    ledger.record_exchange_fill(
+        ts=t1.isoformat(), client_order_id="jev1_out1", exchange_order_id=2, symbol=SYM,
+        action="close", qty=1.0, price=100.0, venue="binance_testnet", commission_usdt=0.1,
+        gross_pnl_usdt=0.0, net_pnl_usdt=-0.6,
+    )
+    intent = TradeIntent(
+        action="close", qty=1.0, stop_price=None, stop_distance=None, entry_type="MARKET",
+        reduce_only=True, client_order_id="jev1_out2", symbol=SYM, risk_pct=0.0,
+        order_side="SELL", limit_price=101.0,
+    )
+    ledger.record(
+        CycleResult(
+            action="close", skip_reason=None, intent=intent,
+            execution=ExecutionResult(
+                status="filled", venue="binance_testnet", client_order_id="jev1_out2", reduce_only=True,
+                detail={"http_status": 200, "body": {"orderId": 3, "status": "FILLED", "executedQty": "1", "avgPrice": "101"}},
+            ),
+            judgment=None, state_text="", state={"symbol": SYM, "price": {"close": 101.0}},
+        )
+    )
+    broker.trade(3, "SELL", 1.0, 101.0, datetime.now(timezone.utc), commission=0.1, realized=1.0)
+
+    _rec(ledger, broker).run_once()
+
+    close = [f for f in _fills(ledger) if f["client_order_id"] == "jev1_out2"][0]
+    # gross 1.0 - close fee 0.1 + funding -0.2; no entry fee from round trip 1
+    assert close["realized_pnl_usdt"] == pytest.approx(0.7)
+    assert windows and windows[0][0] >= _ms(t1) - 1
+
+
+def test_second_partial_exchange_close_is_not_charged_entry_fee_again(tmp_path) -> None:
+    ledger = Ledger(tmp_path / "l.sqlite")
+    broker = FakeBroker()
+    windows: list[tuple[int, int]] = []
+
+    def funding(symbol, start_ms, end_ms):
+        windows.append((start_ms, end_ms))
+        return 0.0
+
+    broker.funding_income = funding  # type: ignore[method-assign]
+    t0 = datetime.now(timezone.utc) - timedelta(hours=2)
+    ledger.record_exchange_fill(
+        ts=t0.isoformat(), client_order_id="jev1_in", exchange_order_id=1, symbol=SYM,
+        action="buy_long", qty=1.0, price=100.0, venue="binance_testnet", commission_usdt=0.4,
+    )
+    broker.flat()
+    broker.trade(61, "SELL", 0.5, 101.0, t0 + timedelta(minutes=10), commission=0.05, realized=0.5)
+    broker.trade(62, "SELL", 0.5, 99.0, t0 + timedelta(minutes=40), commission=0.05, realized=-0.5)
+
+    _rec(ledger, broker).run_once()
+
+    closes = {f["client_order_id"]: f for f in _fills(ledger) if f["action"] == "close"}
+    assert closes["x61"]["realized_pnl_usdt"] == pytest.approx(0.5 - 0.05 - 0.4)
+    assert closes["x62"]["realized_pnl_usdt"] == pytest.approx(-0.5 - 0.05)
+    # Second funding window starts at the first partial close, not at the entry.
+    assert windows[1][0] >= _ms(t0 + timedelta(minutes=10)) - 1

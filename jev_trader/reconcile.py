@@ -467,14 +467,23 @@ class Reconciler:
             return None, None, None
         close_fee = float(agg.get("commission_usdt") or 0.0)
         entry = self.ledger.entry_fill_before(symbol, close_ts)
+        prev_close_ms = _iso_to_ms(self.ledger.close_ts_before(symbol, close_ts) or "")
+        entry_ms = None if entry is None else _iso_to_ms(entry.get("ts"))
+        if entry_ms is not None and prev_close_ms is not None and prev_close_ms >= entry_ms:
+            # That buy_long belongs to an earlier round trip (its fee was
+            # charged on that close), or this is a second partial close.
+            entry, entry_ms = None, None
         entry_fee = 0.0
         funding: float | None = None
         if entry is not None:
             entry_fee = float(entry.get("commission_usdt") or 0.0)
-            start_ms = _iso_to_ms(entry.get("ts"))
+        # Funding since this position opened; with the entry fill missing, the
+        # previous close bounds it (the book was flat in between).
+        start_ms = entry_ms if entry_ms is not None else prev_close_ms
+        if start_ms is not None:
             end_ms = _iso_to_ms(close_ts)
             funding_fn = getattr(self.broker, "funding_income", None)
-            if callable(funding_fn) and start_ms is not None and end_ms is not None and end_ms > start_ms:
+            if callable(funding_fn) and end_ms is not None and end_ms > start_ms:
                 try:
                     funding = funding_fn(symbol, start_ms, end_ms)
                 except Exception as exc:  # noqa: BLE001
