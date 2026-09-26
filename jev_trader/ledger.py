@@ -118,6 +118,9 @@ class Ledger:
                 ("source", "TEXT"),
                 ("pnl_source", "TEXT"),
                 ("enrich_tries", "INTEGER NOT NULL DEFAULT 0"),
+                # Commission paid in a non-USDT asset (e.g. BNB): the USDT
+                # commission / net PnL on this row is not exact.
+                ("fee_unaccounted", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 self._ensure_column(conn, "fills", column, decl)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_cid ON fills(client_order_id)")
@@ -537,6 +540,7 @@ class Ledger:
         gross_pnl_usdt: float | None = None,
         funding_usdt: float | None = None,
         net_pnl_usdt: float | None = None,
+        fee_unaccounted: bool = False,
     ) -> bool:
         """Insert a fill the bot did not see (maker entry filled later, exchange
         stop / manual close). Deduped by clientOrderId and exchange orderId.
@@ -567,8 +571,9 @@ class Ledger:
                 INSERT INTO fills (
                     ts, client_order_id, symbol, action, position_side, qty, price,
                     venue, realized_pnl_usdt, cash_usdt, exchange_order_id,
-                    commission_usdt, funding_usdt, gross_pnl_usdt, source, pnl_source
-                ) VALUES (?, ?, ?, ?, 'LONG', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'exchange', ?)
+                    commission_usdt, funding_usdt, gross_pnl_usdt, source, pnl_source,
+                    fee_unaccounted
+                ) VALUES (?, ?, ?, ?, 'LONG', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'exchange', ?, ?)
                 """,
                 (
                     ts,
@@ -584,7 +589,8 @@ class Ledger:
                     commission_usdt,
                     funding_usdt,
                     gross_pnl_usdt,
-                    "exchange" if action == "close" and net_pnl_usdt is not None else None,
+                    _exchange_pnl_source(fee_unaccounted) if action == "close" and net_pnl_usdt is not None else None,
+                    1 if fee_unaccounted else 0,
                 ),
             )
             conn.commit()
@@ -634,6 +640,7 @@ class Ledger:
         gross_pnl_usdt: float | None = None,
         funding_usdt: float | None = None,
         net_pnl_usdt: float | None = None,
+        fee_unaccounted: bool = False,
     ) -> None:
         """Replace a bot fill's self-computed numbers with the exchange's.
 
@@ -647,7 +654,7 @@ class Ledger:
             conn.execute(
                 """
                 UPDATE fills SET exchange_order_id = ?, price = ?, qty = ?, commission_usdt = ?,
-                    enrich_tries = COALESCE(enrich_tries, 0) + 1
+                    fee_unaccounted = ?, enrich_tries = COALESCE(enrich_tries, 0) + 1
                 WHERE id = ?
                 """,
                 (
@@ -655,6 +662,7 @@ class Ledger:
                     float(price),
                     float(qty),
                     float(commission_usdt),
+                    1 if fee_unaccounted else 0,
                     int(fill_id),
                 ),
             )
@@ -664,10 +672,17 @@ class Ledger:
                 conn.execute(
                     """
                     UPDATE fills SET realized_pnl_usdt = ?, gross_pnl_usdt = ?, funding_usdt = ?,
-                        pnl_source = 'exchange', cash_usdt = COALESCE(cash_usdt, 0) + ?
+                        pnl_source = ?, cash_usdt = COALESCE(cash_usdt, 0) + ?
                     WHERE id = ?
                     """,
-                    (float(net_pnl_usdt), gross_pnl_usdt, funding_usdt, delta, int(fill_id)),
+                    (
+                        float(net_pnl_usdt),
+                        gross_pnl_usdt,
+                        funding_usdt,
+                        _exchange_pnl_source(fee_unaccounted),
+                        delta,
+                        int(fill_id),
+                    ),
                 )
                 conn.execute(
                     """
@@ -962,6 +977,11 @@ class Ledger:
             "fills": fills,
             "recent_decisions": recent,
         }
+
+
+def _exchange_pnl_source(fee_unaccounted: bool) -> str:
+    """'exchange' only when every commission was in USDT."""
+    return "exchange_fee_unaccounted" if fee_unaccounted else "exchange"
 
 
 def _iso_utc(when: datetime) -> str:

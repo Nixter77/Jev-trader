@@ -511,6 +511,7 @@ class Reconciler:
                 gross_pnl_usdt=gross,
                 funding_usdt=funding,
                 net_pnl_usdt=net,
+                fee_unaccounted=self._fee_unaccounted(symbol, cid, agg),
             )
         if not ok:
             return None
@@ -654,6 +655,7 @@ class Reconciler:
                         gross_pnl_usdt=gross,
                         funding_usdt=funding,
                         net_pnl_usdt=net,
+                        fee_unaccounted=self._fee_unaccounted(symbol, f"x{oid}", agg),
                     )
                 if ok:
                     summary["closes"].append(
@@ -706,6 +708,8 @@ class Reconciler:
         funding: float | None = None
         if entry is not None:
             entry_fee = float(entry.get("commission_usdt") or 0.0)
+            if entry.get("fee_unaccounted"):
+                agg["entry_fee_unaccounted"] = True
         # Funding since this position opened; with the entry fill missing, the
         # previous close bounds it (the book was flat in between).
         start_ms = entry_ms if entry_ms is not None else prev_close_ms
@@ -734,6 +738,14 @@ class Reconciler:
         net = float(gross) - close_fee - entry_fee + float(funding or 0.0)
         return float(gross), funding, net
 
+    @staticmethod
+    def _fee_unaccounted(symbol: str, cid: Any, agg: dict[str, Any]) -> bool:
+        """Non-USDT commission (BNB) on this fill, or on the entry a close nets against."""
+        assets = list(agg.get("non_usdt_commission") or [])
+        if assets:
+            log_event("fee_unaccounted", symbol=symbol, cid=cid, assets=assets)
+        return bool(assets) or bool(agg.get("entry_fee_unaccounted"))
+
     def _enrich_fills(self, now: datetime, summary: dict[str, Any]) -> None:
         since = now - timedelta(seconds=self.enrich_lookback_sec)
         for fill in self.ledger.fills_to_enrich(since, limit=self.max_enrich_per_pass):
@@ -758,5 +770,6 @@ class Reconciler:
                 gross_pnl_usdt=gross,
                 funding_usdt=funding,
                 net_pnl_usdt=net,
+                fee_unaccounted=self._fee_unaccounted(symbol, fill["client_order_id"], agg),
             )
             summary["enriched"] += 1
