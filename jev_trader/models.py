@@ -195,3 +195,4 @@ class CycleResult:
     state: dict[str, Any]
     risk_event: str | None = None
     judge_ms: float | None = None
+    model_skipped: bool = False

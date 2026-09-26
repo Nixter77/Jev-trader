@@ -10,6 +10,7 @@ from jev_trader.execution import (
     BinanceFuturesBroker,
     BinanceTestnetBroker,
     PaperBroker,
+    client_order_id,
     current_flatten_generation,
     fill_qty,
     is_real_fill,
@@ -29,8 +30,12 @@ from jev_trader.models import (
 )
 from jev_trader.policy import apply_policy
 from jev_trader.risk import (
+    EntryGuardConfig,
+    EntryGuardState,
     apply_risk,
     build_entry_guard_state,
+    daily_loss_hit,
+    entry_guard_skip_reason,
     load_entry_guard_config,
     long_protective_stop,
     loss_streak_from_closes,
@@ -88,7 +93,70 @@ def decision_payload(result: CycleResult) -> dict[str, Any]:
     }
     if result.judge_ms is not None:
         payload["judge_ms"] = round(float(result.judge_ms), 1)
+    if result.model_skipped:
+        payload["model_skipped"] = True
     return payload
+
+
+# Label on the synthetic judgment when the model was never asked.
+MODEL_SKIPPED = "model_skipped"
+
+
+def pre_model_entry_block(
+    snapshot: MarketSnapshot,
+    account: AccountState,
+    config: EntryGuardConfig,
+    state: EntryGuardState,
+    *,
+    now: datetime,
+) -> str | None:
+    """Guard that blocks any entry for a flat book, so the model call is wasted.
+
+    Order matches apply_risk: daily_loss, then entry_guard_skip_reason
+    (no_entry_window, hourly_entry_cap, loss_streak_pause). An open position
+    returns None (the model still decides closes). kill_switch returns None so
+    apply_risk keeps reporting it exactly as before.
+    """
+    in_position = snapshot.position.side != "FLAT" and snapshot.position.size > 0
+    if in_position or account.kill_switch:
+        return None
+    if daily_loss_hit(account.daily_pnl_pct, account.daily_loss_limit_pct):
+        return "daily_loss"
+    return entry_guard_skip_reason(config, state, now=now)
+
+
+def model_skipped_judgment(reason: str) -> JevJudgment:
+    """Hold stand-in recorded when the model was not called."""
+    return JevJudgment(
+        action="hold",
+        trend_aligned=0.0,
+        false_break_risk=0.0,
+        signal_strength="skipped",
+        should_trade_now=0.0,
+        action_probabilities={},
+        model=MODEL_SKIPPED,
+        raw={MODEL_SKIPPED: True, "reason": reason},
+    )
+
+
+def model_skipped_intent(
+    snapshot: MarketSnapshot, account: AccountState, reason: str
+) -> TradeIntent:
+    """Same shape as apply_risk's skip(): hold, qty 0, risk_event = reason."""
+    return TradeIntent(
+        action="hold",
+        qty=0.0,
+        stop_price=None,
+        stop_distance=None,
+        entry_type="NONE",
+        reduce_only=False,
+        client_order_id=client_order_id(snapshot.symbol, "hold"),
+        symbol=snapshot.symbol,
+        risk_pct=account.risk_pct,
+        order_side="BUY",
+        skip_reason=reason,
+        risk_event=reason,
+    )
 
 
 def arm_exchange_stop(
@@ -170,8 +238,14 @@ def run_once(
     follow_jev: bool = False,
     min_should_trade: float | None = None,
     min_hold_sec: float | None = None,
+    entry_guard_config: EntryGuardConfig | None = None,
+    now: datetime | None = None,
 ) -> CycleResult:
-    """One paper/testnet decision cycle: features → state → Jev → policy → risk → exec."""
+    """One paper/testnet decision cycle: features → state → Jev → policy → risk → exec.
+
+    When the book is flat and an entry guard is already active, the model is not
+    called: the cycle records a hold with that guard as skip_reason.
+    """
     features = compute_features(snapshot)
     compact = build_compact_state(snapshot, features)
     exec_broker = broker or PaperBroker()
@@ -185,32 +259,12 @@ def run_once(
     protective = long_protective_stop(snapshot, features, acct)
     if protective is not None and protective < features.close:
         arm_exchange_stop(exec_broker, ledger, snapshot.symbol, protective, None)
-    resolved = judgment
-    judge_ms: float | None = None
-    if resolved is None:
-        client = jev_client
-        owns = False
-        if client is None:
-            if not typesafe_api_key:
-                raise ValueError("Jev judgment missing and TYPESAFE_API_KEY not provided")
-            client = JevClient(api_key=typesafe_api_key)
-            owns = True
-        try:
-            t0 = time.perf_counter()
-            resolved = client.judge(compact)
-            judge_ms = (time.perf_counter() - t0) * 1000.0
-        finally:
-            if owns:
-                client.close()
-
-    policy_kwargs: dict[str, Any] = {"follow_jev": follow_jev}
-    if min_should_trade is not None:
-        policy_kwargs["min_should_trade"] = min_should_trade
-    policy = apply_policy(resolved, **policy_kwargs)
+    # Guard inputs come first so a blocked flat book never pays for a model call.
+    now = now or datetime.now(timezone.utc)
+    if entry_guard_config is None:
+        entry_guard_config = load_entry_guard_config()
     seconds_since_close = None
     seconds_since_entry = None
-    now = datetime.now(timezone.utc)
-    entry_guard_config = load_entry_guard_config()
     entries_last_hour = 0
     loss_streak = 0
     last_loss_ts = None
@@ -228,22 +282,58 @@ def run_once(
         loss_streak=loss_streak,
         last_loss_ts=last_loss_ts,
     )
-    risk_kwargs: dict[str, Any] = {
-        "seconds_since_last_close": seconds_since_close,
-        "seconds_since_last_entry": seconds_since_entry,
-        "entry_guard_config": entry_guard_config,
-        "entry_guard_state": entry_guard_state,
-        "now": now,
-    }
-    if min_hold_sec is not None:
-        risk_kwargs["min_hold_sec"] = min_hold_sec
-    intent = apply_risk(
-        policy,
-        features,
-        snapshot,
-        acct,
-        **risk_kwargs,
-    )
+
+    resolved = judgment
+    judge_ms: float | None = None
+    pre_skip: str | None = None
+    if resolved is None:
+        pre_skip = pre_model_entry_block(
+            snapshot, acct, entry_guard_config, entry_guard_state, now=now
+        )
+
+    if pre_skip is not None:
+        resolved = model_skipped_judgment(pre_skip)
+        policy = PolicyDecision(
+            action="hold", passed=False, skip_reason=pre_skip, judgment=resolved
+        )
+        intent = model_skipped_intent(snapshot, acct, pre_skip)
+    else:
+        if resolved is None:
+            client = jev_client
+            owns = False
+            if client is None:
+                if not typesafe_api_key:
+                    raise ValueError("Jev judgment missing and TYPESAFE_API_KEY not provided")
+                client = JevClient(api_key=typesafe_api_key)
+                owns = True
+            try:
+                t0 = time.perf_counter()
+                resolved = client.judge(compact)
+                judge_ms = (time.perf_counter() - t0) * 1000.0
+            finally:
+                if owns:
+                    client.close()
+
+        policy_kwargs: dict[str, Any] = {"follow_jev": follow_jev}
+        if min_should_trade is not None:
+            policy_kwargs["min_should_trade"] = min_should_trade
+        policy = apply_policy(resolved, **policy_kwargs)
+        risk_kwargs: dict[str, Any] = {
+            "seconds_since_last_close": seconds_since_close,
+            "seconds_since_last_entry": seconds_since_entry,
+            "entry_guard_config": entry_guard_config,
+            "entry_guard_state": entry_guard_state,
+            "now": now,
+        }
+        if min_hold_sec is not None:
+            risk_kwargs["min_hold_sec"] = min_hold_sec
+        intent = apply_risk(
+            policy,
+            features,
+            snapshot,
+            acct,
+            **risk_kwargs,
+        )
     with order_lock:
         if (
             intent.action == "buy_long"
@@ -279,6 +369,7 @@ def run_once(
         state=compact.as_dict(),
         risk_event=intent.risk_event,
         judge_ms=judge_ms,
+        model_skipped=pre_skip is not None,
     )
     if ledger is not None:
         ledger.record(result)

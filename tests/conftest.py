@@ -34,3 +34,14 @@ def passing_answers() -> dict:
         "should_trade_now": 0.84,
         "model": "jev-1.13.0",
     }
+
+
+@pytest.fixture(autouse=True)
+def _no_wall_clock_entry_window(monkeypatch):
+    """Keep run_once tests independent of the real Jerusalem clock.
+
+    The default 03:00–09:00 no-entry window now skips the model call on a flat
+    book, so a suite run at night would otherwise change behavior. Tests that
+    need the window set it explicitly (env or EntryGuardConfig).
+    """
+    monkeypatch.setenv("NO_ENTRY_WINDOW", "off")

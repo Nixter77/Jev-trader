@@ -737,6 +737,7 @@ class LiveRunner:
             "price": intent.get("limit_price"),
             "venue": None if payload.get("execution") is None else payload["execution"].get("venue"),
             "judge_ms": payload.get("judge_ms"),
+            "model_skipped": bool(payload.get("model_skipped")),
         }
 
     def write_status(self, *, last_error: str | None = None) -> None:
