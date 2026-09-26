@@ -35,6 +35,7 @@ from jev_trader.execution import (
     order_fill_price,
     order_lock,
     order_not_found,
+    wallet_positions_known,
 )
 from jev_trader.ledger import Ledger
 from jev_trader.models import CycleResult, market_close_intent
@@ -189,6 +190,10 @@ class Reconciler:
                 wallet = self.broker.fetch_wallet()
         except Exception as exc:  # noqa: BLE001
             log_event("reconcile_wallet_error", error=f"{type(exc).__name__}: {exc}")
+            return None
+        if isinstance(wallet, dict) and not wallet_positions_known(wallet):
+            # Balance fallback: no positions list, so "not long" means nothing.
+            log_event("reconcile_wallet_positions_unknown")
             return None
         if isinstance(wallet, dict) and self.on_wallet is not None:
             try:

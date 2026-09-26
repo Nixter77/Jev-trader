@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from jev_trader.execution import fill_price, fill_qty, is_real_fill
+from jev_trader.execution import fill_price, fill_qty, is_real_fill, wallet_positions_known
 from jev_trader.models import CycleResult, ExecutionResult, JevJudgment, Position, TradeIntent
 
 
@@ -815,7 +815,13 @@ class Ledger:
         )
 
     def sync_exchange_positions(self, wallet: dict[str, Any]) -> None:
-        """Overwrite local side/size/entry from Binance wallet. Do not invent fills."""
+        """Overwrite local side/size/entry from Binance wallet. Do not invent fills.
+
+        A wallet without a positions list (balance fallback) is skipped: its
+        empty list would mark every open position FLAT.
+        """
+        if not wallet_positions_known(wallet):
+            return
         cash = float(wallet.get("equity_usdt") or 10_000.0)
         seen: set[str] = set()
         with self._connect() as conn:

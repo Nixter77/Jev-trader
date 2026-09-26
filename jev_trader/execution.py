@@ -21,6 +21,7 @@ from jev_trader.config import (
 )
 from jev_trader.http import ssl_context
 from jev_trader.models import ExecutionResult, TradeIntent, market_close_intent
+from jev_trader.status import log_event
 
 SELL_ONLY_CLOSES_LONG = "sell_only_closes_long"
 RECV_WINDOW_MS = 60_000
@@ -254,6 +255,19 @@ def order_fill_price(body: Any) -> float | None:
 SEND_UNKNOWN_CODES = frozenset({-1006, -1007})
 
 
+def wallet_positions_known(wallet: Any) -> bool:
+    """False when the wallet came without a positions list (e.g. /fapi/v2/balance).
+
+    Such a wallet still has a valid balance, but "no positions" in it means
+    "unknown", not "flat". Wallets without the flag (paper, fakes) are trusted.
+    """
+    return isinstance(wallet, dict) and wallet.get("positions_known", True) is not False
+
+
+class PositionsUnknown(RuntimeError):
+    """The exchange answered without a positions list; do not treat as flat."""
+
+
 def send_status_unknown(status: int, data: Any) -> bool:
     """Transport error, 5xx, or Binance 'send status unknown' codes."""
     if status == 0 or status >= 500:
@@ -468,11 +482,24 @@ class BinanceFuturesBroker:
         if not self._time_synced:
             self.sync_time()
         status, data = self._request("GET", "/fapi/v2/account", signed=True)
+        from_account = True
         if not (200 <= status < 300) or not isinstance(data, dict) or data.get("code"):
+            account_status, account_body = status, data
+            from_account = False
             status, data = self._request("GET", "/fapi/v2/balance", signed=True)
         if not (200 <= status < 300):
             raise RuntimeError(f"binance wallet HTTP {status}: {data}")
         wallet = parse_usdt_wallet(data)
+        # /fapi/v2/balance has no positions: an empty list there is "unknown".
+        wallet["positions_known"] = bool(
+            from_account and isinstance(data, dict) and isinstance(data.get("positions"), list)
+        )
+        if not from_account:
+            log_event(
+                "wallet_positions_unknown",
+                account_http_status=account_status,
+                account_body=account_body,
+            )
         wallet["http_status"] = status
         wallet["venue"] = self.venue
         wallet["base"] = self.base_url
@@ -496,6 +523,8 @@ class BinanceFuturesBroker:
         """Fresh exchange position for symbol, or None if flat / missing."""
         self.invalidate_wallet()
         wallet = self.fetch_wallet(ttl=0)
+        if not wallet_positions_known(wallet):
+            raise PositionsUnknown(f"wallet without positions for {symbol}")
         sym = symbol.upper()
         for row in wallet.get("positions") or []:
             if not isinstance(row, dict):
@@ -510,7 +539,10 @@ class BinanceFuturesBroker:
 
     def _align_reduce_close(self, intent: TradeIntent) -> TradeIntent | ExecutionResult:
         """Force close side/qty from live exchange position (fixes stale SHORT/LONG)."""
-        pos = self._live_position(intent.symbol)
+        try:
+            pos = self._live_position(intent.symbol)
+        except PositionsUnknown:
+            return _positions_unknown_result(intent, self.venue)
         if pos is None:
             return ExecutionResult(
                 status="rejected",
@@ -535,7 +567,10 @@ class BinanceFuturesBroker:
 
         Cover with a plain BUY sized to the live short. Qty is clamped so we do not flip long.
         """
-        pos = self._live_position(intent.symbol)
+        try:
+            pos = self._live_position(intent.symbol)
+        except PositionsUnknown:
+            return _positions_unknown_result(intent, self.venue)
         if pos is None or str(pos.get("side")) != "SHORT":
             return ExecutionResult(
                 status="rejected",
@@ -1030,6 +1065,10 @@ class BinanceFuturesBroker:
         cancelled = self.cancel_all_open_orders()
         wallet = self.fetch_wallet(ttl=0)
         closes: list[dict[str, Any]] = []
+        if not wallet_positions_known(wallet):
+            # Without a positions list we cannot tell what to close.
+            log_event("flatten_positions_unknown")
+            return {"cancelled": cancelled, "closes": closes, "wallet": wallet, "error": "positions_unknown"}
         for pos in wallet.get("positions") or []:
             symbol = str(pos.get("symbol") or "")
             size = float(pos.get("size") or 0.0)
@@ -1057,6 +1096,16 @@ class BinanceFuturesBroker:
             )
         after = self.fetch_wallet(ttl=0)
         return {"cancelled": cancelled, "closes": closes, "wallet": after}
+
+
+def _positions_unknown_result(intent: TradeIntent, venue: str) -> ExecutionResult:
+    return ExecutionResult(
+        status="rejected",
+        venue=venue,
+        client_order_id=intent.client_order_id,
+        reduce_only=intent.reduce_only,
+        detail={"error": "positions_unknown"},
+    )
 
 
 class BinanceTestnetBroker(BinanceFuturesBroker):

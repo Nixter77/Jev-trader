@@ -24,6 +24,7 @@ from jev_trader.execution import (
     BinanceTestnetBroker,
     PaperBroker,
     is_real_fill,
+    wallet_positions_known,
 )
 from jev_trader.ledger import Ledger
 from jev_trader.risk import (
@@ -370,8 +371,13 @@ def _account_for_cycle(
     cash = snapshot.position.cash_usdt
     available = None
     daily_pnl_pct = float(account_kwargs.get("daily_pnl_pct", 0.0))
+    # Balance-only wallet: equity is real, positions are unknown (not flat).
+    positions_known = wallet is not None and wallet_positions_known(wallet)
     if wallet is not None:
-        snapshot = overlay_wallet_position(snapshot, wallet)
+        if positions_known:
+            snapshot = overlay_wallet_position(snapshot, wallet)
+        else:
+            log_event("wallet_positions_unknown", symbol=snapshot.symbol)
         cash = float(wallet.get("equity_usdt") or cash)
         if wallet.get("available_usdt") is not None:
             available = float(wallet["available_usdt"])
@@ -392,7 +398,7 @@ def _account_for_cycle(
                         start = cash
             if start:
                 daily_pnl_pct = (cash - float(start)) / float(start)
-        if ledger is not None:
+        if ledger is not None and positions_known:
             try:
                 ledger.sync_exchange_positions(wallet)
                 if snapshot.position.stop_price is None and snapshot.position.side == "LONG":
@@ -415,7 +421,7 @@ def _account_for_cycle(
         open_n = ledger.count_open_positions()
     else:
         open_n = 0 if snapshot.position.side == "FLAT" else 1
-    if wallet is not None and wallet.get("open_positions") is not None:
+    if positions_known and wallet is not None and wallet.get("open_positions") is not None:
         open_n = int(wallet["open_positions"])
     account = AccountState(
         equity_usdt=cash,
@@ -424,7 +430,7 @@ def _account_for_cycle(
         open_positions=open_n,
         max_positions=int(account_kwargs.get("max_positions", max_positions)),
         available_usdt=available,
-        wallet_ok=not (wallet_expected and wallet is None),
+        wallet_ok=not (wallet_expected and not positions_known),
     )
     return snapshot, account
 
