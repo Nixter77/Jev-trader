@@ -741,11 +741,24 @@ class BinanceFuturesBroker:
         blocked = blocked_execution(intent, self.venue)
         if blocked is not None:
             return blocked
+        blind_close = False
         if intent.reduce_only and intent.action == "close" and intent.entry_type == "MARKET":
             aligned = self._align_reduce_close(intent)
             if isinstance(aligned, ExecutionResult):
-                return aligned
-            intent = aligned
+                if not (_is_positions_unknown(aligned) and blind_close_allowed(intent)):
+                    return aligned
+                # Positions unknown (balance-only wallet) but a protective exit
+                # is due: a reduce-only SELL cannot open or flip a position, so
+                # send it with the last-known qty (worst case -2022 when flat).
+                blind_close = True
+                log_event(
+                    "blind_reduce_only_close",
+                    symbol=intent.symbol,
+                    qty=intent.qty,
+                    risk_event=intent.risk_event,
+                )
+            else:
+                intent = aligned
         qty = intent.qty
         price = intent.limit_price
         flt = self.filters_for(intent.symbol)
@@ -794,7 +807,10 @@ class BinanceFuturesBroker:
                 )
             params["timeInForce"] = "GTX"  # post-only
             params["price"] = format_binance_decimal(price)
-        if intent.reduce_only or intent.entry_type == "MARKET":
+        if blind_close:
+            # Keep the exchange stop until the close is known to have flattened.
+            pass
+        elif intent.reduce_only or intent.entry_type == "MARKET":
             self.cancel_open_orders(intent.symbol)
         else:
             self.cancel_open_limits(intent.symbol)
@@ -855,17 +871,25 @@ class BinanceFuturesBroker:
             fill_px = order_fill_price(data)
         self.invalidate_wallet()
         if order_is_filled(data):
+            detail = {
+                "http_status": status,
+                "body": data,
+                "filled_qty": filled_qty,
+                "fill_price": fill_px,
+            }
+            if blind_close:
+                detail["blind_close"] = True
+                # Reduce-only fills at most the position: less than asked means
+                # the book is now flat, so the closePosition stop can go. Else a
+                # remainder may exist and keeps its stop.
+                if 0 < filled_qty < qty:
+                    self.cancel_open_orders(intent.symbol)
             return ExecutionResult(
                 status="filled",
                 venue=self.venue,
                 client_order_id=intent.client_order_id,
                 reduce_only=intent.reduce_only,
-                detail={
-                    "http_status": status,
-                    "body": data,
-                    "filled_qty": filled_qty,
-                    "fill_price": fill_px,
-                },
+                detail=detail,
             )
         if intent.entry_type == "MARKET":
             self.cancel_order(intent.symbol, intent.client_order_id)
@@ -1166,6 +1190,27 @@ class BinanceFuturesBroker:
             )
         after = self.fetch_wallet(ttl=0)
         return {"cancelled": cancelled, "closes": closes, "wallet": after}
+
+
+# Exits that must not wait for a positions list: a reduce-only SELL is safe to
+# send blind (it can only shrink a long; the exchange rejects it when flat).
+BLIND_CLOSE_RISK_EVENTS = frozenset({"kill_switch", "daily_loss", "stop", "flatten"})
+
+
+def blind_close_allowed(intent: TradeIntent) -> bool:
+    return (
+        intent.reduce_only
+        and intent.action == "close"
+        and intent.entry_type == "MARKET"
+        and intent.order_side == "SELL"
+        and intent.qty > 0
+        and intent.risk_event in BLIND_CLOSE_RISK_EVENTS
+    )
+
+
+def _is_positions_unknown(result: ExecutionResult) -> bool:
+    detail = result.detail if isinstance(result.detail, dict) else {}
+    return detail.get("error") == "positions_unknown"
 
 
 def _positions_unknown_result(intent: TradeIntent, venue: str) -> ExecutionResult:

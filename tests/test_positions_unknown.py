@@ -55,8 +55,9 @@ def test_account_wallet_marks_positions_known() -> None:
 
 
 def test_market_close_with_unknown_positions_is_rejected_not_flat() -> None:
+    # A model close (no risk event) waits for a real positions list.
     broker, calls = _broker((503, {"error": "down"}))
-    intent = market_close_intent(symbol=SYM, qty=1.0, order_side="SELL", client_order_id="jf1_x", risk_event="kill_switch")
+    intent = market_close_intent(symbol=SYM, qty=1.0, order_side="SELL", client_order_id="jf1_x", risk_event=None)
     result = broker.submit(intent)
     assert result.status == "rejected"
     assert result.detail["error"] == "positions_unknown"
@@ -155,3 +156,80 @@ def test_reconcile_does_not_burn_close_detection_on_unknown_positions(tmp_path) 
     assert trade_calls == []
     assert synced == []
     assert rec._close_misses == {}
+
+
+def _blind_broker(fill_qty: str) -> tuple[BinanceTestnetBroker, list[tuple[str, str, dict]]]:
+    broker = BinanceTestnetBroker("k", "s", "https://testnet.binancefuture.com")
+    broker._time_synced = True
+    broker._fill_poll_sleep = 0
+    broker.filters_for = lambda symbol: {}  # type: ignore[method-assign]
+    calls: list[tuple[str, str, dict]] = []
+
+    def fake_request(method: str, path: str, params: dict | None = None, signed: bool = False, timeout: float = 10.0, **_kw: Any):
+        calls.append((method, path, dict(params or {})))
+        if path == "/fapi/v2/account":
+            return 503, {"error": "down"}
+        if path == "/fapi/v2/balance":
+            return 200, BALANCE
+        if method == "POST" and path == "/fapi/v1/order":
+            return 200, {"orderId": 91, "status": "FILLED", "executedQty": fill_qty, "avgPrice": "95"}
+        return 200, []
+
+    broker._request = fake_request  # type: ignore[method-assign]
+    return broker, calls
+
+
+def test_protective_close_with_unknown_positions_goes_out_reduce_only() -> None:
+    # kill_switch / daily_loss / stop / flatten must not be refused because the
+    # positions list is missing: a reduce-only SELL cannot open or flip.
+    for event in ("kill_switch", "daily_loss", "stop", "flatten"):
+        broker, calls = _blind_broker("1")
+        intent = market_close_intent(symbol=SYM, qty=1.0, order_side="SELL", client_order_id=f"jc_{event}", risk_event=event)
+        result = broker.submit(intent)
+        assert result.status == "filled", event
+        posts = [c for c in calls if c[0] == "POST" and c[1] == "/fapi/v1/order"]
+        assert len(posts) == 1
+        params = posts[0][2]
+        assert params["side"] == "SELL" and params["reduceOnly"] == "true" and params["type"] == "MARKET"
+        assert params["quantity"] == "1"
+        # The exchange stop stays until we know the close flattened the book.
+        assert not any(c[0] == "DELETE" for c in calls)
+
+
+def test_blind_close_filled_short_of_last_known_qty_clears_the_stop() -> None:
+    broker, calls = _blind_broker("0.4")
+    intent = market_close_intent(symbol=SYM, qty=1.0, order_side="SELL", client_order_id="jc_k", risk_event="kill_switch")
+    result = broker.submit(intent)
+    assert result.status == "filled"
+    post_i = next(i for i, c in enumerate(calls) if c[0] == "POST")
+    assert any(c[0] == "DELETE" and c[1] == "/fapi/v1/allOpenOrders" for c in calls[post_i:])
+
+
+def test_blind_cover_buy_is_still_refused() -> None:
+    broker, calls = _blind_broker("1")
+    intent = market_close_intent(symbol=SYM, qty=1.0, order_side="BUY", client_order_id="jc_s", risk_event="no_short")
+    result = broker.submit(intent)
+    assert result.status == "rejected" and result.detail["error"] == "positions_unknown"
+    assert not any(c[0] == "POST" for c in calls)
+
+
+def test_kill_switch_cycle_closes_last_known_long_when_positions_unknown(tmp_path, market_snapshot) -> None:
+    ledger = _long_ledger(tmp_path)
+    broker, calls = _blind_broker("1")
+    judge = CountingJudge({})
+    cycle = make_run_cycle(
+        judgment=None,
+        account_kwargs={"kill_switch": True},
+        broker=broker,
+        ledger=ledger,
+        notifier=None,
+        typesafe_api_key=None,
+        jev_client=judge,
+        wallet_box={},
+    )
+    snapshot = replace(market_snapshot, symbol=SYM, position=replace(market_snapshot.position, side="LONG", size=1.0, entry=100.0))
+    result = cycle(snapshot)
+    assert judge.calls == 0
+    closes = [c for c in calls if c[0] == "POST" and c[1] == "/fapi/v1/order" and c[2].get("type") == "MARKET"]
+    assert len(closes) == 1 and closes[0][2]["reduceOnly"] == "true" and closes[0][2]["side"] == "SELL"
+    assert result.action == "close" and result.risk_event == "kill_switch"
