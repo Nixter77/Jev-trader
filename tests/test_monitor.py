@@ -327,6 +327,67 @@ def test_flatten_post_without_callback_is_unavailable(tmp_path: Path) -> None:
         server.server_close()
 
 
+def _flatten_status(port: int, headers: dict[str, str], data: bytes | None = None) -> tuple[int, dict]:
+    req = Request(
+        f"http://127.0.0.1:{port}/api/flatten",
+        data=data if data is not None else json.dumps({"confirm": True}).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+def test_flatten_rejects_bad_content_type_host_and_origin(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    calls: list[int] = []
+
+    def flatten() -> dict:
+        calls.append(1)
+        return {"closes": [], "cancelled": [], "wallet": None}
+
+    server = _start_monitor(ledger, tmp_path, flatten_fn=flatten)
+    try:
+        port = server.server_address[1]
+        code, body = _flatten_status(port, {"Content-Type": "text/plain"})
+        assert (code, body["error"]) == (415, "content_type_must_be_json")
+        code, body = _flatten_status(port, {"Content-Type": "application/x-www-form-urlencoded"}, b"confirm=true")
+        assert (code, body["error"]) == (415, "content_type_must_be_json")
+        code, body = _flatten_status(
+            port, {"Content-Type": "application/json", "Host": f"evil.example:{port}"}
+        )
+        assert (code, body["error"]) == (403, "host_not_allowed")
+        code, body = _flatten_status(
+            port, {"Content-Type": "application/json", "Host": "127.0.0.1:1"}
+        )
+        assert (code, body["error"]) == (403, "host_not_allowed")
+        code, body = _flatten_status(
+            port, {"Content-Type": "application/json", "Origin": "http://evil.example"}
+        )
+        assert (code, body["error"]) == (403, "origin_not_allowed")
+        assert calls == []
+        code, body = _flatten_status(
+            port,
+            {
+                "Content-Type": "application/json; charset=utf-8",
+                "Host": f"localhost:{port}",
+                "Origin": f"http://localhost:{port}",
+            },
+        )
+        assert code == 200 and body["ok"] is True
+        code, body = _flatten_status(
+            port, {"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"}
+        )
+        assert code == 200
+        assert calls == [1, 1]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_hourly_cap_follows_the_bot_snapshot_not_monitor_env(monkeypatch) -> None:
     monkeypatch.setenv("MAX_ENTRIES_PER_HOUR", "1")
     restrictions = build_restrictions(

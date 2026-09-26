@@ -235,10 +235,36 @@ class MonitorHandler(BaseHTTPRequestHandler):
             return
         self._send_json(404, {"ok": False, "error": "not found"})
 
+    def _flatten_request_refusal(self) -> tuple[int, str] | None:
+        """Refuse cross-site / non-JSON posts to /api/flatten.
+
+        A browser form or a page on another origin can't send
+        application/json without a preflight, and DNS rebinding shows up as a
+        foreign Host. Only 127.0.0.1:<port> / localhost:<port> are accepted.
+        """
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if ctype != "application/json":
+            return 415, "content_type_must_be_json"
+        port = self.server.server_address[1]
+        allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host not in allowed_hosts:
+            return 403, "host_not_allowed"
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            if origin.strip().lower() not in {f"http://{h}" for h in allowed_hosts}:
+                return 403, "origin_not_allowed"
+        return None
+
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         if path != "/api/flatten":
             self._send_json(404, {"ok": False, "error": "not found"})
+            return
+        refusal = self._flatten_request_refusal()
+        if refusal is not None:
+            code, error = refusal
+            self._send_json(code, {"ok": False, "error": error})
             return
         payload = self._read_json_body()
         if payload.get("confirm") is not True:
