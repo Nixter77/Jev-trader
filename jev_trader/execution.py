@@ -661,12 +661,17 @@ class BinanceFuturesBroker:
                 data = {**queried, "resolved_after": {"http_status": status, "body": data}}
                 status = 200
             elif outcome == "absent":
+                # A few quick -2013 right after a timeout / 5xx do not prove the
+                # order was never accepted (Binance can lag). Keep it
+                # submit_unknown: it counts in the hourly cap and the
+                # reconciler settles it after its grace window.
+                self.invalidate_wallet()
                 return ExecutionResult(
-                    status="rejected",
+                    status="submit_unknown",
                     venue=self.venue,
                     client_order_id=cid,
                     reduce_only=False,
-                    detail={"http_status": status, "body": data, "resolved": "not_found"},
+                    detail={"http_status": status, "body": data, "error": "submit_unknown", "resolved": "not_found_yet"},
                 )
             else:
                 self.invalidate_wallet()
@@ -802,12 +807,17 @@ class BinanceFuturesBroker:
                 data = {**queried, "resolved_after": {"http_status": status, "body": data}}
                 status = 200
             elif outcome == "absent":
+                # A few quick -2013 right after a timeout / 5xx do not prove the
+                # order was never accepted (Binance can lag). Keep it
+                # submit_unknown: it counts in the hourly cap and the
+                # reconciler settles it after its grace window.
+                self.invalidate_wallet()
                 return ExecutionResult(
-                    status="rejected",
+                    status="submit_unknown",
                     venue=self.venue,
                     client_order_id=intent.client_order_id,
                     reduce_only=intent.reduce_only,
-                    detail={"http_status": status, "body": data, "resolved": "not_found"},
+                    detail={"http_status": status, "body": data, "error": "submit_unknown", "resolved": "not_found_yet"},
                 )
             else:
                 self.invalidate_wallet()

@@ -726,11 +726,13 @@ def test_submit_503_found_filled_is_a_fill() -> None:
     assert is_real_fill(result)
 
 
-def test_submit_timeout_absent_on_exchange_is_rejected() -> None:
+def test_submit_timeout_quick_not_found_stays_submit_unknown() -> None:
+    # Quick -2013 after a timeout may be exchange lag: not a rejection.
     broker, calls = _scripted_broker((0, {"error": "URLError"}), [])
     result = broker.submit(_intent())
-    assert result.status == "rejected"
-    assert result.detail["resolved"] == "not_found"
+    assert result.status == "submit_unknown"
+    assert result.detail["resolved"] == "not_found_yet"
+    assert not is_real_fill(result)
     assert calls.count(("GET", "/fapi/v1/order")) == broker._fill_poll_attempts
 
 

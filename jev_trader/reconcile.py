@@ -138,6 +138,7 @@ class Reconciler:
         max_enrich_per_pass: int = 10,
         max_pending_per_pass: int = 25,
         budget_sec: float = 5.0,
+        submit_unknown_grace_sec: float = 300.0,
         min_backoff_sec: float = 10.0,
         max_backoff_sec: float = 300.0,
         now_fn: Callable[[], datetime] | None = None,
@@ -158,6 +159,7 @@ class Reconciler:
         # Resting entries with a partial fill whose closePosition stop is armed.
         self._partial_armed: set[str] = set()
         self.budget_sec = float(budget_sec)
+        self.submit_unknown_grace_sec = float(submit_unknown_grace_sec)
         self.min_backoff_sec = float(min_backoff_sec)
         self.max_backoff_sec = float(max_backoff_sec)
         self._deadline = float("inf")
@@ -347,10 +349,34 @@ class Reconciler:
         query = self.broker.query_order
         status, body = query(symbol, cid, **self._timeout_kw(query))
         if order_not_found(body):
-            with order_lock:
-                self.ledger.mark_order_final(int(row["id"]), "not_found")
-            summary["final"].append({"cid": cid, "status": "not_found"})
-            return
+            if str(row.get("status") or "") != "submit_unknown":
+                with order_lock:
+                    self.ledger.mark_order_final(int(row["id"]), "not_found")
+                summary["final"].append({"cid": cid, "status": "not_found"})
+                return
+            if age is None or age < self.submit_unknown_grace_sec:
+                # Submit timed out / 5xx: -2013 may just be exchange lag.
+                summary.setdefault("unknown_waiting", []).append({"cid": cid, "age_sec": age})
+                return
+            # Grace over: cancel by cid in case it surfaces, then settle.
+            cancel = self.broker.cancel_order(symbol, cid, **self._timeout_kw(self.broker.cancel_order))
+            c_status, c_body = cancel.get("http_status"), cancel.get("body")
+            self._check("cancel_order", c_status, c_body)
+            if (
+                isinstance(c_status, int)
+                and 200 <= c_status < 300
+                and isinstance(c_body, dict)
+                and c_body.get("orderId") is not None
+            ):
+                summary["cancelled"].append({"cid": cid, "symbol": symbol, "http_status": c_status})
+                body = c_body
+                status = c_status
+            else:
+                with order_lock:
+                    self.ledger.mark_order_final(int(row["id"]), "not_found")
+                summary["final"].append({"cid": cid, "status": "not_found", "after_grace": True})
+                log_event("reconcile_submit_unknown_settled", cid=cid, symbol=symbol, age_sec=age)
+                return
         self._check("query_order", status, body)
         if not (200 <= status < 300) or not isinstance(body, dict):
             summary["errors"].append(f"query {cid}: HTTP {status}: {body}")
