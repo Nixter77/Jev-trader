@@ -155,6 +155,8 @@ class Reconciler:
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self.venue = str(getattr(broker, "venue", "binance_testnet"))
         self._last_run = float("-inf")
+        # Resting entries with a partial fill whose closePosition stop is armed.
+        self._partial_armed: set[str] = set()
         self.budget_sec = float(budget_sec)
         self.min_backoff_sec = float(min_backoff_sec)
         self.max_backoff_sec = float(max_backoff_sec)
@@ -357,6 +359,12 @@ class Reconciler:
         ostatus = str(body.get("status") or "").upper()
         if ostatus in RESTING_STATUSES:
             stale = row["action"] == "buy_long" and age is not None and age >= self.entry_max_age_sec
+            if not stale and row["action"] == "buy_long" and order_executed_qty(body) > 0:
+                # Part of the entry is already a position: protect it now, not
+                # when the order finishes. Price already through the stop:
+                # cancel the rest and settle it like a stale order below.
+                if self._arm_partial(symbol, cid, body, summary) == "would_trigger":
+                    stale = True
             if not stale:
                 return
             cancel = self.broker.cancel_order(symbol, cid, **self._timeout_kw(self.broker.cancel_order))
@@ -382,7 +390,38 @@ class Reconciler:
                 (ostatus or "unknown").lower(),
                 exchange_order_id=body.get("orderId"),
             )
+        self._partial_armed.discard(cid)
         summary["final"].append({"cid": cid, "status": ostatus.lower(), "executed": executed})
+
+    def _arm_partial(self, symbol: str, cid: str, body: dict[str, Any], summary: dict[str, Any]) -> str:
+        """closePosition stop for a still-resting entry with executedQty > 0."""
+        if cid in self._partial_armed:
+            return "armed"
+        executed = order_executed_qty(body)
+        stop = self.ledger.order_stop_price(cid)
+        price = _f(body.get("price")) or _f(body.get("avgPrice"))
+        if stop is None or stop <= 0 or (price > 0 and stop >= price):
+            self._partial_armed.add(cid)  # log once; the final fill path retries
+            summary["stops"].append({"symbol": symbol, "stop": stop, "armed": False, "reason": "no_valid_stop", "partial": True})
+            log_event("reconcile_stop_missing", symbol=symbol, cid=cid, stop=stop, partial=True)
+            return "skip"
+        res = arm_exchange_stop(self.broker, self.ledger, symbol, stop, None)
+        http_status = res.get("http_status") if isinstance(res, dict) else None
+        res_body = res.get("body") if isinstance(res, dict) else None
+        ok = isinstance(res, dict) and not res.get("error") and (http_status is None or 200 <= int(http_status) < 300)
+        row = {"symbol": symbol, "stop": stop, "armed": ok, "partial": True, "executed": executed}
+        summary["stops"].append(row)
+        if ok:
+            self._partial_armed.add(cid)
+            log_event("reconcile_partial_stop", symbol=symbol, cid=cid, stop=stop, executed=executed)
+            return "armed"
+        row["error"] = res.get("error") if isinstance(res, dict) and res.get("error") else res_body
+        log_event("reconcile_stop_error", symbol=symbol, stop=stop, http_status=http_status, body=res_body, partial=True)
+        self._check("stop", http_status, res_body)
+        if isinstance(res_body, dict) and res_body.get("code") == STOP_WOULD_TRIGGER:
+            row["fail_closed"] = "cancel_rest_then_close"
+            return "would_trigger"
+        return "error"
 
     def _trades_for_order(self, symbol: str, order_id: Any) -> list[dict[str, Any]]:
         if order_id is None:
