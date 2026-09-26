@@ -422,3 +422,60 @@ def test_old_backfilled_entry_does_not_move_current_stop(tmp_path) -> None:
     summary = _rec(ledger, broker).run_once()
     assert [e["cid"] for e in summary["entries"]] == ["jev1_old"]
     assert broker.stops == []
+
+
+def test_bot_fill_with_known_order_id_is_not_recorded_twice(tmp_path) -> None:
+    # The reconciler settled the exchange close as x777; a flatten running in
+    # another process (own order_lock) then records the same orderId.
+    ledger = Ledger(tmp_path / "l.sqlite")
+    broker = FakeBroker()
+    t0 = datetime.now(timezone.utc) - timedelta(minutes=30)
+    ledger.record_exchange_fill(
+        ts=t0.isoformat(),
+        client_order_id="jev1_in",
+        exchange_order_id=1,
+        symbol=SYM,
+        action="buy_long",
+        qty=1.0,
+        price=100.0,
+        venue="binance_testnet",
+        commission_usdt=0.04,
+    )
+    broker.flat()
+    broker.trade(777, "SELL", 1.0, 94.0, t0 + timedelta(minutes=5), commission=0.05, realized=-6.0)
+    _rec(ledger, broker).run_once()
+    intent = TradeIntent(
+        action="close",
+        qty=1.0,
+        stop_price=None,
+        stop_distance=None,
+        entry_type="MARKET",
+        reduce_only=True,
+        client_order_id="jfBTCUSDT1",
+        symbol=SYM,
+        risk_pct=0.0,
+        order_side="SELL",
+        limit_price=94.0,
+    )
+    ledger.record(
+        CycleResult(
+            action="close",
+            skip_reason=None,
+            intent=intent,
+            execution=ExecutionResult(
+                status="filled",
+                venue="binance_testnet",
+                client_order_id="jfBTCUSDT1",
+                reduce_only=True,
+                detail={"http_status": 200, "body": {"orderId": 777, "status": "FILLED", "executedQty": "1", "avgPrice": "94"}},
+            ),
+            judgment=None,
+            state_text="flatten",
+            state={"symbol": SYM, "price": {"close": 94.0}},
+            risk_event="flatten",
+        )
+    )
+    closes = [f for f in _fills(ledger) if f["action"] == "close"]
+    assert [c["client_order_id"] for c in closes] == ["x777"]
+    streak, _ = loss_streak_from_closes(ledger.recent_close_pnls())
+    assert streak == 1

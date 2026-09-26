@@ -275,6 +275,12 @@ class Ledger:
         price = fill_price(execution, _fill_price(result, mark))
         if price is None or qty <= 0:
             return
+        eid = _exchange_order_id(execution)
+        if eid is not None and self._has_fill(conn, None, eid):
+            # Already settled under this exchange orderId (e.g. the reconciler
+            # recorded it as x<orderId> before a flatten in another process
+            # wrote its own row). A second row would count the PnL twice.
+            return
         row = self._row_position(conn, symbol)
         side = str(row["side"]) if row else "FLAT"
         size = float(row["size"]) if row else 0.0
