@@ -139,6 +139,7 @@ class Reconciler:
         max_pending_per_pass: int = 25,
         budget_sec: float = 5.0,
         submit_unknown_grace_sec: float = 300.0,
+        close_miss_reset_sec: float = 1800.0,
         min_backoff_sec: float = 10.0,
         max_backoff_sec: float = 300.0,
         now_fn: Callable[[], datetime] | None = None,
@@ -160,6 +161,9 @@ class Reconciler:
         self._partial_armed: set[str] = set()
         self.budget_sec = float(budget_sec)
         self.submit_unknown_grace_sec = float(submit_unknown_grace_sec)
+        self.close_miss_reset_sec = float(close_miss_reset_sec)
+        # cid -> monotonic time of its last close-detect miss.
+        self._close_miss_at: dict[str, float] = {}
         self.min_backoff_sec = float(min_backoff_sec)
         self.max_backoff_sec = float(max_backoff_sec)
         self._deadline = float("inf")
@@ -590,6 +594,7 @@ class Reconciler:
     # --- 2. closes the bot did not send ------------------------------------
 
     def _detect_exchange_closes(self, now: datetime, summary: dict[str, Any]) -> None:
+        self._expire_close_misses()
         open_rows = [
             r for r in self.ledger.open_entries(now - timedelta(seconds=self.lookback_sec))
             if self._close_misses.get(str(r["client_order_id"]), 0) < 3
@@ -623,6 +628,7 @@ class Reconciler:
             if not groups:
                 key = str(entry["client_order_id"])
                 self._close_misses[key] = self._close_misses.get(key, 0) + 1
+                self._close_miss_at[key] = time.monotonic()
                 continue
             for oid, rows in sorted(groups.items(), key=lambda kv: max(_f(t.get("time")) for t in kv[1])):
                 agg = summarize_trades(rows)
@@ -653,6 +659,14 @@ class Reconciler:
                     summary["closes"].append(
                         {"cid": f"x{oid}", "symbol": symbol, "qty": agg["qty"], "price": agg["price"], "net_pnl_usdt": net, "ts": ts}
                     )
+
+    def _expire_close_misses(self) -> None:
+        """Give a gave-up entry another 3 tries every close_miss_reset_sec."""
+        now_mono = time.monotonic()
+        for key in [k for k, n in self._close_misses.items() if n >= 3]:
+            if now_mono - self._close_miss_at.get(key, now_mono) >= self.close_miss_reset_sec:
+                self._close_misses.pop(key, None)
+                self._close_miss_at.pop(key, None)
 
     def _unknown_sell_groups(
         self, symbol: str, since_ts: str, entry_ms: int, trades: list[dict[str, Any]]
@@ -699,14 +713,24 @@ class Reconciler:
             end_ms = _iso_to_ms(close_ts)
             funding_fn = getattr(self.broker, "funding_income", None)
             if callable(funding_fn) and end_ms is not None and end_ms > start_ms:
-                try:
-                    funding = funding_fn(symbol, start_ms, end_ms, **self._timeout_kw(funding_fn))
-                except ExchangeHTTPError as exc:
-                    if exc.backoff:
-                        raise self._halt_from("funding_income", exc) from exc
-                    log_event("reconcile_funding_error", symbol=symbol, error=str(exc))
-                except Exception as exc:  # noqa: BLE001
-                    log_event("reconcile_funding_error", symbol=symbol, error=f"{type(exc).__name__}: {exc}")
+                # One retry on a soft failure (None / non-throttle error);
+                # a throttle or transport error halts the pass instead.
+                for attempt in range(2):
+                    try:
+                        funding = funding_fn(symbol, start_ms, end_ms, **self._timeout_kw(funding_fn))
+                    except ExchangeHTTPError as exc:
+                        if exc.backoff:
+                            raise self._halt_from("funding_income", exc) from exc
+                        log_event("reconcile_funding_error", symbol=symbol, error=str(exc), attempt=attempt)
+                    except Exception as exc:  # noqa: BLE001
+                        log_event(
+                            "reconcile_funding_error",
+                            symbol=symbol,
+                            error=f"{type(exc).__name__}: {exc}",
+                            attempt=attempt,
+                        )
+                    if funding is not None:
+                        break
         net = float(gross) - close_fee - entry_fee + float(funding or 0.0)
         return float(gross), funding, net
 
