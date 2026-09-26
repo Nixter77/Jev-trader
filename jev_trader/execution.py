@@ -576,7 +576,8 @@ class BinanceFuturesBroker:
         if send_status_unknown(status, data):
             # A timeout / 5xx does not mean the exchange refused the order.
             # Ask by clientOrderId before calling it rejected.
-            outcome, queried = self._resolve_submit(intent.symbol, intent.client_order_id)
+            # The cover was sent under its own `cid`, not the intent's id.
+            outcome, queried = self._resolve_submit(intent.symbol, cid)
             if outcome == "found":
                 data = {**queried, "resolved_after": {"http_status": status, "body": data}}
                 status = 200
@@ -584,8 +585,8 @@ class BinanceFuturesBroker:
                 return ExecutionResult(
                     status="rejected",
                     venue=self.venue,
-                    client_order_id=intent.client_order_id,
-                    reduce_only=intent.reduce_only,
+                    client_order_id=cid,
+                    reduce_only=False,
                     detail={"http_status": status, "body": data, "resolved": "not_found"},
                 )
             else:
@@ -593,8 +594,8 @@ class BinanceFuturesBroker:
                 return ExecutionResult(
                     status="submit_unknown",
                     venue=self.venue,
-                    client_order_id=intent.client_order_id,
-                    reduce_only=intent.reduce_only,
+                    client_order_id=cid,
+                    reduce_only=False,
                     detail={"http_status": status, "body": data, "error": "submit_unknown"},
                 )
         ok = 200 <= status < 300

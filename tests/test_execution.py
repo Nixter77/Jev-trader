@@ -746,3 +746,31 @@ def test_plain_exchange_rejection_is_not_requeried() -> None:
     result = broker.submit(_intent())
     assert result.status == "rejected"
     assert ("GET", "/fapi/v1/order") not in calls
+
+
+def test_short_cover_timeout_is_resolved_by_the_cover_client_id() -> None:
+    # The -2022 fallback sends a plain BUY under a fresh "jf..." id. A timeout
+    # on that POST must be looked up by that id, not the original intent's.
+    broker = BinanceTestnetBroker("k", "s", "https://testnet.binancefuture.com")
+    broker._fill_poll_sleep = 0
+    broker.filters_for = lambda symbol: {}  # type: ignore[method-assign]
+    broker._live_position = lambda symbol: {"symbol": symbol, "side": "SHORT", "size": 0.01}  # type: ignore[method-assign]
+    sent: dict[str, str] = {}
+
+    def fake_request(method: str, path: str, params: dict | None = None, signed: bool = False, timeout: float = 10.0, **_kw: Any):
+        params = params or {}
+        if method == "POST" and path == "/fapi/v1/order":
+            sent["cid"] = params["newClientOrderId"]
+            return 0, {"error": "TimeoutError: timed out"}
+        if method == "GET" and path == "/fapi/v1/order":
+            if params.get("origClientOrderId") == sent.get("cid"):
+                return 200, {"orderId": 8, "clientOrderId": sent["cid"], "status": "FILLED", "executedQty": "0.01", "avgPrice": "100"}
+            return 400, {"code": -2013, "msg": "Order does not exist."}
+        return 200, {}
+
+    broker._request = fake_request  # type: ignore[method-assign]
+    intent = _intent(action="close", order_side="BUY", reduce_only=True, entry_type="MARKET", client_order_id="jcBTCUSDT1")
+    result = broker._cover_short_without_reduce_only(intent, 0.01)
+    assert result.status == "filled"
+    assert result.client_order_id == sent["cid"] != "jcBTCUSDT1"
+    assert is_real_fill(result)
