@@ -41,6 +41,7 @@ from jev_trader.risk import (
     loss_streak_from_closes,
 )
 from jev_trader.state import build_compact_state
+from jev_trader.status import log_event
 from jev_trader.telegram import TelegramNotifier
 
 
@@ -112,7 +113,7 @@ def pre_model_entry_block(
 ) -> str | None:
     """Guard that blocks any entry for a flat book, so the model call is wasted.
 
-    Order matches apply_risk: kill_switch, daily_loss, then
+    Order: wallet_unavailable (no wallet this cycle), kill_switch, daily_loss, then
     entry_guard_skip_reason (no_entry_window, hourly_entry_cap,
     loss_streak_pause). An open position returns None (the model still
     decides closes; kill_switch there is a MARKET close from apply_risk).
@@ -120,6 +121,8 @@ def pre_model_entry_block(
     in_position = snapshot.position.side != "FLAT" and snapshot.position.size > 0
     if in_position:
         return None
+    if not account.wallet_ok:
+        return "wallet_unavailable"
     if account.kill_switch:
         return "kill_switch"
     if daily_loss_hit(account.daily_pnl_pct, account.daily_loss_limit_pct):
@@ -167,30 +170,35 @@ def arm_exchange_stop(
     symbol: str,
     stop_price: float | None,
     detail: dict[str, Any] | None,
-) -> None:
-    """Remember the stop and make sure the exchange has a close-all STOP_MARKET."""
+) -> Any:
+    """Remember the stop and make sure the exchange has a close-all STOP_MARKET.
+
+    Returns the broker's answer (None when there is nothing to arm).
+    """
     if not symbol or stop_price is None or float(stop_price) <= 0:
-        return
+        return None
     price = float(stop_price)
     with order_lock:
         if ledger is not None:
             try:
                 ledger.set_stop(symbol, price)
-            except Exception:  # noqa: BLE001 — a missing ledger row must not block the order
-                pass
+            except Exception as exc:  # noqa: BLE001 — a missing ledger row must not block the order
+                log_event("ledger_stop_error", symbol=symbol, error=f"{type(exc).__name__}: {exc}")
         ensure = getattr(broker, "ensure_stop_market", None)
         if not callable(ensure):
-            return
+            return None
         try:
             res = ensure(symbol, stop_price=price, order_side="SELL")
         except Exception as exc:  # noqa: BLE001 — fill already happened; surface the miss
             res = {"error": f"{type(exc).__name__}: {exc}"}
-        if not isinstance(detail, dict):
-            return
         if isinstance(res, dict) and res.get("error"):
-            detail["stop_error"] = res["error"]
-        else:
-            detail["stop"] = res
+            log_event("stop_error", symbol=symbol, stop_price=price, error=res["error"])
+        if isinstance(detail, dict):
+            if isinstance(res, dict) and res.get("error"):
+                detail["stop_error"] = res["error"]
+            else:
+                detail["stop"] = res
+        return res
 
 
 def recorded_outcome(

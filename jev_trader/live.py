@@ -31,7 +31,13 @@ from jev_trader.risk import (
     load_entry_guard_config,
     loss_streak_from_closes,
 )
-from jev_trader.status import resolve_day_anchor, seconds_to_next_5m, utc_now, write_json
+from jev_trader.status import (
+    log_event,
+    resolve_day_anchor,
+    seconds_to_next_5m,
+    utc_now,
+    write_json,
+)
 from jev_trader.models import (
     AccountState,
     Candle,
@@ -336,14 +342,11 @@ def _pull_wallet(broker: Any, wallet_box: dict[str, Any] | None) -> dict[str, An
     try:
         wallet = fetch()
     except Exception as exc:  # noqa: BLE001
+        error = f"{type(exc).__name__}: {exc}"
+        log_event("wallet_error", error=error)
         if wallet_box is None:
             return None
-        return finish_wallet_pull(
-            wallet_box,
-            gen,
-            None,
-            error=f"{type(exc).__name__}: {exc}",
-        )
+        return finish_wallet_pull(wallet_box, gen, None, error=error)
     if wallet_box is None:
         return wallet
     return finish_wallet_pull(wallet_box, gen, wallet)
@@ -357,8 +360,13 @@ def _account_for_cycle(
     wallet_box: dict[str, Any] | None,
     account_kwargs: dict[str, Any],
     max_positions: int,
+    wallet_expected: bool = False,
 ) -> tuple[MarketSnapshot, AccountState]:
-    """Wallet is the position. Ledger only supplies a stop the exchange row does not carry."""
+    """Wallet is the position. Ledger only supplies a stop the exchange row does not carry.
+
+    wallet_expected: the broker has a wallet endpoint. A missing wallet then
+    means "unknown", and AccountState.wallet_ok is False (no new entries).
+    """
     cash = snapshot.position.cash_usdt
     available = None
     daily_pnl_pct = float(account_kwargs.get("daily_pnl_pct", 0.0))
@@ -394,8 +402,15 @@ def _account_for_cycle(
                             snapshot,
                             position=replace(snapshot.position, stop_price=loaded.stop_price),
                         )
-            except Exception:  # noqa: BLE001 — trading must not die on ledger sync
-                pass
+                if wallet_box is not None:
+                    with _box_lock(wallet_box):
+                        wallet_box.pop("sync_error", None)
+            except Exception as exc:  # noqa: BLE001 — trading must not die on ledger sync
+                error = f"{type(exc).__name__}: {exc}"
+                log_event("ledger_sync_error", symbol=snapshot.symbol, error=error)
+                if wallet_box is not None:
+                    with _box_lock(wallet_box):
+                        wallet_box["sync_error"] = error
     if ledger is not None:
         open_n = ledger.count_open_positions()
     else:
@@ -409,6 +424,7 @@ def _account_for_cycle(
         open_positions=open_n,
         max_positions=int(account_kwargs.get("max_positions", max_positions)),
         available_usdt=available,
+        wallet_ok=not (wallet_expected and wallet is None),
     )
     return snapshot, account
 
@@ -436,6 +452,7 @@ def make_run_cycle(
             wallet_box=wallet_box,
             account_kwargs=account_kwargs,
             max_positions=max_positions,
+            wallet_expected=callable(getattr(broker, "fetch_wallet", None)),
         )
         return run_once(
             snapshot,
@@ -601,8 +618,8 @@ class LiveRunner:
             try:
                 for symbol in self.ledger.open_symbols():
                     add(symbol)
-            except Exception:  # noqa: BLE001 — ordering must not break the poll
-                pass
+            except Exception as exc:  # noqa: BLE001 — ordering must not break the poll
+                log_event("ledger_open_symbols_error", error=f"{type(exc).__name__}: {exc}")
         wallet = self.wallet_box.get("wallet") if isinstance(self.wallet_box, dict) else None
         if isinstance(wallet, dict):
             for row in wallet.get("positions") or []:
@@ -765,7 +782,8 @@ class LiveRunner:
                 loss_streak=loss_streak,
                 last_loss_ts=last_loss_ts,
             ).as_dict()
-        except Exception:  # noqa: BLE001 — status must not die on guard math
+        except Exception as exc:  # noqa: BLE001 — status must not die on guard math
+            log_event("entry_guard_status_error", error=f"{type(exc).__name__}: {exc}")
             entry_guards = None
         with self._state_lock:
             cycles = self.cycles
@@ -784,7 +802,7 @@ class LiveRunner:
             "watch": symbols,
             "universe": self.universe,
             "seconds_to_next_5m": seconds_to_next_5m(),
-            "last_error": last_error or wallet_error,
+            "last_error": last_error or wallet_error or self.wallet_box.get("sync_error"),
             "last_decisions": decisions,
             "wallet": wallet,
             "day_start_equity_usdt": day_start,

@@ -386,6 +386,9 @@ def apply_risk(
     if in_position and pos_side == "LONG":
         return skip("already_long")
 
+    if not account.wallet_ok:
+        return skip("wallet_unavailable")
+
     if (
         seconds_since_last_close is not None
         and reentry_cooldown_sec > 0
@@ -415,7 +418,10 @@ def apply_risk(
         available = account.equity_usdt
     leverage = max(float(account.leverage or 1.0), 1.0)
     max_notional = max(0.0, float(available)) * leverage
-    if close > 0 and max_notional > 0:
+    if max_notional <= 0:
+        # No free margin is a hard stop, not "no limit".
+        return skip("insufficient_margin")
+    if close > 0:
         qty = min(qty, max_notional / close)
     if qty <= 0:
         return skip("insufficient_margin")

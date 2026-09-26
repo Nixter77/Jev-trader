@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -20,6 +21,15 @@ def seconds_to_next_5m(*, now: float | None = None) -> float:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def log_event(event: str, **fields: Any) -> None:
+    """One JSON line on stderr for errors that must not stop trading."""
+    row = {"type": event, "ts": utc_now(), **fields}
+    try:
+        print(json.dumps(row, ensure_ascii=False, default=str), file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
 
 
 def resolve_day_anchor(

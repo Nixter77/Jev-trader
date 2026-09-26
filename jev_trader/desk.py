@@ -24,6 +24,7 @@ IL_TZ_NAME = "Asia/Jerusalem"
 # ~0.8s Jev HTTP call. Used only when status and env both omit the backend.
 LAYA_JUDGE_MS_HINT = 2000.0
 SKIP_REASONS = (
+    "wallet_unavailable",
     "kill_switch",
     "daily_loss",
     "no_entry_window",

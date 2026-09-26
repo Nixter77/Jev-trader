@@ -173,6 +173,9 @@ class AccountState:
     daily_loss_limit_pct: float = DAILY_LOSS_LIMIT_PCT
     leverage: float = 3.0
     available_usdt: float | None = None
+    # False when the broker has a wallet endpoint but this cycle's pull failed:
+    # equity/available/positions are then unknown, so no new entries.
+    wallet_ok: bool = True
 
 
 @dataclass(frozen=True)
