@@ -132,3 +132,49 @@ def test_timeout_kw_only_for_brokers_that_accept_it(tmp_path) -> None:
     assert rec._timeout_kw(FakeBroker().query_order) == {}
     kw = rec._timeout_kw(with_timeout)
     assert 1.0 <= kw["timeout"] <= 10.0
+
+
+def test_fill_recorded_before_a_halt_still_gets_its_stop(tmp_path) -> None:
+    # Newest row fills and is marked final; the next (older) row hits a 503.
+    # The final fill is never re-queried, so its stop must be armed now.
+    ledger = Ledger(tmp_path / "l.sqlite")
+
+    class HalfDown(FakeBroker):
+        def query_order(self, symbol, cid=None, *, order_id=None):
+            if cid == "jev1_old":
+                self.queries += 1
+                return 503, {"error": "Service Unavailable"}
+            return super().query_order(symbol, cid, order_id=order_id)
+
+    broker = HalfDown()
+    _record_entry(ledger, broker, "jev1_old", 10)
+    time.sleep(0.01)
+    _record_entry(ledger, broker, "jev1_new", 11)
+    broker.orders["jev1_new"].update(status="FILLED", executedQty="1", avgPrice="100")
+    broker.trade(11, "BUY", 1.0, 100.0, datetime.now(timezone.utc))
+    broker.long(1.0)
+    summary = _rec(ledger, broker).run_once()
+    assert summary["halted"]["http_status"] == 503
+    assert [f["client_order_id"] for f in _fills(ledger)] == ["jev1_new"]
+    assert broker.stops == [(SYM, 95.0)]
+
+
+def test_no_stop_arming_during_ip_ban(tmp_path) -> None:
+    ledger = Ledger(tmp_path / "l.sqlite")
+
+    class Banned(FakeBroker):
+        def query_order(self, symbol, cid=None, *, order_id=None):
+            if cid == "jev1_old":
+                return 418, {"code": -1003, "msg": "banned"}
+            return super().query_order(symbol, cid, order_id=order_id)
+
+    broker = Banned()
+    _record_entry(ledger, broker, "jev1_old", 10)
+    time.sleep(0.01)
+    _record_entry(ledger, broker, "jev1_new", 11)
+    broker.orders["jev1_new"].update(status="FILLED", executedQty="1", avgPrice="100")
+    broker.trade(11, "BUY", 1.0, 100.0, datetime.now(timezone.utc))
+    broker.long(1.0)
+    summary = _rec(ledger, broker).run_once()
+    assert summary["halted"]["http_status"] == 418
+    assert broker.stops == []

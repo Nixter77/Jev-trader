@@ -332,11 +332,13 @@ class Reconciler:
             except _Halt as halt:
                 halted = halt
                 break
-        if armed and halted is None:
+        # Fills already written are final (not re-queried), so this is their
+        # only chance at the intended stop before the next bar. A halt on some
+        # other row does not change that; only an IP ban (418) does, where
+        # every extra request lengthens the ban.
+        if armed and (halted is None or halted.status != 418):
             self._after_entry_fills(armed, summary)
         if halted is not None:
-            # Fills already written stay; the cycle arms their stop from the
-            # wallet position on its next bar.
             raise halted
 
     def _resolve_one(
