@@ -102,6 +102,28 @@ class Ledger:
                 """
             )
             self._ensure_column(conn, "positions", "stop_price", "REAL")
+            # Exchange reconciliation (orders resolved later, fills from userTrades).
+            for column, decl in (
+                ("stop_price", "REAL"),
+                ("exchange_order_id", "TEXT"),
+                ("final_status", "TEXT"),
+                ("final_ts", "TEXT"),
+            ):
+                self._ensure_column(conn, "orders", column, decl)
+            for column, decl in (
+                ("exchange_order_id", "TEXT"),
+                ("commission_usdt", "REAL"),
+                ("funding_usdt", "REAL"),
+                ("gross_pnl_usdt", "REAL"),
+                ("source", "TEXT"),
+                ("pnl_source", "TEXT"),
+                ("enrich_tries", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                self._ensure_column(conn, "fills", column, decl)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_cid ON fills(client_order_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_sym_ts ON fills(symbol, ts)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_cid ON orders(client_order_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_ts ON orders(ts)")
             conn.commit()
 
     def _ensure_column(
@@ -139,8 +161,9 @@ class Ledger:
                     """
                     INSERT INTO orders (
                         ts, client_order_id, symbol, action, qty, reduce_only,
-                        entry_type, venue, status, detail_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        entry_type, venue, status, detail_json, stop_price,
+                        exchange_order_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         _now(),
@@ -153,6 +176,8 @@ class Ledger:
                         execution.venue,
                         execution.status,
                         json.dumps(execution.detail, ensure_ascii=False),
+                        intent.stop_price,
+                        _exchange_order_id(execution),
                     ),
                 )
             symbol = (result.state or {}).get("symbol") or (intent.symbol if intent else "")
@@ -293,8 +318,9 @@ class Ledger:
             """
             INSERT INTO fills (
                 ts, client_order_id, symbol, action, position_side, qty, price,
-                venue, realized_pnl_usdt, cash_usdt
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                venue, realized_pnl_usdt, cash_usdt, exchange_order_id, source,
+                pnl_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'bot', ?)
             """,
             (
                 _now(),
@@ -307,6 +333,8 @@ class Ledger:
                 execution.venue,
                 pnl,
                 cash,
+                _exchange_order_id(execution),
+                None if pnl is None else "local",
             ),
         )
         self._upsert_position(
@@ -347,7 +375,7 @@ class Ledger:
                 """
                 SELECT ts FROM fills
                 WHERE symbol = ? AND action = ?
-                ORDER BY id DESC LIMIT 1
+                ORDER BY ts DESC, id DESC LIMIT 1
                 """,
                 (symbol.upper(), action),
             ).fetchone()
@@ -363,19 +391,339 @@ class Ledger:
         return max(0.0, (datetime.now(timezone.utc) - ts).total_seconds())
 
     def count_entries_since(self, since: datetime) -> int:
-        """Count buy_long fills (any symbol) at or after `since` (UTC)."""
-        if since.tzinfo is None:
-            since = since.replace(tzinfo=timezone.utc)
-        bound = since.astimezone(timezone.utc).isoformat()
+        """Entries (any symbol) at or after `since` (UTC).
+
+        Real buy_long fills (bot or exchange-reconciled, by trade time) plus
+        entry orders placed since `since` that are still unresolved (resting
+        GTX / submit_unknown). A resting maker order can fill at any moment,
+        so it counts against the hourly cap until the reconciler settles it.
+        """
+        bound = _iso_utc(since)
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT COUNT(*) AS n FROM fills
-                WHERE action = 'buy_long' AND ts >= ?
+                SELECT
+                  (SELECT COUNT(*) FROM fills
+                    WHERE action = 'buy_long' AND ts >= ?)
+                  +
+                  (SELECT COUNT(*) FROM orders o
+                    WHERE o.action = 'buy_long' AND o.ts >= ?
+                      AND o.status IN ('working', 'accepted', 'submit_unknown')
+                      AND o.final_status IS NULL
+                      AND NOT EXISTS (
+                        SELECT 1 FROM fills f WHERE f.client_order_id = o.client_order_id
+                      )) AS n
                 """,
-                (bound,),
+                (bound, bound),
             ).fetchone()
         return int(row["n"] if row is not None else 0)
+
+    # --- exchange reconciliation -------------------------------------------
+
+    def pending_orders(self, since: datetime) -> list[dict[str, Any]]:
+        """Orders whose outcome the exchange still has to tell us, oldest first.
+
+        buy_long that were resting (working / accepted) or whose submit timed
+        out, and closes whose submit timed out. Rows already settled or with a
+        fill under the same clientOrderId are excluded.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT o.* FROM orders o
+                WHERE o.ts >= ?
+                  AND o.final_status IS NULL
+                  AND (
+                    (o.action = 'buy_long'
+                      AND o.status IN ('working', 'accepted', 'submit_unknown'))
+                    OR (o.action = 'close' AND o.status = 'submit_unknown')
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM fills f WHERE f.client_order_id = o.client_order_id
+                  )
+                ORDER BY o.ts, o.id
+                """,
+                (_iso_utc(since),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_order_final(
+        self, order_row_id: int, status: str, *, exchange_order_id: Any = None
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE orders
+                SET final_status = ?, final_ts = ?,
+                    exchange_order_id = COALESCE(?, exchange_order_id)
+                WHERE id = ?
+                """,
+                (
+                    str(status),
+                    _now(),
+                    None if exchange_order_id is None else str(exchange_order_id),
+                    int(order_row_id),
+                ),
+            )
+            conn.commit()
+
+    def order_stop_price(self, client_order_id: str) -> float | None:
+        """Stop the entry was sized with: orders.stop_price, else the decision intent."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT stop_price FROM orders
+                WHERE client_order_id = ? AND stop_price IS NOT NULL
+                ORDER BY id DESC LIMIT 1
+                """,
+                (client_order_id,),
+            ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    """
+                    SELECT json_extract(intent_json, '$.stop_price') AS stop_price
+                    FROM decisions
+                    WHERE json_extract(intent_json, '$.client_order_id') = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (client_order_id,),
+                ).fetchone()
+        if row is None or row["stop_price"] is None:
+            return None
+        try:
+            value = float(row["stop_price"])
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    def has_fill(self, *, client_order_id: str | None = None, exchange_order_id: Any = None) -> bool:
+        with self._connect() as conn:
+            return self._has_fill(conn, client_order_id, exchange_order_id)
+
+    def _has_fill(
+        self, conn: sqlite3.Connection, client_order_id: str | None, exchange_order_id: Any
+    ) -> bool:
+        if client_order_id:
+            if conn.execute(
+                "SELECT 1 FROM fills WHERE client_order_id = ? LIMIT 1", (client_order_id,)
+            ).fetchone():
+                return True
+        if exchange_order_id is not None:
+            if conn.execute(
+                "SELECT 1 FROM fills WHERE exchange_order_id = ? LIMIT 1",
+                (str(exchange_order_id),),
+            ).fetchone():
+                return True
+        return False
+
+    def record_exchange_fill(
+        self,
+        *,
+        ts: str,
+        client_order_id: str,
+        exchange_order_id: Any,
+        symbol: str,
+        action: str,
+        qty: float,
+        price: float,
+        venue: str,
+        commission_usdt: float | None,
+        gross_pnl_usdt: float | None = None,
+        funding_usdt: float | None = None,
+        net_pnl_usdt: float | None = None,
+    ) -> bool:
+        """Insert a fill the bot did not see (maker entry filled later, exchange
+        stop / manual close). Deduped by clientOrderId and exchange orderId.
+
+        Positions side/size come from the wallet sync, not from here; a close
+        only adds its PnL to the running totals. Returns False on a duplicate.
+        """
+        symbol = symbol.upper()
+        with self._connect() as conn:
+            if self._has_fill(conn, client_order_id, exchange_order_id):
+                return False
+            row = self._row_position(conn, symbol)
+            cash = float(row["cash_usdt"]) if row else 10_000.0
+            realized_total = float(row["realized_pnl_usdt"]) if row else 0.0
+            if action == "close" and net_pnl_usdt is not None:
+                cash += float(net_pnl_usdt)
+                realized_total += float(net_pnl_usdt)
+                if row is not None:
+                    conn.execute(
+                        """
+                        UPDATE positions SET cash_usdt = ?, realized_pnl_usdt = ?, updated_ts = ?
+                        WHERE symbol = ?
+                        """,
+                        (cash, realized_total, _now(), symbol),
+                    )
+            conn.execute(
+                """
+                INSERT INTO fills (
+                    ts, client_order_id, symbol, action, position_side, qty, price,
+                    venue, realized_pnl_usdt, cash_usdt, exchange_order_id,
+                    commission_usdt, funding_usdt, gross_pnl_usdt, source, pnl_source
+                ) VALUES (?, ?, ?, ?, 'LONG', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'exchange', ?)
+                """,
+                (
+                    ts,
+                    client_order_id,
+                    symbol,
+                    action,
+                    float(qty),
+                    float(price),
+                    venue,
+                    net_pnl_usdt if action == "close" else None,
+                    cash,
+                    None if exchange_order_id is None else str(exchange_order_id),
+                    commission_usdt,
+                    funding_usdt,
+                    gross_pnl_usdt,
+                    "exchange" if action == "close" and net_pnl_usdt is not None else None,
+                ),
+            )
+            conn.commit()
+        return True
+
+    def fills_to_enrich(self, since: datetime, *, limit: int = 10, max_tries: int = 5) -> list[dict[str, Any]]:
+        """Bot fills without exchange commission yet, oldest first, with the orderId."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT f.*,
+                  COALESCE(
+                    f.exchange_order_id,
+                    (SELECT COALESCE(o.exchange_order_id,
+                                     CAST(json_extract(o.detail_json, '$.body.orderId') AS TEXT))
+                       FROM orders o WHERE o.client_order_id = f.client_order_id
+                       ORDER BY o.id DESC LIMIT 1)
+                  ) AS order_eid
+                FROM fills f
+                WHERE f.ts >= ?
+                  AND f.venue != 'paper'
+                  AND f.commission_usdt IS NULL
+                  AND COALESCE(f.enrich_tries, 0) < ?
+                ORDER BY f.ts, f.id
+                LIMIT ?
+                """,
+                (_iso_utc(since), int(max_tries), int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def bump_enrich_tries(self, fill_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE fills SET enrich_tries = COALESCE(enrich_tries, 0) + 1 WHERE id = ?",
+                (int(fill_id),),
+            )
+            conn.commit()
+
+    def apply_exchange_enrichment(
+        self,
+        fill_id: int,
+        *,
+        exchange_order_id: Any,
+        price: float,
+        qty: float,
+        commission_usdt: float,
+        gross_pnl_usdt: float | None = None,
+        funding_usdt: float | None = None,
+        net_pnl_usdt: float | None = None,
+    ) -> None:
+        """Replace a bot fill's self-computed numbers with the exchange's.
+
+        For a close the net PnL replaces realized_pnl_usdt and the running
+        position totals move by the difference.
+        """
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM fills WHERE id = ?", (int(fill_id),)).fetchone()
+            if row is None:
+                return
+            conn.execute(
+                """
+                UPDATE fills SET exchange_order_id = ?, price = ?, qty = ?, commission_usdt = ?,
+                    enrich_tries = COALESCE(enrich_tries, 0) + 1
+                WHERE id = ?
+                """,
+                (
+                    None if exchange_order_id is None else str(exchange_order_id),
+                    float(price),
+                    float(qty),
+                    float(commission_usdt),
+                    int(fill_id),
+                ),
+            )
+            if row["action"] == "close" and net_pnl_usdt is not None:
+                old = float(row["realized_pnl_usdt"] or 0.0)
+                delta = float(net_pnl_usdt) - old
+                conn.execute(
+                    """
+                    UPDATE fills SET realized_pnl_usdt = ?, gross_pnl_usdt = ?, funding_usdt = ?,
+                        pnl_source = 'exchange', cash_usdt = COALESCE(cash_usdt, 0) + ?
+                    WHERE id = ?
+                    """,
+                    (float(net_pnl_usdt), gross_pnl_usdt, funding_usdt, delta, int(fill_id)),
+                )
+                conn.execute(
+                    """
+                    UPDATE positions SET realized_pnl_usdt = realized_pnl_usdt + ?,
+                        cash_usdt = cash_usdt + ?, updated_ts = ?
+                    WHERE symbol = ?
+                    """,
+                    (delta, delta, _now(), str(row["symbol"]).upper()),
+                )
+            conn.commit()
+
+    def entry_fill_before(self, symbol: str, ts: str) -> dict[str, Any] | None:
+        """Latest buy_long fill for symbol at or before ts."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM fills
+                WHERE symbol = ? AND action = 'buy_long' AND ts <= ?
+                ORDER BY ts DESC, id DESC LIMIT 1
+                """,
+                (symbol.upper(), ts),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def open_entries(self, since: datetime) -> list[dict[str, Any]]:
+        """Per symbol, the latest fill when it is a buy_long placed since `since`
+        (an entry the ledger has no close for yet)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT f.* FROM fills f
+                WHERE f.ts >= ?
+                  AND f.action = 'buy_long'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM fills g
+                    WHERE g.symbol = f.symbol
+                      AND (g.ts > f.ts OR (g.ts = f.ts AND g.id > f.id))
+                  )
+                ORDER BY f.ts
+                """,
+                (_iso_utc(since),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def known_order_ids(self, symbol: str, since_ts: str) -> set[str]:
+        """Exchange orderIds already behind a fill for symbol since since_ts."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT COALESCE(
+                    f.exchange_order_id,
+                    (SELECT COALESCE(o.exchange_order_id,
+                                     CAST(json_extract(o.detail_json, '$.body.orderId') AS TEXT))
+                       FROM orders o WHERE o.client_order_id = f.client_order_id
+                       ORDER BY o.id DESC LIMIT 1)
+                ) AS eid
+                FROM fills f
+                WHERE f.symbol = ? AND f.ts >= ?
+                """,
+                (symbol.upper(), since_ts),
+            ).fetchall()
+        return {str(r["eid"]) for r in rows if r["eid"] is not None}
 
     def recent_close_pnls(self, *, limit: int = 64) -> list[tuple[datetime, float]]:
         """Newest-first close fills with realized PnL. Break-even is 0.0 when null."""
@@ -385,7 +733,7 @@ class Ledger:
                 """
                 SELECT ts, realized_pnl_usdt FROM fills
                 WHERE action = 'close'
-                ORDER BY id DESC
+                ORDER BY ts DESC, id DESC
                 LIMIT ?
                 """,
                 (lim,),
@@ -589,6 +937,20 @@ class Ledger:
             "fills": fills,
             "recent_decisions": recent,
         }
+
+
+def _iso_utc(when: datetime) -> str:
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.astimezone(timezone.utc).isoformat()
+
+
+def _exchange_order_id(execution: ExecutionResult | None) -> str | None:
+    detail = getattr(execution, "detail", None)
+    body = detail.get("body") if isinstance(detail, dict) else None
+    if isinstance(body, dict) and body.get("orderId") is not None:
+        return str(body["orderId"])
+    return None
 
 
 def _mark_price(result: CycleResult) -> float | None:

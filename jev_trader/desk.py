@@ -25,6 +25,7 @@ IL_TZ_NAME = "Asia/Jerusalem"
 LAYA_JUDGE_MS_HINT = 2000.0
 SKIP_REASONS = (
     "wallet_unavailable",
+    "submit_unknown",
     "kill_switch",
     "daily_loss",
     "no_entry_window",

@@ -17,7 +17,8 @@ from jev_trader.jev import judgment_from_dict
 from jev_trader.judge import make_judge_client, normalize_backend
 from jev_trader.laya_client import DEFAULT_LAYA_CHECKPOINT
 from jev_trader.ledger import Ledger
-from jev_trader.live import LiveRunner, load_answers, load_json, make_run_cycle
+from jev_trader.live import LiveRunner, force_wallet, load_answers, load_json, make_run_cycle
+from jev_trader.reconcile import Reconciler
 from jev_trader.models import AccountState
 from jev_trader.flatten import run_flatten
 from jev_trader.monitor import bind_monitor, dashboard_state
@@ -363,6 +364,26 @@ def _make_live_runner(args: argparse.Namespace, settings, ledger: Ledger, broker
     recorded_depth = load_json(args.recorded_depth) if getattr(args, "recorded_depth", None) else None
     universe = bool(args.universe) and recorded_klines is None and not recorded_closes
     status_path = _sidecar(ledger, "bot-status.json", getattr(args, "status", None))
+    reconciler = None
+    if (
+        callable(getattr(broker, "query_order", None))
+        and callable(fetch)
+        and recorded_klines is None
+        and not recorded_closes
+    ):
+
+        def _reconcile_wallet():
+            invalidate = getattr(broker, "invalidate_wallet", None)
+            if callable(invalidate):
+                invalidate()
+            return fetch(ttl=0)
+
+        reconciler = Reconciler(
+            broker,
+            ledger,
+            wallet_fn=_reconcile_wallet,
+            on_wallet=lambda wallet: force_wallet(wallet_box, wallet),
+        )
     return LiveRunner(
         _parse_symbols(getattr(args, "symbols", None), getattr(args, "symbol", "BTCUSDT")),
         run_cycle=run_cycle,
@@ -388,6 +409,7 @@ def _make_live_runner(args: argparse.Namespace, settings, ledger: Ledger, broker
         wallet_box=wallet_box,
         decision_backend=settings.decision_backend,
         laya_checkpoint=settings.laya_checkpoint,
+        reconciler=reconciler,
     )
 
 

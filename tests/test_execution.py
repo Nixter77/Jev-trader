@@ -686,3 +686,63 @@ def test_close_side_for_position_helper() -> None:
 
     assert close_side_for_position("SHORT") == "BUY"
     assert close_side_for_position("LONG") == "SELL"
+
+
+def _scripted_broker(post_answer: tuple[int, Any], query_answers: list[tuple[int, Any]]) -> tuple[BinanceTestnetBroker, list[tuple[str, str]]]:
+    broker = BinanceTestnetBroker("k", "s", "https://testnet.binancefuture.com")
+    broker._fill_poll_sleep = 0
+    broker.filters_for = lambda symbol: {}  # type: ignore[method-assign]
+    calls: list[tuple[str, str]] = []
+    answers = list(query_answers)
+
+    def fake_request(method: str, path: str, params: dict | None = None, signed: bool = False, timeout: float = 10.0, **_kw: Any):
+        calls.append((method, path))
+        if method == "POST" and path == "/fapi/v1/order":
+            return post_answer
+        if method == "GET" and path == "/fapi/v1/order":
+            return answers.pop(0) if answers else (400, {"code": -2013, "msg": "Order does not exist."})
+        if method == "GET" and path == "/fapi/v1/openOrders":
+            return 200, []
+        return 200, {}
+
+    broker._request = fake_request  # type: ignore[method-assign]
+    return broker, calls
+
+
+def test_submit_timeout_found_resting_is_working_not_rejected() -> None:
+    body = {"orderId": 5, "clientOrderId": "jev1_test", "status": "NEW", "executedQty": "0", "avgPrice": "0"}
+    broker, calls = _scripted_broker((0, {"error": "TimeoutError: timed out"}), [(200, body)])
+    result = broker.submit(_intent())
+    assert result.status == "working"
+    assert result.detail["body"]["resolved_after"]["http_status"] == 0
+    assert ("GET", "/fapi/v1/order") in calls
+
+
+def test_submit_503_found_filled_is_a_fill() -> None:
+    body = {"orderId": 5, "clientOrderId": "jev1_test", "status": "FILLED", "executedQty": "0.01", "avgPrice": "104900"}
+    broker, _ = _scripted_broker((503, {"error": "Service Unavailable"}), [(200, body)])
+    result = broker.submit(_intent())
+    assert result.status == "filled"
+    assert is_real_fill(result)
+
+
+def test_submit_timeout_absent_on_exchange_is_rejected() -> None:
+    broker, calls = _scripted_broker((0, {"error": "URLError"}), [])
+    result = broker.submit(_intent())
+    assert result.status == "rejected"
+    assert result.detail["resolved"] == "not_found"
+    assert calls.count(("GET", "/fapi/v1/order")) == broker._fill_poll_attempts
+
+
+def test_submit_timeout_unresolved_is_submit_unknown() -> None:
+    broker, _ = _scripted_broker((0, {"error": "URLError"}), [(0, {"error": "URLError"})] * 20)
+    result = broker.submit(_intent())
+    assert result.status == "submit_unknown"
+    assert not is_real_fill(result)
+
+
+def test_plain_exchange_rejection_is_not_requeried() -> None:
+    broker, calls = _scripted_broker((400, {"code": -5022, "msg": "Post Only order will be rejected"}), [])
+    result = broker.submit(_intent())
+    assert result.status == "rejected"
+    assert ("GET", "/fapi/v1/order") not in calls

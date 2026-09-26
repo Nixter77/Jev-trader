@@ -232,6 +232,9 @@ def recorded_outcome(
         return "hold", skip or "unfilled"
     if status == "working":
         return action, skip or "working"
+    if status == "submit_unknown":
+        # The reconciler finds out by clientOrderId and records any fill.
+        return "hold", "submit_unknown"
     return action, skip
 
 

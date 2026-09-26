@@ -506,8 +506,11 @@ class LiveRunner:
         wallet_box: dict[str, Any] | None = None,
         decision_backend: str = "jev",
         laya_checkpoint: str = "typed-decisions",
+        reconciler: Any = None,
     ) -> None:
         self.run_cycle = run_cycle
+        self.reconciler = reconciler
+        self.last_reconcile: dict[str, Any] | None = None
         self.symbols = [s.upper() for s in symbols]
         self.interval = interval
         self.kline_poll = max(0.0, float(kline_poll))
@@ -639,6 +642,29 @@ class LiveRunner:
         """Open positions first each poll so management is not starved by Laya latency."""
         return order_symbols_open_first(self.symbols, self._open_priority_symbols())
 
+    def reconcile(self) -> None:
+        """Exchange reconciliation (rate-limited inside the reconciler)."""
+        rec = self.reconciler
+        if rec is None or self._offline:
+            return
+        try:
+            summary = rec.maybe_run()
+        except Exception as exc:  # noqa: BLE001 — reconciliation must not stop the loop
+            log_event("reconcile_error", error=f"{type(exc).__name__}: {exc}")
+            return
+        if summary is None:
+            return
+        with self._state_lock:
+            self.last_reconcile = {
+                "ts": utc_now(),
+                "entries": len(summary.get("entries") or []),
+                "closes": len(summary.get("closes") or []),
+                "cancelled": len(summary.get("cancelled") or []),
+                "stops": len(summary.get("stops") or []),
+                "enriched": int(summary.get("enriched") or 0),
+                "errors": list(summary.get("errors") or [])[:5],
+            }
+
     def poll_live_symbol(self, symbol: str) -> CycleResult | None:
         loop = self._ensure_loop(symbol)
         rows = fetch_klines(symbol, interval=self.interval, limit=self.kline_limit)
@@ -702,6 +728,9 @@ class LiveRunner:
         for symbol in self._symbols_for_pass():
             if remaining is not None and len(results) >= remaining:
                 break
+            # Before every symbol (at most every ~10s): a maker entry that
+            # filled meanwhile gets its stop, and guards see real entries.
+            self.reconcile()
             take(self.poll_live_symbol(symbol))
         return results
 
@@ -807,6 +836,7 @@ class LiveRunner:
             "wallet": wallet,
             "day_start_equity_usdt": day_start,
             "entry_guards": entry_guards,
+            "reconcile": self.last_reconcile,
             "decision_backend": self.decision_backend,
             "laya_checkpoint": self.laya_checkpoint if self.decision_backend == "laya" else None,
             "hint": "Jev на закрытии 5m. Вход только BUY/лонг; выход MARKET; стоп на бирже.",

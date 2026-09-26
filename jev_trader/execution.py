@@ -249,6 +249,22 @@ def order_fill_price(body: Any) -> float | None:
     return px if px > 0 else None
 
 
+# -1007: "Timeout waiting for response from backend server. Send status unknown".
+# -1006: unexpected response from the message bus; execution status unknown.
+SEND_UNKNOWN_CODES = frozenset({-1006, -1007})
+
+
+def send_status_unknown(status: int, data: Any) -> bool:
+    """Transport error, 5xx, or Binance 'send status unknown' codes."""
+    if status == 0 or status >= 500:
+        return True
+    return isinstance(data, dict) and data.get("code") in SEND_UNKNOWN_CODES
+
+
+def order_not_found(data: Any) -> bool:
+    return isinstance(data, dict) and data.get("code") == -2013
+
+
 def order_is_filled(body: Any) -> bool:
     if not isinstance(body, dict):
         return False
@@ -557,6 +573,30 @@ class BinanceFuturesBroker:
         }
         self.cancel_open_orders(intent.symbol)
         status, data = self._request("POST", "/fapi/v1/order", params=params, signed=True)
+        if send_status_unknown(status, data):
+            # A timeout / 5xx does not mean the exchange refused the order.
+            # Ask by clientOrderId before calling it rejected.
+            outcome, queried = self._resolve_submit(intent.symbol, intent.client_order_id)
+            if outcome == "found":
+                data = {**queried, "resolved_after": {"http_status": status, "body": data}}
+                status = 200
+            elif outcome == "absent":
+                return ExecutionResult(
+                    status="rejected",
+                    venue=self.venue,
+                    client_order_id=intent.client_order_id,
+                    reduce_only=intent.reduce_only,
+                    detail={"http_status": status, "body": data, "resolved": "not_found"},
+                )
+            else:
+                self.invalidate_wallet()
+                return ExecutionResult(
+                    status="submit_unknown",
+                    venue=self.venue,
+                    client_order_id=intent.client_order_id,
+                    reduce_only=intent.reduce_only,
+                    detail={"http_status": status, "body": data, "error": "submit_unknown"},
+                )
         ok = 200 <= status < 300
         if not ok:
             return ExecutionResult(
@@ -674,6 +714,30 @@ class BinanceFuturesBroker:
         else:
             self.cancel_open_limits(intent.symbol)
         status, data = self._request("POST", "/fapi/v1/order", params=params, signed=True)
+        if send_status_unknown(status, data):
+            # A timeout / 5xx does not mean the exchange refused the order.
+            # Ask by clientOrderId before calling it rejected.
+            outcome, queried = self._resolve_submit(intent.symbol, intent.client_order_id)
+            if outcome == "found":
+                data = {**queried, "resolved_after": {"http_status": status, "body": data}}
+                status = 200
+            elif outcome == "absent":
+                return ExecutionResult(
+                    status="rejected",
+                    venue=self.venue,
+                    client_order_id=intent.client_order_id,
+                    reduce_only=intent.reduce_only,
+                    detail={"http_status": status, "body": data, "resolved": "not_found"},
+                )
+            else:
+                self.invalidate_wallet()
+                return ExecutionResult(
+                    status="submit_unknown",
+                    venue=self.venue,
+                    client_order_id=intent.client_order_id,
+                    reduce_only=intent.reduce_only,
+                    detail={"http_status": status, "body": data, "error": "submit_unknown"},
+                )
         ok = 200 <= status < 300
         if not ok:
             # Testnet (and some one-way states) reject BUY+reduceOnly on a real SHORT
@@ -747,6 +811,82 @@ class BinanceFuturesBroker:
             if 200 <= status < 300:
                 data = queried
         return data
+
+    def _resolve_submit(self, symbol: str, client_order_id: str) -> tuple[str, Any]:
+        """found (order body) / absent (-2013 on every try) / unknown."""
+        last = "unknown"
+        body: Any = None
+        for attempt in range(max(1, int(self._fill_poll_attempts))):
+            if attempt and self._fill_poll_sleep:
+                time.sleep(self._fill_poll_sleep)
+            status, body = self.query_order(symbol, client_order_id)
+            if 200 <= status < 300 and isinstance(body, dict) and body.get("orderId") is not None:
+                return "found", body
+            last = "absent" if order_not_found(body) else "unknown"
+        return last, body
+
+    def query_order(
+        self,
+        symbol: str,
+        client_order_id: str | None = None,
+        *,
+        order_id: Any = None,
+    ) -> tuple[int, Any]:
+        params: dict[str, Any] = {"symbol": symbol.upper()}
+        if order_id is not None:
+            params["orderId"] = order_id
+        else:
+            params["origClientOrderId"] = client_order_id
+        return self._request("GET", "/fapi/v1/order", params=params, signed=True)
+
+    def user_trades(
+        self,
+        symbol: str,
+        *,
+        order_id: Any = None,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Account trades (price, qty, commission, realizedPnl). Raises on HTTP error."""
+        params: dict[str, Any] = {"symbol": symbol.upper(), "limit": int(limit)}
+        if order_id is not None:
+            params["orderId"] = order_id
+        else:
+            if start_ms is not None:
+                params["startTime"] = int(start_ms)
+            if end_ms is not None:
+                params["endTime"] = int(end_ms)
+        status, data = self._request("GET", "/fapi/v1/userTrades", params=params, signed=True)
+        if not (200 <= status < 300) or not isinstance(data, list):
+            raise RuntimeError(f"userTrades HTTP {status}: {data}")
+        return [row for row in data if isinstance(row, dict)]
+
+    def funding_income(self, symbol: str, start_ms: int, end_ms: int) -> float | None:
+        """Sum of FUNDING_FEE income for symbol in [start, end]; None if unavailable."""
+        status, data = self._request(
+            "GET",
+            "/fapi/v1/income",
+            params={
+                "symbol": symbol.upper(),
+                "incomeType": "FUNDING_FEE",
+                "startTime": int(start_ms),
+                "endTime": int(end_ms),
+                "limit": 1000,
+            },
+            signed=True,
+        )
+        if not (200 <= status < 300) or not isinstance(data, list):
+            return None
+        total = 0.0
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            try:
+                total += float(row.get("income") or 0.0)
+            except (TypeError, ValueError):
+                continue
+        return total
 
     def cancel_order(self, symbol: str, client_order_id: str) -> dict[str, Any]:
         status, data = self._request(
