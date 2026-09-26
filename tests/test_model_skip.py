@@ -210,20 +210,42 @@ def test_no_guards_calls_model(market_snapshot, passing_answers) -> None:
     assert result.skip_reason != "no_entry_window"
 
 
-def test_kill_switch_semantics_unchanged(market_snapshot, passing_answers) -> None:
+def test_kill_switch_flat_skips_model(market_snapshot, passing_answers) -> None:
     judge = CountingJudge(passing_answers)
+    ledger = FakeLedger()
     result = run_once(
         market_snapshot,
         jev_client=judge,
         account=_account(kill_switch=True, daily_pnl_pct=-0.05),
         broker=PaperBroker(),
-        ledger=FakeLedger(),
+        ledger=ledger,
         entry_guard_config=_cfg(),
         now=NIGHT,
     )
-    assert judge.calls == 1
+    assert judge.calls == 0
+    assert result.action == "hold"
     assert result.skip_reason == "kill_switch"
+    assert result.risk_event == "kill_switch"
+    assert result.model_skipped is True
+    assert ledger.recorded == [result]
+
+
+def test_kill_switch_open_position_still_closes(market_snapshot, passing_answers) -> None:
+    judge = CountingJudge({**passing_answers, "action": "hold"})
+    result = run_once(
+        _long(market_snapshot),
+        jev_client=judge,
+        account=_account(kill_switch=True, open_positions=1),
+        broker=PaperBroker(),
+        ledger=FakeLedger(),
+        entry_guard_config=_cfg(),
+        now=NOON,
+    )
+    assert judge.calls == 1
     assert result.model_skipped is False
+    assert result.risk_event == "kill_switch"
+    assert result.intent.action == "close"
+    assert result.intent.entry_type == "MARKET"
 
 
 def test_precomputed_judgment_path_unchanged(market_snapshot, passing_answers) -> None:

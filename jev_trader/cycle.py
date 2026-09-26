@@ -112,14 +112,16 @@ def pre_model_entry_block(
 ) -> str | None:
     """Guard that blocks any entry for a flat book, so the model call is wasted.
 
-    Order matches apply_risk: daily_loss, then entry_guard_skip_reason
-    (no_entry_window, hourly_entry_cap, loss_streak_pause). An open position
-    returns None (the model still decides closes). kill_switch returns None so
-    apply_risk keeps reporting it exactly as before.
+    Order matches apply_risk: kill_switch, daily_loss, then
+    entry_guard_skip_reason (no_entry_window, hourly_entry_cap,
+    loss_streak_pause). An open position returns None (the model still
+    decides closes; kill_switch there is a MARKET close from apply_risk).
     """
     in_position = snapshot.position.side != "FLAT" and snapshot.position.size > 0
-    if in_position or account.kill_switch:
+    if in_position:
         return None
+    if account.kill_switch:
+        return "kill_switch"
     if daily_loss_hit(account.daily_pnl_pct, account.daily_loss_limit_pct):
         return "daily_loss"
     return entry_guard_skip_reason(config, state, now=now)
