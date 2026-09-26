@@ -130,6 +130,23 @@ def pre_model_entry_block(
     return entry_guard_skip_reason(config, state, now=now)
 
 
+def pre_model_risk_close(snapshot: MarketSnapshot, account: AccountState) -> str | None:
+    """kill_switch / daily_loss with an open position: close now, no model call.
+
+    apply_risk turns either into a MARKET reduce-only close before it looks at
+    the model's answer, so waiting for a (possibly failing) model call only
+    delays the exit.
+    """
+    in_position = snapshot.position.side != "FLAT" and snapshot.position.size > 0
+    if not in_position:
+        return None
+    if account.kill_switch:
+        return "kill_switch"
+    if daily_loss_hit(account.daily_pnl_pct, account.daily_loss_limit_pct):
+        return "daily_loss"
+    return None
+
+
 def model_skipped_judgment(reason: str) -> JevJudgment:
     """Hold stand-in recorded when the model was not called."""
     return JevJudgment(
@@ -299,12 +316,23 @@ def run_once(
     resolved = judgment
     judge_ms: float | None = None
     pre_skip: str | None = None
+    risk_close: str | None = None
     if resolved is None:
-        pre_skip = pre_model_entry_block(
-            snapshot, acct, entry_guard_config, entry_guard_state, now=now
-        )
+        risk_close = pre_model_risk_close(snapshot, acct)
+        if risk_close is None:
+            pre_skip = pre_model_entry_block(
+                snapshot, acct, entry_guard_config, entry_guard_state, now=now
+            )
 
-    if pre_skip is not None:
+    if risk_close is not None:
+        resolved = model_skipped_judgment(risk_close)
+        policy = PolicyDecision(
+            action="hold", passed=False, skip_reason=risk_close, judgment=resolved
+        )
+        # apply_risk returns the MARKET reduce-only close for kill / daily_loss
+        # before it reads the (skipped) policy.
+        intent = apply_risk(policy, features, snapshot, acct, now=now)
+    elif pre_skip is not None:
         resolved = model_skipped_judgment(pre_skip)
         policy = PolicyDecision(
             action="hold", passed=False, skip_reason=pre_skip, judgment=resolved
@@ -382,7 +410,7 @@ def run_once(
         state=compact.as_dict(),
         risk_event=intent.risk_event,
         judge_ms=judge_ms,
-        model_skipped=pre_skip is not None,
+        model_skipped=pre_skip is not None or risk_close is not None,
     )
     if ledger is not None:
         ledger.record(result)

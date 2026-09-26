@@ -169,7 +169,7 @@ def test_priority_daily_loss_first_then_window(market_snapshot, passing_answers)
     assert result.skip_reason == "no_entry_window"
 
 
-@pytest.mark.parametrize("guard", GUARDS)
+@pytest.mark.parametrize("guard", [g for g in GUARDS if g != "daily_loss"])
 def test_open_position_with_guard_still_calls_model(market_snapshot, passing_answers, guard) -> None:
     case = _case(guard)
     judge = CountingJudge({**passing_answers, "action": "hold"})
@@ -186,10 +186,8 @@ def test_open_position_with_guard_still_calls_model(market_snapshot, passing_ans
     assert result.judge_ms is not None
     assert result.model_skipped is False
     assert result.judgment.model != MODEL_SKIPPED
-    if guard == "daily_loss":
-        # Risk flatten for an open long is unchanged.
-        assert result.risk_event == "daily_loss"
-        assert result.intent.action == "close"
+    # daily_loss with an open long closes without the model (see
+    # test_daily_loss_open_position_closes_even_if_model_is_down).
 
 
 def test_no_guards_calls_model(market_snapshot, passing_answers) -> None:
@@ -230,7 +228,7 @@ def test_kill_switch_flat_skips_model(market_snapshot, passing_answers) -> None:
     assert ledger.recorded == [result]
 
 
-def test_kill_switch_open_position_still_closes(market_snapshot, passing_answers) -> None:
+def test_kill_switch_open_position_closes_without_model(market_snapshot, passing_answers) -> None:
     judge = CountingJudge({**passing_answers, "action": "hold"})
     result = run_once(
         _long(market_snapshot),
@@ -241,11 +239,63 @@ def test_kill_switch_open_position_still_closes(market_snapshot, passing_answers
         entry_guard_config=_cfg(),
         now=NOON,
     )
-    assert judge.calls == 1
-    assert result.model_skipped is False
+    assert judge.calls == 0
+    assert result.model_skipped is True
     assert result.risk_event == "kill_switch"
     assert result.intent.action == "close"
     assert result.intent.entry_type == "MARKET"
+    assert result.intent.reduce_only is True
+
+
+class BrokenJudge:
+    model = "broken"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def judge(self, _compact):
+        self.calls += 1
+        raise RuntimeError("model down")
+
+
+class FillingBroker:
+    venue = "binance_testnet"
+
+    def __init__(self) -> None:
+        self.sent = []
+
+    def submit(self, intent):
+        from jev_trader.models import ExecutionResult
+
+        self.sent.append(intent)
+        return ExecutionResult(
+            status="filled",
+            venue=self.venue,
+            client_order_id=intent.client_order_id,
+            reduce_only=intent.reduce_only,
+            detail={"http_status": 200, "body": {"orderId": 1, "status": "FILLED", "executedQty": str(intent.qty), "avgPrice": "100"}, "filled_qty": intent.qty, "fill_price": 100.0},
+        )
+
+
+def test_daily_loss_open_position_closes_even_if_model_is_down(market_snapshot) -> None:
+    judge = BrokenJudge()
+    broker = FillingBroker()
+    result = run_once(
+        _long(market_snapshot),
+        jev_client=judge,
+        account=_account(daily_pnl_pct=-(DAILY_LOSS_LIMIT_PCT + 0.01), open_positions=1),
+        broker=broker,
+        ledger=FakeLedger(),
+        entry_guard_config=_cfg(),
+        now=NOON,
+    )
+    assert judge.calls == 0
+    assert [i.action for i in broker.sent] == ["close"]
+    assert broker.sent[0].entry_type == "MARKET" and broker.sent[0].reduce_only
+    assert result.action == "close"
+    assert result.skip_reason is None
+    assert result.risk_event == "daily_loss"
+    assert result.model_skipped is True
 
 
 def test_precomputed_judgment_path_unchanged(market_snapshot, passing_answers) -> None:
