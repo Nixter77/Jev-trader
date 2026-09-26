@@ -16,10 +16,17 @@ This module asks Binance what actually happened and writes it to the ledger:
    exchange net PnL instead of the self-computed one.
 
 Hourly entry cap, min-hold and the loss streak read those rows.
+
+A pass has a time budget (~5 s). The first transport error / 5xx / 418 / 429
+stops the pass, and the next one waits for Retry-After or an exponential
+backoff. Network reads run outside `order_lock`; only ledger writes, cancels
+of a resolved order and fail-closed exits take it, so a slow Binance does not
+hold up flatten or cycle closes.
 """
 
 from __future__ import annotations
 
+import inspect
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -27,7 +34,10 @@ from typing import Any
 
 from jev_trader.cycle import arm_exchange_stop
 from jev_trader.execution import (
+    ExchangeHTTPError,
     client_order_id as new_client_order_id,
+    is_backoff_status,
+    retry_after_sec,
     fill_price,
     fill_qty,
     is_real_fill,
@@ -43,6 +53,17 @@ from jev_trader.status import log_event
 
 RESTING_STATUSES = frozenset({"NEW", "PARTIALLY_FILLED"})
 STOP_WOULD_TRIGGER = -2021
+
+
+class _Halt(Exception):
+    """Stop this pass: the exchange is unreachable or throttling us."""
+
+    def __init__(self, what: str, status: int, body: Any, retry_after: float | None) -> None:
+        super().__init__(f"{what}: HTTP {status}")
+        self.what = what
+        self.status = int(status)
+        self.body = body
+        self.retry_after = retry_after
 
 
 def _ms_to_iso(ms: Any) -> str:
@@ -116,6 +137,9 @@ class Reconciler:
         min_interval_sec: float = 10.0,
         max_enrich_per_pass: int = 10,
         max_pending_per_pass: int = 25,
+        budget_sec: float = 5.0,
+        min_backoff_sec: float = 10.0,
+        max_backoff_sec: float = 300.0,
         now_fn: Callable[[], datetime] | None = None,
     ) -> None:
         self.broker = broker
@@ -131,6 +155,12 @@ class Reconciler:
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self.venue = str(getattr(broker, "venue", "binance_testnet"))
         self._last_run = float("-inf")
+        self.budget_sec = float(budget_sec)
+        self.min_backoff_sec = float(min_backoff_sec)
+        self.max_backoff_sec = float(max_backoff_sec)
+        self._deadline = float("inf")
+        self._backoff = 0.0
+        self._next_allowed = float("-inf")
         # entry client_order_id -> passes where the wallet was flat but no SELL
         # trade was found; stop asking after a few.
         self._close_misses: dict[str, int] = {}
@@ -139,6 +169,8 @@ class Reconciler:
 
     def maybe_run(self) -> dict[str, Any] | None:
         now_mono = time.monotonic()
+        if now_mono < self._next_allowed:
+            return None
         if now_mono - self._last_run < self.min_interval_sec:
             return None
         self._last_run = now_mono
@@ -155,14 +187,27 @@ class Reconciler:
             "errors": [],
         }
         now = self.now_fn()
-        # Enrich before detecting closes so an exchange close sees the entry fee.
-        for step in (self._resolve_pending, self._enrich_fills, self._detect_exchange_closes):
-            try:
-                step(now, summary)
-            except Exception as exc:  # noqa: BLE001 — never take the trading loop down
-                error = f"{step.__name__}: {type(exc).__name__}: {exc}"
-                summary["errors"].append(error)
-                log_event("reconcile_error", error=error)
+        self._deadline = time.monotonic() + self.budget_sec
+        halted = False
+        try:
+            # Enrich before detecting closes so an exchange close sees the entry fee.
+            for step in (self._resolve_pending, self._enrich_fills, self._detect_exchange_closes):
+                if self._out_of_time(summary):
+                    break
+                try:
+                    step(now, summary)
+                except _Halt as halt:
+                    self._halt(halt, summary)
+                    halted = True
+                    break
+                except Exception as exc:  # noqa: BLE001 — never take the trading loop down
+                    error = f"{step.__name__}: {type(exc).__name__}: {exc}"
+                    summary["errors"].append(error)
+                    log_event("reconcile_error", error=error)
+        finally:
+            self._deadline = float("inf")
+        if not halted:
+            self._backoff = 0.0
         if summary["entries"] or summary["closes"] or summary["cancelled"] or summary["stops"]:
             log_event(
                 "reconcile",
@@ -173,6 +218,56 @@ class Reconciler:
                 enriched=summary["enriched"],
             )
         return summary
+
+    # --- budget / backoff ----------------------------------------------------
+
+    def _time_left(self) -> float:
+        return self._deadline - time.monotonic()
+
+    def _out_of_time(self, summary: dict[str, Any]) -> bool:
+        if self._time_left() > 0:
+            return False
+        summary["budget_exhausted"] = True
+        return True
+
+    def _timeout_kw(self, fn: Any) -> dict[str, float]:
+        """Per-request timeout bounded by what is left of the pass budget."""
+        try:
+            accepts = "timeout" in inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            accepts = False
+        if not accepts:
+            return {}
+        return {"timeout": max(1.0, min(10.0, self._time_left()))}
+
+    @staticmethod
+    def _check(what: str, status: Any, body: Any) -> None:
+        try:
+            code = int(status)
+        except (TypeError, ValueError):
+            return
+        if is_backoff_status(code):
+            raise _Halt(what, code, body, retry_after_sec(body))
+
+    @staticmethod
+    def _halt_from(what: str, exc: ExchangeHTTPError) -> _Halt:
+        return _Halt(what, exc.status, exc.body, exc.retry_after)
+
+    def _halt(self, halt: _Halt, summary: dict[str, Any]) -> None:
+        self._backoff = min(
+            self.max_backoff_sec, max(self.min_backoff_sec, self._backoff * 2.0)
+        )
+        wait = max(self._backoff, float(halt.retry_after or 0.0))
+        self._next_allowed = time.monotonic() + wait
+        summary["halted"] = {"what": halt.what, "http_status": halt.status, "wait_sec": wait}
+        summary["errors"].append(f"halted {halt.what}: HTTP {halt.status}; next pass in {wait:.0f}s")
+        log_event(
+            "reconcile_halt",
+            what=halt.what,
+            http_status=halt.status,
+            retry_after=halt.retry_after,
+            wait_sec=wait,
+        )
 
     # --- wallet --------------------------------------------------------------
 
@@ -220,49 +315,74 @@ class Reconciler:
         # wait for the next pass.
         rows = list(reversed(rows))[: max(1, self.max_pending_per_pass)]
         armed: dict[str, dict[str, Any]] = {}
+        halted: _Halt | None = None
         for row in rows:
-            symbol = str(row["symbol"]).upper()
-            cid = str(row["client_order_id"])
-            placed_ms = _iso_to_ms(row["ts"])
-            age = None if placed_ms is None else now.timestamp() - placed_ms / 1000.0
-            with order_lock:
-                status, body = self.broker.query_order(symbol, cid)
-                if order_not_found(body):
-                    self.ledger.mark_order_final(int(row["id"]), "not_found")
-                    summary["final"].append({"cid": cid, "status": "not_found"})
-                    continue
-                if not (200 <= status < 300) or not isinstance(body, dict):
-                    summary["errors"].append(f"query {cid}: HTTP {status}: {body}")
-                    log_event("reconcile_query_error", cid=cid, http_status=status, body=body)
-                    continue
-                ostatus = str(body.get("status") or "").upper()
-                if ostatus in RESTING_STATUSES:
-                    stale = row["action"] == "buy_long" and age is not None and age >= self.entry_max_age_sec
-                    if not stale:
-                        continue
-                    cancel = self.broker.cancel_order(symbol, cid)
-                    summary["cancelled"].append({"cid": cid, "symbol": symbol, "http_status": cancel.get("http_status")})
-                    q_status, q_body = self.broker.query_order(symbol, cid)
-                    if 200 <= q_status < 300 and isinstance(q_body, dict):
-                        body = q_body
-                        ostatus = str(body.get("status") or "").upper()
-                    if ostatus in RESTING_STATUSES:
-                        # Cancel did not land; try again next pass.
-                        continue
-                executed = order_executed_qty(body)
-                if executed > 0:
-                    recorded = self._record_order_fill(row, body, summary)
-                    if recorded is not None and row["action"] == "buy_long":
-                        # Rows go newest first: keep the newest fill per symbol.
-                        armed.setdefault(symbol, recorded)
-                self.ledger.mark_order_final(
-                    int(row["id"]),
-                    (ostatus or "unknown").lower(),
-                    exchange_order_id=body.get("orderId"),
-                )
-                summary["final"].append({"cid": cid, "status": ostatus.lower(), "executed": executed})
-        if armed:
+            if self._out_of_time(summary):
+                break
+            try:
+                self._resolve_one(row, now, summary, armed)
+            except _Halt as halt:
+                halted = halt
+                break
+        if armed and halted is None:
             self._after_entry_fills(armed, summary)
+        if halted is not None:
+            # Fills already written stay; the cycle arms their stop from the
+            # wallet position on its next bar.
+            raise halted
+
+    def _resolve_one(
+        self,
+        row: dict[str, Any],
+        now: datetime,
+        summary: dict[str, Any],
+        armed: dict[str, dict[str, Any]],
+    ) -> None:
+        symbol = str(row["symbol"]).upper()
+        cid = str(row["client_order_id"])
+        placed_ms = _iso_to_ms(row["ts"])
+        age = None if placed_ms is None else now.timestamp() - placed_ms / 1000.0
+        query = self.broker.query_order
+        status, body = query(symbol, cid, **self._timeout_kw(query))
+        if order_not_found(body):
+            with order_lock:
+                self.ledger.mark_order_final(int(row["id"]), "not_found")
+            summary["final"].append({"cid": cid, "status": "not_found"})
+            return
+        self._check("query_order", status, body)
+        if not (200 <= status < 300) or not isinstance(body, dict):
+            summary["errors"].append(f"query {cid}: HTTP {status}: {body}")
+            log_event("reconcile_query_error", cid=cid, http_status=status, body=body)
+            return
+        ostatus = str(body.get("status") or "").upper()
+        if ostatus in RESTING_STATUSES:
+            stale = row["action"] == "buy_long" and age is not None and age >= self.entry_max_age_sec
+            if not stale:
+                return
+            cancel = self.broker.cancel_order(symbol, cid, **self._timeout_kw(self.broker.cancel_order))
+            summary["cancelled"].append({"cid": cid, "symbol": symbol, "http_status": cancel.get("http_status")})
+            self._check("cancel_order", cancel.get("http_status"), cancel.get("body"))
+            q_status, q_body = query(symbol, cid, **self._timeout_kw(query))
+            self._check("query_order", q_status, q_body)
+            if 200 <= q_status < 300 and isinstance(q_body, dict):
+                body = q_body
+                ostatus = str(body.get("status") or "").upper()
+            if ostatus in RESTING_STATUSES:
+                # Cancel did not land; try again next pass.
+                return
+        executed = order_executed_qty(body)
+        if executed > 0:
+            recorded = self._record_order_fill(row, body, summary)
+            if recorded is not None and row["action"] == "buy_long":
+                # Rows go newest first: keep the newest fill per symbol.
+                armed.setdefault(symbol, recorded)
+        with order_lock:
+            self.ledger.mark_order_final(
+                int(row["id"]),
+                (ostatus or "unknown").lower(),
+                exchange_order_id=body.get("orderId"),
+            )
+        summary["final"].append({"cid": cid, "status": ostatus.lower(), "executed": executed})
 
     def _trades_for_order(self, symbol: str, order_id: Any) -> list[dict[str, Any]]:
         if order_id is None:
@@ -271,7 +391,13 @@ class Reconciler:
         if not callable(trades_fn):
             return []
         try:
-            return [t for t in trades_fn(symbol, order_id=order_id) if str(t.get("orderId")) == str(order_id)]
+            rows = trades_fn(symbol, order_id=order_id, **self._timeout_kw(trades_fn))
+            return [t for t in rows if str(t.get("orderId")) == str(order_id)]
+        except ExchangeHTTPError as exc:
+            if exc.backoff:
+                raise self._halt_from("user_trades", exc) from exc
+            log_event("reconcile_trades_error", symbol=symbol, order_id=order_id, error=str(exc))
+            return []
         except Exception as exc:  # noqa: BLE001
             log_event("reconcile_trades_error", symbol=symbol, order_id=order_id, error=f"{type(exc).__name__}: {exc}")
             return []
@@ -302,20 +428,21 @@ class Reconciler:
         gross = net = funding = None
         if action == "close":
             gross, funding, net = self._close_net(symbol, ts, agg)
-        ok = self.ledger.record_exchange_fill(
-            ts=ts,
-            client_order_id=cid,
-            exchange_order_id=order_id,
-            symbol=symbol,
-            action=action,
-            qty=agg["qty"],
-            price=agg["price"],
-            venue=self.venue,
-            commission_usdt=agg["commission_usdt"],
-            gross_pnl_usdt=gross,
-            funding_usdt=funding,
-            net_pnl_usdt=net,
-        )
+        with order_lock:
+            ok = self.ledger.record_exchange_fill(
+                ts=ts,
+                client_order_id=cid,
+                exchange_order_id=order_id,
+                symbol=symbol,
+                action=action,
+                qty=agg["qty"],
+                price=agg["price"],
+                venue=self.venue,
+                commission_usdt=agg["commission_usdt"],
+                gross_pnl_usdt=gross,
+                funding_usdt=funding,
+                net_pnl_usdt=net,
+            )
         if not ok:
             return None
         entry = {"cid": cid, "symbol": symbol, "action": action, "qty": agg["qty"], "price": agg["price"], "ts": ts}
@@ -419,29 +546,30 @@ class Reconciler:
             entry_ms = _iso_to_ms(entry["ts"])
             if entry_ms is None:
                 continue
-            with order_lock:
-                trades = trades_fn(symbol, start_ms=entry_ms, end_ms=now_ms)
-                known = self.ledger.known_order_ids(symbol, str(entry["ts"]))
-                groups: dict[str, list[dict[str, Any]]] = {}
-                for trade in trades:
-                    if str(trade.get("side") or "").upper() != "SELL":
-                        continue
-                    if int(_f(trade.get("time"))) < entry_ms:
-                        continue
-                    oid = str(trade.get("orderId"))
-                    if oid in known:
-                        continue
-                    groups.setdefault(oid, []).append(trade)
-                if not groups:
-                    key = str(entry["client_order_id"])
-                    self._close_misses[key] = self._close_misses.get(key, 0) + 1
+            if self._out_of_time(summary):
+                return
+            try:
+                trades = trades_fn(symbol, start_ms=entry_ms, end_ms=now_ms, **self._timeout_kw(trades_fn))
+            except ExchangeHTTPError as exc:
+                if exc.backoff:
+                    raise self._halt_from("user_trades", exc) from exc
+                raise
+            groups = self._unknown_sell_groups(symbol, str(entry["ts"]), entry_ms, trades)
+            if not groups:
+                key = str(entry["client_order_id"])
+                self._close_misses[key] = self._close_misses.get(key, 0) + 1
+                continue
+            for oid, rows in sorted(groups.items(), key=lambda kv: max(_f(t.get("time")) for t in kv[1])):
+                agg = summarize_trades(rows)
+                if agg is None:
                     continue
-                for oid, rows in sorted(groups.items(), key=lambda kv: max(_f(t.get("time")) for t in kv[1])):
-                    agg = summarize_trades(rows)
-                    if agg is None:
+                ts = _ms_to_iso(agg["time_ms"]) if agg.get("time_ms") else now.isoformat()
+                # Funding lookup is network: outside the lock.
+                gross, funding, net = self._close_net(symbol, ts, agg)
+                with order_lock:
+                    # A flatten may have recorded this order while we fetched.
+                    if oid in self.ledger.known_order_ids(symbol, str(entry["ts"])):
                         continue
-                    ts = _ms_to_iso(agg["time_ms"]) if agg.get("time_ms") else now.isoformat()
-                    gross, funding, net = self._close_net(symbol, ts, agg)
                     ok = self.ledger.record_exchange_fill(
                         ts=ts,
                         client_order_id=f"x{oid}",
@@ -456,10 +584,27 @@ class Reconciler:
                         funding_usdt=funding,
                         net_pnl_usdt=net,
                     )
-                    if ok:
-                        summary["closes"].append(
-                            {"cid": f"x{oid}", "symbol": symbol, "qty": agg["qty"], "price": agg["price"], "net_pnl_usdt": net, "ts": ts}
-                        )
+                if ok:
+                    summary["closes"].append(
+                        {"cid": f"x{oid}", "symbol": symbol, "qty": agg["qty"], "price": agg["price"], "net_pnl_usdt": net, "ts": ts}
+                    )
+
+    def _unknown_sell_groups(
+        self, symbol: str, since_ts: str, entry_ms: int, trades: list[dict[str, Any]]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """SELL trades after the entry, by orderId, that no ledger fill owns yet."""
+        known = self.ledger.known_order_ids(symbol, since_ts)
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for trade in trades:
+            if str(trade.get("side") or "").upper() != "SELL":
+                continue
+            if int(_f(trade.get("time"))) < entry_ms:
+                continue
+            oid = str(trade.get("orderId"))
+            if oid in known:
+                continue
+            groups.setdefault(oid, []).append(trade)
+        return groups
 
     # --- 3. exchange numbers for bot fills -----------------------------------
 
@@ -490,7 +635,11 @@ class Reconciler:
             funding_fn = getattr(self.broker, "funding_income", None)
             if callable(funding_fn) and end_ms is not None and end_ms > start_ms:
                 try:
-                    funding = funding_fn(symbol, start_ms, end_ms)
+                    funding = funding_fn(symbol, start_ms, end_ms, **self._timeout_kw(funding_fn))
+                except ExchangeHTTPError as exc:
+                    if exc.backoff:
+                        raise self._halt_from("funding_income", exc) from exc
+                    log_event("reconcile_funding_error", symbol=symbol, error=str(exc))
                 except Exception as exc:  # noqa: BLE001
                     log_event("reconcile_funding_error", symbol=symbol, error=f"{type(exc).__name__}: {exc}")
         net = float(gross) - close_fee - entry_fee + float(funding or 0.0)
@@ -499,6 +648,8 @@ class Reconciler:
     def _enrich_fills(self, now: datetime, summary: dict[str, Any]) -> None:
         since = now - timedelta(seconds=self.enrich_lookback_sec)
         for fill in self.ledger.fills_to_enrich(since, limit=self.max_enrich_per_pass):
+            if self._out_of_time(summary):
+                return
             symbol = str(fill["symbol"]).upper()
             order_id = fill.get("order_eid")
             trades = self._trades_for_order(symbol, order_id)

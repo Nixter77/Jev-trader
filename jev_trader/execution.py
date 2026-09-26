@@ -264,6 +264,42 @@ def wallet_positions_known(wallet: Any) -> bool:
     return isinstance(wallet, dict) and wallet.get("positions_known", True) is not False
 
 
+BACKOFF_HTTP_STATUSES = frozenset({418, 429})
+
+
+def is_backoff_status(status: int) -> bool:
+    """Transport error, 5xx, or Binance rate limit / IP ban: stop and back off."""
+    return status == 0 or status >= 500 or status in BACKOFF_HTTP_STATUSES
+
+
+def retry_after_sec(body: Any) -> float | None:
+    """Retry-After (seconds) captured from a 418/429 response, if any."""
+    if not isinstance(body, dict):
+        return None
+    try:
+        value = float(body.get("retry_after_sec"))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+class ExchangeHTTPError(RuntimeError):
+    """Non-2xx answer from a read endpoint (keeps the status for backoff)."""
+
+    def __init__(self, what: str, status: int, body: Any) -> None:
+        super().__init__(f"{what} HTTP {status}: {body}")
+        self.status = int(status)
+        self.body = body
+
+    @property
+    def backoff(self) -> bool:
+        return is_backoff_status(self.status)
+
+    @property
+    def retry_after(self) -> float | None:
+        return retry_after_sec(self.body)
+
+
 class PositionsUnknown(RuntimeError):
     """The exchange answered without a positions list; do not treat as flat."""
 
@@ -456,6 +492,14 @@ class BinanceFuturesBroker:
             except json.JSONDecodeError:
                 data = {"error": body or str(exc)}
             status = exc.code
+            if status in BACKOFF_HTTP_STATUSES:
+                raw_retry = exc.headers.get("Retry-After") if exc.headers is not None else None
+                if not isinstance(data, dict):
+                    data = {"body": data}
+                try:
+                    data["retry_after_sec"] = float(raw_retry) if raw_retry is not None else None
+                except (TypeError, ValueError):
+                    data["retry_after_sec"] = None
         except Exception as exc:  # noqa: BLE001 — ping/order must surface transport errors
             return 0, {"error": f"{type(exc).__name__}: {exc}"}
         if (
@@ -867,13 +911,14 @@ class BinanceFuturesBroker:
         client_order_id: str | None = None,
         *,
         order_id: Any = None,
+        timeout: float = 10.0,
     ) -> tuple[int, Any]:
         params: dict[str, Any] = {"symbol": symbol.upper()}
         if order_id is not None:
             params["orderId"] = order_id
         else:
             params["origClientOrderId"] = client_order_id
-        return self._request("GET", "/fapi/v1/order", params=params, signed=True)
+        return self._request("GET", "/fapi/v1/order", params=params, signed=True, timeout=timeout)
 
     def user_trades(
         self,
@@ -883,6 +928,7 @@ class BinanceFuturesBroker:
         start_ms: int | None = None,
         end_ms: int | None = None,
         limit: int = 1000,
+        timeout: float = 10.0,
     ) -> list[dict[str, Any]]:
         """Account trades (price, qty, commission, realizedPnl). Raises on HTTP error."""
         params: dict[str, Any] = {"symbol": symbol.upper(), "limit": int(limit)}
@@ -893,13 +939,21 @@ class BinanceFuturesBroker:
                 params["startTime"] = int(start_ms)
             if end_ms is not None:
                 params["endTime"] = int(end_ms)
-        status, data = self._request("GET", "/fapi/v1/userTrades", params=params, signed=True)
+        status, data = self._request(
+            "GET", "/fapi/v1/userTrades", params=params, signed=True, timeout=timeout
+        )
         if not (200 <= status < 300) or not isinstance(data, list):
-            raise RuntimeError(f"userTrades HTTP {status}: {data}")
+            raise ExchangeHTTPError("userTrades", status, data)
         return [row for row in data if isinstance(row, dict)]
 
-    def funding_income(self, symbol: str, start_ms: int, end_ms: int) -> float | None:
-        """Sum of FUNDING_FEE income for symbol in [start, end]; None if unavailable."""
+    def funding_income(
+        self, symbol: str, start_ms: int, end_ms: int, *, timeout: float = 10.0
+    ) -> float | None:
+        """Sum of FUNDING_FEE income for symbol in [start, end]; None if unavailable.
+
+        Raises ExchangeHTTPError on a transport error / 5xx / 418 / 429 so the
+        caller can back off instead of hammering a throttled API.
+        """
         status, data = self._request(
             "GET",
             "/fapi/v1/income",
@@ -911,7 +965,10 @@ class BinanceFuturesBroker:
                 "limit": 1000,
             },
             signed=True,
+            timeout=timeout,
         )
+        if is_backoff_status(status):
+            raise ExchangeHTTPError("income", status, data)
         if not (200 <= status < 300) or not isinstance(data, list):
             return None
         total = 0.0
@@ -924,12 +981,15 @@ class BinanceFuturesBroker:
                 continue
         return total
 
-    def cancel_order(self, symbol: str, client_order_id: str) -> dict[str, Any]:
+    def cancel_order(
+        self, symbol: str, client_order_id: str, *, timeout: float = 10.0
+    ) -> dict[str, Any]:
         status, data = self._request(
             "DELETE",
             "/fapi/v1/order",
             params={"symbol": symbol, "origClientOrderId": client_order_id},
             signed=True,
+            timeout=timeout,
         )
         return {"http_status": status, "body": data}
 
