@@ -311,3 +311,27 @@ def test_precomputed_judgment_path_unchanged(market_snapshot, passing_answers) -
     assert result.model_skipped is False
     assert result.judgment.model != MODEL_SKIPPED
     assert result.skip_reason == "no_entry_window"
+
+
+def test_long_through_its_stop_closes_even_if_model_is_down(market_snapshot) -> None:
+    # Price already at/below the stored stop: apply_risk would close before it
+    # reads the model, so a model outage must not keep the long open.
+    judge = BrokenJudge()
+    broker = FillingBroker()
+    long_snap = _long(market_snapshot)
+    last_close = long_snap.candles[-1].close
+    snap = replace(long_snap, position=replace(long_snap.position, stop_price=last_close + 1.0))
+    result = run_once(
+        snap,
+        jev_client=judge,
+        account=_account(open_positions=1),
+        broker=broker,
+        ledger=FakeLedger(),
+        entry_guard_config=_cfg(),
+        now=NOON,
+    )
+    assert judge.calls == 0
+    assert [i.action for i in broker.sent] == ["close"]
+    assert broker.sent[0].entry_type == "MARKET" and broker.sent[0].reduce_only
+    assert result.risk_event == "stop"
+    assert result.action == "close"

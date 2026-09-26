@@ -130,7 +130,13 @@ def pre_model_entry_block(
     return entry_guard_skip_reason(config, state, now=now)
 
 
-def pre_model_risk_close(snapshot: MarketSnapshot, account: AccountState) -> str | None:
+def pre_model_risk_close(
+    snapshot: MarketSnapshot,
+    account: AccountState,
+    *,
+    protective_stop: float | None = None,
+    close: float | None = None,
+) -> str | None:
     """kill_switch / daily_loss with an open position: close now, no model call.
 
     apply_risk turns either into a MARKET reduce-only close before it looks at
@@ -144,6 +150,15 @@ def pre_model_risk_close(snapshot: MarketSnapshot, account: AccountState) -> str
         return "kill_switch"
     if daily_loss_hit(account.daily_pnl_pct, account.daily_loss_limit_pct):
         return "daily_loss"
+    # Price already through the long's stop (apply_risk closes before reading
+    # the model): a failing model call must not keep the position open.
+    if (
+        snapshot.position.side == "LONG"
+        and protective_stop is not None
+        and close is not None
+        and close <= protective_stop
+    ):
+        return "stop"
     return None
 
 
@@ -318,7 +333,9 @@ def run_once(
     pre_skip: str | None = None
     risk_close: str | None = None
     if resolved is None:
-        risk_close = pre_model_risk_close(snapshot, acct)
+        risk_close = pre_model_risk_close(
+            snapshot, acct, protective_stop=protective, close=features.close
+        )
         if risk_close is None:
             pre_skip = pre_model_entry_block(
                 snapshot, acct, entry_guard_config, entry_guard_state, now=now
