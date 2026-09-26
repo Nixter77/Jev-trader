@@ -110,6 +110,17 @@ def flatten_open_positions(broker: Any, ledger: Ledger) -> dict[str, Any]:
         flatten = getattr(broker, "flatten_all", None)
         if callable(flatten) and not isinstance(broker, PaperBroker):
             raw = flatten() or {}
+            if raw.get("error") == "positions_unknown":
+                # Balance-only wallet: close the ledger's last-known positions
+                # with reduce-only MARKET orders (cannot open or flip) and
+                # cancel resting entries only, so exchange stops stay armed.
+                cancel_entries = getattr(broker, "cancel_working_entries", None)
+                cancelled = cancel_entries() if callable(cancel_entries) else []
+                out = _flatten_ledger(broker, ledger)
+                out["cancelled"] = list(raw.get("cancelled") or []) + list(cancelled or [])
+                out["error"] = "positions_unknown"
+                out["fallback"] = "ledger_positions"
+                return out
             closes = list(raw.get("closes") or [])
             for row in closes:
                 if not isinstance(row, dict):

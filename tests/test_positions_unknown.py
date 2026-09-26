@@ -233,3 +233,19 @@ def test_kill_switch_cycle_closes_last_known_long_when_positions_unknown(tmp_pat
     closes = [c for c in calls if c[0] == "POST" and c[1] == "/fapi/v1/order" and c[2].get("type") == "MARKET"]
     assert len(closes) == 1 and closes[0][2]["reduceOnly"] == "true" and closes[0][2]["side"] == "SELL"
     assert result.action == "close" and result.risk_event == "kill_switch"
+
+
+def test_flatten_with_unknown_positions_closes_ledger_longs_and_keeps_stops(tmp_path) -> None:
+    from jev_trader.flatten import flatten_open_positions
+
+    ledger = _long_ledger(tmp_path)
+    broker, calls = _blind_broker("1")
+    out = flatten_open_positions(broker, ledger)
+    assert out["error"] == "positions_unknown" and out["fallback"] == "ledger_positions"
+    posts = [c for c in calls if c[0] == "POST" and c[1] == "/fapi/v1/order"]
+    assert len(posts) == 1
+    assert posts[0][2]["side"] == "SELL" and posts[0][2]["reduceOnly"] == "true" and posts[0][2]["quantity"] == "1"
+    # Stops were never cancelled wholesale.
+    assert not any(c[0] == "DELETE" and c[1] == "/fapi/v1/allOpenOrders" for c in calls)
+    closes = [f for f in ledger.book()["fills"] if f["action"] == "close"]
+    assert len(closes) == 1

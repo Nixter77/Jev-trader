@@ -1156,11 +1156,17 @@ class BinanceFuturesBroker:
             return self._flatten_all_locked()
 
     def _flatten_all_locked(self) -> dict[str, Any]:
+        closes: list[dict[str, Any]] = []
+        probe = self.fetch_wallet(ttl=0)
+        if not wallet_positions_known(probe):
+            # Without a positions list we cannot tell what to close. Do not
+            # cancel first: that would strip the exchange stops and close
+            # nothing. The caller falls back to the ledger's last-known longs.
+            log_event("flatten_positions_unknown")
+            return {"cancelled": [], "closes": closes, "wallet": probe, "error": "positions_unknown"}
         cancelled = self.cancel_all_open_orders()
         wallet = self.fetch_wallet(ttl=0)
-        closes: list[dict[str, Any]] = []
         if not wallet_positions_known(wallet):
-            # Without a positions list we cannot tell what to close.
             log_event("flatten_positions_unknown")
             return {"cancelled": cancelled, "closes": closes, "wallet": wallet, "error": "positions_unknown"}
         for pos in wallet.get("positions") or []:
