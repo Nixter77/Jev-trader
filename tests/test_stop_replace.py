@@ -86,3 +86,16 @@ def test_stop_without_price_field_is_not_churned() -> None:
     ex = Exchange([{"orderId": 1, "type": "STOP_MARKET", "side": "SELL", "closePosition": True}])
     res = _broker(ex).ensure_stop_market("BTCUSDT", stop_price=95.0)
     assert res["body"]["skipped"] == "stop_exists"
+
+
+def test_unknown_tick_size_does_not_churn_the_stop() -> None:
+    # exchangeInfo unavailable: no tick to round to. A replace would cancel the
+    # good stop, send an unrounded price (-1111) and restore, every cycle.
+    ex = Exchange([_stop(1, "95.0")], refuse=[(400, {"code": -1111, "msg": "Precision is over the maximum defined for this asset."})] * 3)
+    broker = _broker(ex)
+    broker.filters_for = lambda symbol: {}  # type: ignore[method-assign]
+    for _ in range(3):
+        res = broker.ensure_stop_market("BTCUSDT", stop_price=95.0433)
+        assert res["body"] == {"skipped": "stop_exists", "unverified": "no_tick_size"}
+    assert [c for c in ex.calls if c[0] in {"DELETE", "POST"}] == []
+    assert [r["stopPrice"] for r in ex.open] == ["95.0"]

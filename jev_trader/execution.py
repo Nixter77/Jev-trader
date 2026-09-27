@@ -1261,7 +1261,14 @@ class BinanceFuturesBroker:
                 return self.place_stop_market(symbol, stop_price=stop_price, order_side=order_side)
             flt = self.filters_for(symbol)
             tick = float(flt.get("tickSize") or 0.0) if flt else 0.0
-            target = round_to_step(stop_price, flt["tickSize"]) if tick > 0 else float(stop_price)
+            if tick <= 0:
+                # No tick size (exchangeInfo missing): the unrounded target never
+                # equals the exchange's price, and sending it is refused for
+                # precision. Replacing would cancel + fail + restore every cycle,
+                # each time leaving the long bare. Keep the stop that is there.
+                log_event("stop_kept_unverified", symbol=symbol, want=stop_price, have=[r.get("stopPrice") for r in stops])
+                return {"http_status": 200, "body": {"skipped": "stop_exists", "unverified": "no_tick_size"}, "stop_price": stop_price}
+            target = round_to_step(stop_price, flt["tickSize"])
             if any(self._stop_matches(row, target, tick) for row in stops):
                 return {"http_status": 200, "body": {"skipped": "stop_exists"}, "stop_price": stop_price}
             old_prices = [row.get("stopPrice") for row in stops]
