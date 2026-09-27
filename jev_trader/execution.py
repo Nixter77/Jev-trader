@@ -810,7 +810,12 @@ class BinanceFuturesBroker:
         if blind_close:
             # Keep the exchange stop until the close is known to have flattened.
             pass
-        elif intent.reduce_only or intent.entry_type == "MARKET":
+        elif intent.reduce_only:
+            # A reduce-only close and the closePosition stop can coexist: drop
+            # only resting limits now; the stop goes after a confirmed full
+            # fill, so a rejected / unknown / partial close stays protected.
+            self.cancel_open_limits(intent.symbol)
+        elif intent.entry_type == "MARKET":
             self.cancel_open_orders(intent.symbol)
         else:
             self.cancel_open_limits(intent.symbol)
@@ -884,6 +889,13 @@ class BinanceFuturesBroker:
                 # remainder may exist and keeps its stop.
                 if 0 < filled_qty < qty:
                     self.cancel_open_orders(intent.symbol)
+            elif intent.reduce_only and _close_fully_filled(data, filled_qty, qty, flt):
+                self.cancel_open_orders(intent.symbol)
+                detail["stop_cleared"] = True
+            elif intent.reduce_only:
+                # Partial close: the remainder keeps its closePosition stop.
+                detail["stop_kept"] = "partial_close"
+                log_event("close_partial_stop_kept", symbol=intent.symbol, filled_qty=filled_qty, qty=qty)
             return ExecutionResult(
                 status="filled",
                 venue=self.venue,
@@ -1063,7 +1075,9 @@ class BinanceFuturesBroker:
             cancelled.append({"http_status": c_status, "body": c_body})
         return cancelled
 
-    def cancel_all_open_orders(self, symbols: list[str] | None = None) -> list[dict[str, Any]]:
+    def cancel_all_open_orders(
+        self, symbols: list[str] | None = None, *, exclude: set[str] | None = None
+    ) -> list[dict[str, Any]]:
         names = [s.upper() for s in (symbols or [])]
         if not names:
             status, data = self._request("GET", "/fapi/v1/openOrders", signed=True)
@@ -1075,7 +1089,8 @@ class BinanceFuturesBroker:
                         if isinstance(row, dict) and row.get("symbol")
                     }
                 )
-        return [self.cancel_open_orders(symbol) for symbol in names]
+        skip = {s.upper() for s in (exclude or set())}
+        return [self.cancel_open_orders(symbol) for symbol in names if symbol not in skip]
 
     def cancel_working_entries(self) -> list[dict[str, Any]]:
         """Cancel resting LIMIT/GTX entries. Leave STOP_MARKET protection in place."""
@@ -1234,7 +1249,14 @@ class BinanceFuturesBroker:
             # nothing. The caller falls back to the ledger's last-known longs.
             log_event("flatten_positions_unknown")
             return {"cancelled": [], "closes": closes, "wallet": probe, "error": "positions_unknown"}
-        cancelled = self.cancel_all_open_orders()
+        # Symbols with a position keep their closePosition stop: submit() drops
+        # their limits before the close and the stop after a confirmed fill.
+        positioned = {
+            str(p.get("symbol") or "").upper()
+            for p in probe.get("positions") or []
+            if isinstance(p, dict) and float(p.get("size") or 0.0) > 0
+        }
+        cancelled = self.cancel_all_open_orders(exclude=positioned)
         wallet = self.fetch_wallet(ttl=0)
         if not wallet_positions_known(wallet):
             log_event("flatten_positions_unknown")
@@ -1271,6 +1293,18 @@ class BinanceFuturesBroker:
 # Exits that must not wait for a positions list: a reduce-only SELL is safe to
 # send blind (it can only shrink a long; the exchange rejects it when flat).
 BLIND_CLOSE_RISK_EVENTS = frozenset({"kill_switch", "daily_loss", "stop", "flatten"})
+
+
+def _close_fully_filled(body: Any, filled_qty: float, qty: float, flt: dict[str, Any] | None) -> bool:
+    """Reduce-only close done: FILLED, or executed within half a step of qty."""
+    if isinstance(body, dict) and str(body.get("status") or "") == "FILLED" and filled_qty > 0:
+        return True
+    step = 0.0
+    try:
+        step = float((flt or {}).get("stepSize") or 0.0)
+    except (TypeError, ValueError):
+        step = 0.0
+    return filled_qty > 0 and filled_qty >= qty - step / 2 - 1e-12
 
 
 def blind_close_allowed(intent: TradeIntent) -> bool:
