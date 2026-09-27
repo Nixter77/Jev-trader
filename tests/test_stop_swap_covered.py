@@ -233,3 +233,49 @@ def test_reconcile_does_not_close_when_temp_stop_protects(tmp_path) -> None:
     summary = _rec(ledger, broker).run_once()
     assert "fail_closed" not in summary["stops"][0]
     assert broker.submitted == []
+
+
+class _LandsButTimesOut(Exchange):
+    """The new closePosition stop reaches the book, but its answer is lost."""
+
+    def request(self, method, path, params=None, signed=False, timeout=10.0, **kw):
+        out = super().request(method, path, params, signed, timeout, **kw)
+        p = dict(params or {})
+        if method == "POST" and p.get("closePosition") == "true" and p.get("stopPrice") == "95" and out[0] == 200:
+            return 0, {"error": "TimeoutError: timed out"}
+        return out
+
+
+def test_timed_out_new_stop_that_landed_is_not_called_unprotected() -> None:
+    # No position read -> no temp. New stop times out but lands; the restore
+    # then gets -4130. The long is protected: closing it would be spurious.
+    ex = _LandsButTimesOut([_stop(1, "80.0")])
+    res = _broker(ex, size=None).ensure_stop_market("BTCUSDT", stop_price=95.0)
+    assert res["restored_old_stop"]["body"]["code"] == -4130
+    assert not res.get("unprotected")
+    assert not _must_fail_close(res)
+    assert [r["stopPrice"] for r in ex.open] == ["95"]
+
+
+class _NetworkDown(Exchange):
+    def __init__(self, stops):
+        super().__init__(stops)
+        self.down = False
+
+    def request(self, method, path, params=None, signed=False, timeout=10.0, **kw):
+        if self.down:
+            self.calls.append((method, path, dict(params or {})))
+            return 0, {"error": "URLError: network unreachable"}
+        out = super().request(method, path, params, signed, timeout, **kw)
+        if method == "GET" and path == "/fapi/v1/openOrders":
+            self.down = True  # drops right after the first listing
+        return out
+
+
+def test_network_outage_mid_swap_does_not_trigger_fail_close() -> None:
+    ex = _NetworkDown([_stop(1, "80.0")])
+    res = _broker(ex, size=None).ensure_stop_market("BTCUSDT", stop_price=95.0)
+    assert [r["stopPrice"] for r in ex.open] == ["80.0"]  # the old stop never left
+    assert not res.get("unprotected")
+    assert res.get("protection_unknown") is True
+    assert not _must_fail_close(res)

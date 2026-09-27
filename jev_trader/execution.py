@@ -1532,7 +1532,23 @@ class BinanceFuturesBroker:
                 restore = self.place_stop_market(symbol, stop_price=old, order_side=order_side)
             res["restored_old_stop"] = restore
             if restore is None or not _http_ok(restore):
-                res["unprotected"] = True
+                # Refused answers do not prove the long is bare: a timed-out
+                # new stop may have landed (the restore then gets -4130), or a
+                # cancel that failed left the old one in place. Look before
+                # telling the caller to close the position.
+                listed = self._open_orders(symbol)
+                if listed is not None:
+                    still = self._close_stops_from(listed, order_side) + self._temp_stops_from(listed, order_side)
+                    if still:
+                        res["stop_still_listed"] = [r.get("stopPrice") for r in still]
+                    else:
+                        res["unprotected"] = True
+                elif all(_http_ok(c) for c in cancels) and _http_refused(res) and _http_refused(restore):
+                    # Old stop cancelled and both placements answered with a
+                    # refusal: nothing can be resting.
+                    res["unprotected"] = True
+                else:
+                    res["protection_unknown"] = True
             log_event(
                 "stop_replace_failed",
                 symbol=symbol,
@@ -1644,6 +1660,12 @@ def _close_fully_filled(body: Any, filled_qty: float, qty: float, flt: dict[str,
 def _http_ok(res: Any) -> bool:
     status = res.get("http_status") if isinstance(res, dict) else None
     return isinstance(status, int) and 200 <= status < 300
+
+
+def _http_refused(res: Any) -> bool:
+    """The exchange answered and said no (4xx), as opposed to a timeout / 5xx."""
+    status = res.get("http_status") if isinstance(res, dict) else None
+    return isinstance(status, int) and 400 <= status < 500
 
 
 def _tighter_stop_prices(
