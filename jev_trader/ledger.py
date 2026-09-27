@@ -486,10 +486,14 @@ class Ledger:
 
     def unknown_cover_cids(self, symbol: str) -> list[str]:
         """Plain-BUY short covers still in submit_unknown (no fill, not final)."""
+        return [cid for cid, _age in self.unknown_cover_rows(symbol)]
+
+    def unknown_cover_rows(self, symbol: str) -> list[tuple[str, float | None]]:
+        """Same covers as (clientOrderId, age in seconds; None if ts is unreadable)."""
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT o.client_order_id FROM orders o
+                SELECT o.client_order_id, o.ts FROM orders o
                 WHERE o.symbol = ?
                   AND o.action = 'close'
                   AND o.status = 'submit_unknown'
@@ -500,7 +504,32 @@ class Ledger:
                 """,
                 (symbol.upper(), COVER_FALLBACK),
             ).fetchall()
-        return [str(r[0]) for r in rows]
+        now = datetime.now(timezone.utc)
+        out: list[tuple[str, float | None]] = []
+        for r in rows:
+            age: float | None = None
+            try:
+                ts = datetime.fromisoformat(str(r[1]))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                age = (now - ts).total_seconds()
+            except (TypeError, ValueError):
+                age = None
+            out.append((str(r[0]), age))
+        return out
+
+    def mark_order_final_by_cid(self, client_order_id: str, status: str) -> int:
+        """Settle open order rows under this clientOrderId; returns rows changed."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE orders SET final_status = ?, final_ts = ?
+                WHERE client_order_id = ? AND final_status IS NULL
+                """,
+                (str(status), _now(), str(client_order_id)),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
 
     def pending_orders(self, since: datetime) -> list[dict[str, Any]]:
         """Orders whose outcome the exchange still has to tell us, oldest first.

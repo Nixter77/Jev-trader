@@ -451,7 +451,12 @@ class BinanceFuturesBroker:
         self.cover_unknown_grace_sec = 300.0
         # Optional ledger lookup (survives restarts): symbol -> cover cids
         # still in submit_unknown.
-        self.unknown_cover_cids_fn: Callable[[str], list[str]] | None = None
+        # Items are cids or (cid, age_sec) pairs.
+        self.unknown_cover_cids_fn: Callable[[str], list[Any]] | None = None
+        # A ledger cover row this old can no longer be in flight: cancel by
+        # cid and settle it via settle_unknown_cover_fn(cid, status).
+        self.cover_unknown_max_age_sec = 72 * 3600.0
+        self.settle_unknown_cover_fn: Callable[[str, str], Any] | None = None
 
     def sync_time(self) -> int:
         status, data = self._request("GET", "/fapi/v1/time", signed=False)
@@ -779,16 +784,27 @@ class BinanceFuturesBroker:
         """
         sym = symbol.upper()
         cids: dict[str, float | None] = {}
+        ages: dict[str, float] = {}
         mem = self._unknown_covers.get(sym)
         if mem is not None:
             cids[mem[0]] = mem[1]
         if self.unknown_cover_cids_fn is not None:
             try:
-                for cid in self.unknown_cover_cids_fn(sym) or []:
-                    cids.setdefault(str(cid), None)
+                for item in self.unknown_cover_cids_fn(sym) or []:
+                    if isinstance(item, (tuple, list)):
+                        cid = str(item[0])
+                        age = item[1] if len(item) > 1 else None
+                        if age is not None:
+                            ages[cid] = float(age)
+                    else:
+                        cid = str(item)
+                    cids.setdefault(cid, None)
             except Exception as exc:  # noqa: BLE001
                 log_event("cover_guard_error", symbol=sym, error=f"{type(exc).__name__}: {exc}")
         for cid, since in cids.items():
+            if ages.get(cid, 0.0) >= self.cover_unknown_max_age_sec:
+                self._expire_unknown_cover(sym, cid, ages[cid])
+                continue
             status, body = self.query_order(sym, cid)
             if 200 <= status < 300 and isinstance(body, dict) and body.get("orderId") is not None:
                 if str(body.get("status") or "").upper() in {"NEW", "PARTIALLY_FILLED"}:
@@ -808,6 +824,31 @@ class BinanceFuturesBroker:
             # rows without a local timestamp wait for the reconciler to settle.
             return cid
         return None
+
+    def _expire_unknown_cover(self, symbol: str, cid: str, age_sec: float) -> None:
+        """Terminal path for a cover that stayed submit_unknown past the max age.
+
+        A plain MARKET BUY does not rest for days: cancel by cid in case it
+        somehow does, settle the ledger row as rejected and stop blocking.
+        """
+        cancel = self.cancel_order(symbol, cid)
+        settled: Any = None
+        if self.settle_unknown_cover_fn is not None:
+            try:
+                settled = self.settle_unknown_cover_fn(cid, "rejected")
+            except Exception as exc:  # noqa: BLE001
+                settled = f"{type(exc).__name__}: {exc}"
+        mem = self._unknown_covers.get(symbol)
+        if mem is not None and mem[0] == cid:
+            self._unknown_covers.pop(symbol, None)
+        log_event(
+            "cover_unknown_expired",
+            symbol=symbol,
+            cid=cid,
+            age_sec=round(age_sec),
+            cancel_status=cancel.get("http_status") if isinstance(cancel, dict) else None,
+            settled=settled,
+        )
 
     def submit(self, intent: TradeIntent) -> ExecutionResult:
         with order_lock:

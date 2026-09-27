@@ -379,7 +379,9 @@ def _make_live_runner(args: argparse.Namespace, settings, ledger: Ledger, broker
             return fetch(ttl=0)
 
         if hasattr(broker, "unknown_cover_cids_fn"):
-            broker.unknown_cover_cids_fn = ledger.unknown_cover_cids
+            broker.unknown_cover_cids_fn = ledger.unknown_cover_rows
+        if hasattr(broker, "settle_unknown_cover_fn"):
+            broker.settle_unknown_cover_fn = ledger.mark_order_final_by_cid
         reconciler = Reconciler(
             broker,
             ledger,
