@@ -71,3 +71,48 @@ def test_ledger_end_to_end(tmp_path) -> None:
     with ledger._connect() as conn:
         final = conn.execute("SELECT final_status FROM orders WHERE client_order_id = ?", (cid,)).fetchone()[0]
     assert final == "rejected"
+
+
+def test_old_cover_that_filled_is_not_settled_as_rejected() -> None:
+    # The exchange filled the "unknown" cover: settling it as rejected would
+    # drop its fill and PnL from the ledger for good.
+    ex = Exchange()
+    ex.orders["jf_old"] = (200, {"orderId": 5, "status": "FILLED", "executedQty": "1", "avgPrice": "98"})
+    ex.post_answers = [REDUCE_ONLY_REJECTED, FILLED]
+    broker = _broker(ex)
+    settled: list[tuple[str, str]] = []
+    broker.unknown_cover_cids_fn = lambda symbol: [("jf_old", OLD)]
+    broker.settle_unknown_cover_fn = lambda cid, status: settled.append((cid, status))
+    result = broker.submit(_cover("jc_new"))
+    assert result.status == "filled"  # no longer blocks
+    assert settled == []  # left open for the reconciler to record the fill
+    assert not any(m == "DELETE" and p.get("origClientOrderId") == "jf_old" for m, _path, p in ex.calls)
+
+
+def test_old_cover_query_error_keeps_blocking() -> None:
+    ex = Exchange()
+    ex.orders["jf_old"] = (0, {"error": "timeout"})
+    ex.post_answers = [REDUCE_ONLY_REJECTED]
+    broker = _broker(ex)
+    settled: list[tuple[str, str]] = []
+    broker.unknown_cover_cids_fn = lambda symbol: [("jf_old", OLD)]
+    broker.settle_unknown_cover_fn = lambda cid, status: settled.append((cid, status))
+    result = broker.submit(_cover("jc_new"))
+    assert result.detail["error"] == "cover_submit_unknown"
+    assert settled == []
+
+
+def test_reconciler_still_sees_unknown_close_older_than_lookback(tmp_path) -> None:
+    ex = Exchange()
+    ex.post_answers = [REDUCE_ONLY_REJECTED, (503, {"error": "down"})]
+    broker = _broker(ex)
+    ledger = Ledger(tmp_path / "l.sqlite")
+    intent = _cover("jc_s1")
+    first = broker.submit(intent)
+    _record(ledger, intent, first)
+    old_ts = (datetime.now(timezone.utc) - timedelta(hours=100)).isoformat()
+    with ledger._connect() as conn:
+        conn.execute("UPDATE orders SET ts = ?", (old_ts,))
+        conn.commit()
+    since = datetime.now(timezone.utc) - timedelta(hours=72)
+    assert [r["client_order_id"] for r in ledger.pending_orders(since)] == [first.client_order_id]

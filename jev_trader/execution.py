@@ -806,7 +806,8 @@ class BinanceFuturesBroker:
                 log_event("cover_guard_error", symbol=sym, error=f"{type(exc).__name__}: {exc}")
         for cid, since in cids.items():
             if ages.get(cid, 0.0) >= self.cover_unknown_max_age_sec:
-                self._expire_unknown_cover(sym, cid, ages[cid])
+                if self._expire_unknown_cover(sym, cid, ages[cid]):
+                    return cid
                 continue
             status, body = self.query_order(sym, cid)
             if 200 <= status < 300 and isinstance(body, dict) and body.get("orderId") is not None:
@@ -828,17 +829,44 @@ class BinanceFuturesBroker:
             return cid
         return None
 
-    def _expire_unknown_cover(self, symbol: str, cid: str, age_sec: float) -> None:
+    def _expire_unknown_cover(self, symbol: str, cid: str, age_sec: float) -> bool:
         """Terminal path for a cover that stayed submit_unknown past the max age.
 
-        A plain MARKET BUY does not rest for days: cancel by cid in case it
-        somehow does, settle the ledger row as rejected and stop blocking.
+        Ask the exchange first: a cover that did fill must not be settled as
+        rejected (its fill and PnL would never reach the ledger). It stays
+        open for the reconciler, which records the fill from the order. Only a
+        cover the exchange does not know (or that ended with nothing executed)
+        is cancelled by cid and settled. Returns True while it still blocks.
         """
-        cancel = self.cancel_order(symbol, cid)
+        q_status, q_body = self.query_order(symbol, cid)
+        found = 200 <= q_status < 300 and isinstance(q_body, dict) and q_body.get("orderId") is not None
+        settle_as: str | None = None
+        cancel: Any = None
+        if found:
+            ostatus = str(q_body.get("status") or "").upper()
+            if ostatus in {"NEW", "PARTIALLY_FILLED"}:
+                self.cancel_order(symbol, cid)
+                log_event("cover_unknown_expired_resting", symbol=symbol, cid=cid, status=ostatus)
+                return True
+            if order_executed_qty(q_body) > 0:
+                # Filled: not blocking, but the ledger still owes this fill.
+                log_event("cover_unknown_expired_filled", symbol=symbol, cid=cid, status=ostatus, executed=q_body.get("executedQty"))
+                mem = self._unknown_covers.get(symbol)
+                if mem is not None and mem[0] == cid:
+                    self._unknown_covers.pop(symbol, None)
+                return False
+            settle_as = ostatus.lower() or "rejected"
+        elif order_not_found(q_body):
+            cancel = self.cancel_order(symbol, cid)
+            settle_as = "rejected"
+        else:
+            # The query itself failed: cannot tell, keep blocking.
+            log_event("cover_unknown_expired_query_error", symbol=symbol, cid=cid, http_status=q_status, body=q_body)
+            return True
         settled: Any = None
         if self.settle_unknown_cover_fn is not None:
             try:
-                settled = self.settle_unknown_cover_fn(cid, "rejected")
+                settled = self.settle_unknown_cover_fn(cid, settle_as)
             except Exception as exc:  # noqa: BLE001
                 settled = f"{type(exc).__name__}: {exc}"
         mem = self._unknown_covers.get(symbol)
@@ -849,9 +877,11 @@ class BinanceFuturesBroker:
             symbol=symbol,
             cid=cid,
             age_sec=round(age_sec),
+            settled_as=settle_as,
             cancel_status=cancel.get("http_status") if isinstance(cancel, dict) else None,
             settled=settled,
         )
+        return False
 
     def submit(self, intent: TradeIntent) -> ExecutionResult:
         with order_lock:

@@ -535,14 +535,15 @@ class Ledger:
         """Orders whose outcome the exchange still has to tell us, oldest first.
 
         buy_long that were resting (working / accepted) or whose submit timed
-        out, and closes whose submit timed out. Rows already settled or with a
+        out, and closes whose submit timed out (at any age: a close that did
+        fill must reach the ledger, however late). Rows already settled or with a
         fill under the same clientOrderId are excluded.
         """
         with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT o.* FROM orders o
-                WHERE o.ts >= ?
+                WHERE (o.ts >= ? OR (o.action = 'close' AND o.status = 'submit_unknown'))
                   AND o.final_status IS NULL
                   AND (
                     (o.action = 'buy_long'
