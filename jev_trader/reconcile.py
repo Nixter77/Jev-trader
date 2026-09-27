@@ -138,6 +138,7 @@ class Reconciler:
         max_enrich_per_pass: int = 10,
         max_pending_per_pass: int = 25,
         budget_sec: float = 5.0,
+        detect_reserve_sec: float = 1.5,
         submit_unknown_grace_sec: float = 300.0,
         close_miss_reset_sec: float = 1800.0,
         min_backoff_sec: float = 10.0,
@@ -160,6 +161,9 @@ class Reconciler:
         # Resting entries with a partial fill whose closePosition stop is armed.
         self._partial_armed: set[str] = set()
         self.budget_sec = float(budget_sec)
+        # Held back from pending / enrich so close detection always gets a turn.
+        self.detect_reserve_sec = max(0.0, min(float(detect_reserve_sec), self.budget_sec / 2.0))
+        self._reserve = 0.0
         self.submit_unknown_grace_sec = float(submit_unknown_grace_sec)
         self.close_miss_reset_sec = float(close_miss_reset_sec)
         # cid -> monotonic time of its last close-detect miss.
@@ -200,8 +204,11 @@ class Reconciler:
         try:
             # Enrich before detecting closes so an exchange close sees the entry fee.
             for step in (self._resolve_pending, self._enrich_fills, self._detect_exchange_closes):
+                self._reserve = 0.0 if step == self._detect_exchange_closes else self.detect_reserve_sec
                 if self._out_of_time(summary):
-                    break
+                    if step == self._detect_exchange_closes:
+                        break
+                    continue
                 try:
                     step(now, summary)
                 except _Halt as halt:
@@ -214,6 +221,7 @@ class Reconciler:
                     log_event("reconcile_error", error=error)
         finally:
             self._deadline = float("inf")
+            self._reserve = 0.0
         if not halted:
             self._backoff = 0.0
         if summary["entries"] or summary["closes"] or summary["cancelled"] or summary["stops"]:
@@ -230,7 +238,7 @@ class Reconciler:
     # --- budget / backoff ----------------------------------------------------
 
     def _time_left(self) -> float:
-        return self._deadline - time.monotonic()
+        return self._deadline - self._reserve - time.monotonic()
 
     def _out_of_time(self, summary: dict[str, Any]) -> bool:
         if self._time_left() > 0:

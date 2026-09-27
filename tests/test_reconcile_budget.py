@@ -215,3 +215,28 @@ def test_no_stop_arming_during_ip_ban(tmp_path) -> None:
     summary = _rec(ledger, broker).run_once()
     assert summary["halted"]["http_status"] == 418
     assert broker.stops == []
+
+
+def test_detect_keeps_its_reserve_when_pending_is_slow(tmp_path) -> None:
+    ledger = Ledger(tmp_path / "l.sqlite")
+
+    class SlowBroker(FakeBroker):
+        def query_order(self, symbol, cid=None, *, order_id=None):
+            time.sleep(0.05)
+            return super().query_order(symbol, cid, order_id=order_id)
+
+    broker = SlowBroker()
+    for i in range(10):
+        _record_entry(ledger, broker, f"jev1_{i}", 10 + i)
+    rec = _rec(ledger, broker, budget_sec=0.4, detect_reserve_sec=0.2)
+    ran: list[float] = []
+    rec._detect_exchange_closes = lambda now, summary: ran.append(rec._time_left())  # type: ignore[method-assign]
+    summary = rec.run_once()
+    assert summary.get("budget_exhausted") is True
+    assert broker.queries < 10
+    assert len(ran) == 1 and ran[0] > 0.1  # detect still ran, with most of its reserve
+
+
+def test_detect_reserve_is_capped_at_half_the_budget(tmp_path) -> None:
+    rec = _rec(Ledger(tmp_path / "l.sqlite"), FakeBroker(), budget_sec=2.0, detect_reserve_sec=5.0)
+    assert rec.detect_reserve_sec == 1.0
