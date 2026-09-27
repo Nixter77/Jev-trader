@@ -1095,6 +1095,10 @@ class BinanceFuturesBroker:
         return cancelled
 
     def _close_stop_open(self, symbol: str) -> bool:
+        return bool(self._close_stops(symbol))
+
+    def _close_stops(self, symbol: str, order_side: str | None = None) -> list[dict[str, Any]] | None:
+        """Open closePosition STOP/STOP_MARKET orders (None if the query failed)."""
         status, data = self._request(
             "GET",
             "/fapi/v1/openOrders",
@@ -1102,16 +1106,40 @@ class BinanceFuturesBroker:
             signed=True,
         )
         if not (200 <= status < 300) or not isinstance(data, list):
-            return False
+            return None
+        rows: list[dict[str, Any]] = []
         for row in data:
             if not isinstance(row, dict):
                 continue
             if str(row.get("type") or "") not in CLOSE_STOP_TYPES:
                 continue
             flag = row.get("closePosition")
-            if flag is True or str(flag).lower() == "true":
-                return True
-        return False
+            if not (flag is True or str(flag).lower() == "true"):
+                continue
+            side = str(row.get("side") or "").upper()
+            if order_side and side and side != order_side.upper():
+                continue
+            rows.append(row)
+        return rows
+
+    def _stop_matches(self, row: dict[str, Any], target: float, tick: float) -> bool:
+        try:
+            have = float(row.get("stopPrice"))
+        except (TypeError, ValueError):
+            return True  # cannot compare: do not churn the stop
+        if have <= 0:
+            return True
+        tol = tick / 2.0 if tick > 0 else max(1e-9, abs(target) * 1e-9)
+        return abs(have - target) <= tol
+
+    def _cancel_row(self, symbol: str, row: dict[str, Any]) -> dict[str, Any]:
+        params: dict[str, Any] = {"symbol": symbol.upper()}
+        if row.get("orderId") is not None:
+            params["orderId"] = row.get("orderId")
+        else:
+            params["origClientOrderId"] = row.get("clientOrderId")
+        status, data = self._request("DELETE", "/fapi/v1/order", params=params, signed=True)
+        return {"http_status": status, "body": data}
 
     def ensure_stop_market(
         self,
@@ -1120,11 +1148,53 @@ class BinanceFuturesBroker:
         stop_price: float,
         order_side: str = "SELL",
     ) -> dict[str, Any]:
-        """Place a close-all stop if the exchange does not already have one."""
+        """Make the exchange's close-all stop sit at `stop_price`.
+
+        A closePosition stop at another price (left from an earlier position
+        or an older plan) is replaced. Binance keeps one closePosition stop
+        per direction (-4130), so it cannot be placed-then-swapped: the old
+        one is cancelled and the new one sent right after. If the new one is
+        refused, the old one is put back so the long is never left bare.
+        """
         with order_lock:
-            if self._close_stop_open(symbol):
+            stops = self._close_stops(symbol, order_side)
+            if stops is None:
+                # Could not list orders: try to place; a duplicate is refused.
+                return self.place_stop_market(symbol, stop_price=stop_price, order_side=order_side)
+            if not stops:
+                return self.place_stop_market(symbol, stop_price=stop_price, order_side=order_side)
+            flt = self.filters_for(symbol)
+            tick = float(flt.get("tickSize") or 0.0) if flt else 0.0
+            target = round_to_step(stop_price, flt["tickSize"]) if tick > 0 else float(stop_price)
+            if any(self._stop_matches(row, target, tick) for row in stops):
                 return {"http_status": 200, "body": {"skipped": "stop_exists"}, "stop_price": stop_price}
-            return self.place_stop_market(symbol, stop_price=stop_price, order_side=order_side)
+            old_prices = [row.get("stopPrice") for row in stops]
+            cancels = [self._cancel_row(symbol, row) for row in stops]
+            res = self.place_stop_market(symbol, stop_price=stop_price, order_side=order_side)
+            http_status = res.get("http_status")
+            ok = isinstance(http_status, int) and 200 <= http_status < 300
+            res["replaced"] = {"old_stop_prices": old_prices, "cancels": cancels}
+            if ok:
+                log_event("stop_replaced", symbol=symbol, old=old_prices, new=target)
+                return res
+            restore: dict[str, Any] | None = None
+            try:
+                old = float(old_prices[0])
+            except (TypeError, ValueError, IndexError):
+                old = 0.0
+            if old > 0:
+                restore = self.place_stop_market(symbol, stop_price=old, order_side=order_side)
+            res["restored_old_stop"] = restore
+            log_event(
+                "stop_replace_failed",
+                symbol=symbol,
+                old=old_prices,
+                new=target,
+                http_status=http_status,
+                body=res.get("body"),
+                restore=restore,
+            )
+            return res
 
     def place_stop_market(
         self,
