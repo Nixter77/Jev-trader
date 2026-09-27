@@ -411,8 +411,9 @@ class Reconciler:
                 # Cancel did not land; try again next pass.
                 return
         executed = order_executed_qty(body)
+        deferred: _Halt | None = None
         if executed > 0:
-            recorded = self._record_order_fill(row, body, summary)
+            recorded, deferred = self._record_order_fill(row, body, summary)
             if recorded is not None and row["action"] == "buy_long":
                 # Rows go newest first: keep the newest fill per symbol.
                 armed.setdefault(symbol, recorded)
@@ -424,6 +425,10 @@ class Reconciler:
             )
         self._partial_armed.discard(cid)
         summary["final"].append({"cid": cid, "status": ostatus.lower(), "executed": executed})
+        if deferred is not None:
+            # The entry fill is written from the order body and its stop arms
+            # in _resolve_pending; the halt still stops the rest of the pass.
+            raise deferred
 
     def _arm_partial(self, symbol: str, cid: str, body: dict[str, Any], summary: dict[str, Any]) -> str:
         """closePosition stop for a still-resting entry with executedQty > 0."""
@@ -475,16 +480,28 @@ class Reconciler:
 
     def _record_order_fill(
         self, row: dict[str, Any], body: dict[str, Any], summary: dict[str, Any]
-    ) -> dict[str, Any] | None:
+    ) -> tuple[dict[str, Any] | None, _Halt | None]:
+        """(fill entry or None, halt deferred until the fill is written)."""
         symbol = str(row["symbol"]).upper()
         cid = str(row["client_order_id"])
         order_id = body.get("orderId")
-        trades = self._trades_for_order(symbol, order_id)
+        deferred: _Halt | None = None
+        try:
+            trades = self._trades_for_order(symbol, order_id)
+        except _Halt as halt:
+            # A filled entry is a live long: waiting out the backoff for its
+            # trades would leave it without a stop. Write the fill from the
+            # order body (avgPrice / executedQty); enrichment adds the fee later.
+            if str(row["action"]) != "buy_long" or order_fill_price(body) is None:
+                raise
+            log_event("reconcile_fill_from_order_body", symbol=symbol, cid=cid, halt=halt.what, http_status=halt.status)
+            trades = []
+            deferred = halt
         agg = summarize_trades(trades)
         if agg is None:
             price = order_fill_price(body)
             if price is None:
-                return None
+                return None, deferred
             when = body.get("updateTime") or body.get("time")
             agg = {
                 "qty": order_executed_qty(body),
@@ -516,10 +533,12 @@ class Reconciler:
                 fee_unaccounted=self._fee_unaccounted(symbol, cid, agg),
             )
         if not ok:
-            return None
+            return None, deferred
         entry = {"cid": cid, "symbol": symbol, "action": action, "qty": agg["qty"], "price": agg["price"], "ts": ts}
+        if deferred is not None:
+            entry["fee_pending"] = True
         (summary["entries"] if action == "buy_long" else summary["closes"]).append(entry)
-        return entry
+        return entry, deferred
 
     def _after_entry_fills(self, armed: dict[str, dict[str, Any]], summary: dict[str, Any]) -> None:
         """Wallet sync + exchange stop right after a confirmed entry fill."""

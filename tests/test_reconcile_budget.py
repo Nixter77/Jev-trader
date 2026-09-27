@@ -73,6 +73,7 @@ def test_transport_error_on_user_trades_halts_detect(tmp_path) -> None:
     broker = FakeBroker()
     _record_entry(ledger, broker, "jev1_a", 11)
     broker.orders["jev1_a"].update(status="FILLED", executedQty="1", avgPrice="100")
+    broker.long(1.0)
 
     def boom(symbol, **kw):
         raise ExchangeHTTPError("userTrades", 0, {"error": "timed out"})
@@ -80,7 +81,43 @@ def test_transport_error_on_user_trades_halts_detect(tmp_path) -> None:
     broker.user_trades = boom  # type: ignore[method-assign]
     summary = _rec(ledger, broker).run_once()
     assert summary["halted"]["what"] == "user_trades"
-    # Not marked final: the fill is fetched again after the backoff.
+    # A FILLED entry is a live long: the fill is written from the order body
+    # (fee later, via enrichment) and its stop arms despite the halt.
+    assert ledger.pending_orders(datetime.now(timezone.utc) - timedelta(hours=1)) == []
+    fills = _fills(ledger)
+    assert len(fills) == 1 and fills[0]["qty"] == 1.0 and fills[0]["price"] == 100.0
+    assert fills[0]["commission_usdt"] is None
+    assert summary["entries"][0]["fee_pending"] is True
+    assert summary["stops"] and summary["stops"][0]["armed"] is True
+    assert broker.stops == [(SYM, 95.0)]
+
+
+def test_transport_error_on_user_trades_for_close_stays_pending(tmp_path) -> None:
+    from jev_trader.models import CycleResult, ExecutionResult, market_close_intent
+
+    ledger = Ledger(tmp_path / "l.sqlite")
+    broker = FakeBroker()
+    intent = market_close_intent(symbol=SYM, qty=1.0, order_side="SELL", client_order_id="jc1_a", risk_event=None)
+    ledger.record(
+        CycleResult(
+            action="close",
+            skip_reason=None,
+            intent=intent,
+            execution=ExecutionResult(status="submit_unknown", venue="binance_testnet", client_order_id="jc1_a", reduce_only=True, detail={}),
+            judgment=None,
+            state_text="",
+            state={"symbol": SYM},
+        )
+    )
+    broker.orders["jc1_a"] = {"orderId": 12, "status": "FILLED", "executedQty": "1", "avgPrice": "101", "symbol": SYM}
+
+    def boom(symbol, **kw):
+        raise ExchangeHTTPError("userTrades", 0, {"error": "timed out"})
+
+    broker.user_trades = boom  # type: ignore[method-assign]
+    summary = _rec(ledger, broker).run_once()
+    assert summary["halted"]["what"] == "user_trades"
+    # A close needs its trades for PnL: stays pending until after the backoff.
     assert len(ledger.pending_orders(datetime.now(timezone.utc) - timedelta(hours=1))) == 1
     assert _fills(ledger) == []
 
