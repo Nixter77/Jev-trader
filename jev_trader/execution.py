@@ -457,6 +457,9 @@ class BinanceFuturesBroker:
         # cid and settle it via settle_unknown_cover_fn(cid, status).
         self.cover_unknown_max_age_sec = 72 * 3600.0
         self.settle_unknown_cover_fn: Callable[[str, str], Any] | None = None
+        # Symbols whose close filled while positions could not be read: their
+        # leftover stops are cleared by the reconciler once the book is known.
+        self.stop_sweep_pending: set[str] = set()
 
     def sync_time(self) -> int:
         status, data = self._request("GET", "/fapi/v1/time", signed=False)
@@ -1014,6 +1017,13 @@ class BinanceFuturesBroker:
                 # remainder may exist and keeps its stop.
                 if 0 < filled_qty < qty:
                     self.cancel_open_orders(intent.symbol)
+                else:
+                    # Full fill of the last known qty: flat only if the fresh
+                    # positions list says so; otherwise the reconciler retries.
+                    check = self.clear_stops_if_flat(intent.symbol)
+                    detail["flat_check"] = check
+                    if check.get("cleared"):
+                        detail["stop_cleared"] = True
             elif intent.reduce_only and _close_fully_filled(data, filled_qty, qty, flt):
                 self.cancel_open_orders(intent.symbol)
                 detail["stop_cleared"] = True
@@ -1349,6 +1359,39 @@ class BinanceFuturesBroker:
             for row in temps
             if keep is None or str(row.get("clientOrderId") or "") != keep
         ]
+
+    def clear_stops_if_flat(self, symbol: str) -> dict[str, Any]:
+        """Cancel leftover close stops (closePosition and temporary) once the symbol is flat.
+
+        Checked against a fresh positions list under order_lock. Unknown
+        positions or orders keep the stops and leave the symbol queued in
+        `stop_sweep_pending` for the reconciler's next pass.
+        """
+        sym = symbol.upper()
+        with order_lock:
+            try:
+                pos = self._live_position(sym)
+            except PositionsUnknown:
+                self.stop_sweep_pending.add(sym)
+                return {"kept": "positions_unknown"}
+            if pos is not None:
+                self.stop_sweep_pending.discard(sym)
+                return {"kept": "position"}
+            rows = self._open_orders(sym)
+            if rows is None:
+                self.stop_sweep_pending.add(sym)
+                return {"kept": "orders_unknown"}
+            stale = self._close_stops_from(rows) + self._temp_stops_from(rows)
+            cancels = [self._cancel_row(sym, row) for row in stale]
+            self.stop_sweep_pending.discard(sym)
+            if cancels:
+                log_event(
+                    "flat_stop_cleared",
+                    symbol=sym,
+                    stops=[r.get("stopPrice") for r in stale],
+                    statuses=[c.get("http_status") for c in cancels],
+                )
+            return {"cleared": len(cancels), "cancels": cancels}
 
     def ensure_stop_market(
         self,

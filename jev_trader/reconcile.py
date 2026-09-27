@@ -338,7 +338,20 @@ class Reconciler:
 
     # --- 1. pending orders ---------------------------------------------------
 
+    def _clear_flat_stops(self, symbol: str, summary: dict[str, Any]) -> None:
+        clear = getattr(self.broker, "clear_stops_if_flat", None)
+        if clear is None:
+            return
+        out = clear(symbol)
+        if isinstance(out, dict) and out.get("cleared"):
+            summary["stops"].append({"symbol": symbol, "flat_cleared": out.get("cleared")})
+
     def _resolve_pending(self, now: datetime, summary: dict[str, Any]) -> None:
+        # Closes that filled while positions were unknown: retry the flat check.
+        for sym in sorted(getattr(self.broker, "stop_sweep_pending", ()) or ()):
+            if self._out_of_time(summary):
+                break
+            self._clear_flat_stops(sym, summary)
         rows = self.ledger.pending_orders(now - timedelta(seconds=self.lookback_sec))
         # Newest first: a fresh maker fill needs its stop now; old leftovers can
         # wait for the next pass.
@@ -446,6 +459,10 @@ class Reconciler:
             )
         self._partial_armed.discard(cid)
         summary["final"].append({"cid": cid, "status": ostatus.lower(), "executed": executed})
+        if row["action"] == "close" and executed > 0:
+            # A blind / unknown close that filled may have flattened the book:
+            # its old stop must not sit on an empty symbol.
+            self._clear_flat_stops(symbol, summary)
         if deferred is not None:
             # The entry fill is written from the order body and its stop arms
             # in _resolve_pending; the halt still stops the rest of the pass.
