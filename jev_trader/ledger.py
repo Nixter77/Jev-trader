@@ -8,6 +8,7 @@ from typing import Any
 
 from jev_trader.execution import fill_price, fill_qty, is_real_fill, wallet_positions_known
 from jev_trader.models import CycleResult, ExecutionResult, JevJudgment, Position, TradeIntent
+from jev_trader.status import log_event
 
 
 def _now() -> str:
@@ -128,6 +129,45 @@ class Ledger:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_cid ON orders(client_order_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_ts ON orders(ts)")
             conn.commit()
+        self._ensure_unique_fill_eid()
+
+    def _ensure_unique_fill_eid(self) -> None:
+        """One fill per exchange order (orderIds are per symbol on Binance).
+
+        Old duplicates block the index: then only log, never fail startup.
+        """
+        try:
+            with self._connect() as conn:
+                have = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'uq_fills_sym_eid'"
+                ).fetchone()
+                if have is not None:
+                    return
+                dups = conn.execute(
+                    """
+                    SELECT symbol, exchange_order_id, COUNT(*) AS n FROM fills
+                    WHERE exchange_order_id IS NOT NULL
+                    GROUP BY symbol, exchange_order_id HAVING COUNT(*) > 1
+                    LIMIT 20
+                    """
+                ).fetchall()
+                if dups:
+                    log_event(
+                        "ledger_fill_eid_duplicates",
+                        path=str(self.path),
+                        duplicates=[dict(r) for r in dups],
+                        index="not_created",
+                    )
+                    return
+                conn.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_fills_sym_eid
+                    ON fills(symbol, exchange_order_id) WHERE exchange_order_id IS NOT NULL
+                    """
+                )
+                conn.commit()
+        except sqlite3.Error as exc:
+            log_event("ledger_fill_eid_index_error", path=str(self.path), error=f"{type(exc).__name__}: {exc}")
 
     def _ensure_column(
         self, conn: sqlite3.Connection, table: str, column: str, decl: str
@@ -323,15 +363,8 @@ class Ledger:
             stop_price = None
         else:
             return
-        conn.execute(
-            """
-            INSERT INTO fills (
-                ts, client_order_id, symbol, action, position_side, qty, price,
-                venue, realized_pnl_usdt, cash_usdt, exchange_order_id, source,
-                pnl_source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'bot', ?)
-            """,
-            (
+        try:
+            self._insert_bot_fill(conn, (
                 _now(),
                 intent.client_order_id,
                 symbol,
@@ -344,8 +377,12 @@ class Ledger:
                 cash,
                 _exchange_order_id(execution),
                 None if pnl is None else "local",
-            ),
-        )
+            ))
+        except sqlite3.IntegrityError as exc:
+            # Same exchange order already settled: a second row would count
+            # its PnL twice. The statement is aborted, the transaction goes on.
+            log_event("ledger_fill_duplicate", symbol=symbol, eid=eid, error=str(exc))
+            return
         self._upsert_position(
             conn,
             symbol=symbol,
@@ -525,6 +562,19 @@ class Ledger:
                 return True
         return False
 
+    @staticmethod
+    def _insert_bot_fill(conn: sqlite3.Connection, values: tuple[Any, ...]) -> None:
+        conn.execute(
+            """
+            INSERT INTO fills (
+                ts, client_order_id, symbol, action, position_side, qty, price,
+                venue, realized_pnl_usdt, cash_usdt, exchange_order_id, source,
+                pnl_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'bot', ?)
+            """,
+            values,
+        )
+
     def record_exchange_fill(
         self,
         *,
@@ -549,6 +599,35 @@ class Ledger:
         only adds its PnL to the running totals. Returns False on a duplicate.
         """
         symbol = symbol.upper()
+        try:
+            return self._record_exchange_fill(
+                ts=ts, client_order_id=client_order_id, exchange_order_id=exchange_order_id,
+                symbol=symbol, action=action, qty=qty, price=price, venue=venue,
+                commission_usdt=commission_usdt, gross_pnl_usdt=gross_pnl_usdt,
+                funding_usdt=funding_usdt, net_pnl_usdt=net_pnl_usdt, fee_unaccounted=fee_unaccounted,
+            )
+        except sqlite3.IntegrityError as exc:
+            # The connection context rolled back the PnL update with the insert.
+            log_event("ledger_fill_duplicate", symbol=symbol, eid=exchange_order_id, cid=client_order_id, error=str(exc))
+            return False
+
+    def _record_exchange_fill(
+        self,
+        *,
+        ts: str,
+        client_order_id: str,
+        exchange_order_id: Any,
+        symbol: str,
+        action: str,
+        qty: float,
+        price: float,
+        venue: str,
+        commission_usdt: float | None,
+        gross_pnl_usdt: float | None,
+        funding_usdt: float | None,
+        net_pnl_usdt: float | None,
+        fee_unaccounted: bool,
+    ) -> bool:
         with self._connect() as conn:
             if self._has_fill(conn, client_order_id, exchange_order_id):
                 return False
@@ -647,6 +726,31 @@ class Ledger:
         For a close the net PnL replaces realized_pnl_usdt and the running
         position totals move by the difference.
         """
+        try:
+            self._apply_exchange_enrichment(
+                fill_id, exchange_order_id=exchange_order_id, price=price, qty=qty,
+                commission_usdt=commission_usdt, gross_pnl_usdt=gross_pnl_usdt,
+                funding_usdt=funding_usdt, net_pnl_usdt=net_pnl_usdt, fee_unaccounted=fee_unaccounted,
+            )
+        except sqlite3.IntegrityError as exc:
+            # Another row already owns this exchange order: leave both alone,
+            # count the try so it is not retried forever.
+            log_event("ledger_enrich_duplicate", fill_id=int(fill_id), eid=exchange_order_id, error=str(exc))
+            self.bump_enrich_tries(int(fill_id))
+
+    def _apply_exchange_enrichment(
+        self,
+        fill_id: int,
+        *,
+        exchange_order_id: Any,
+        price: float,
+        qty: float,
+        commission_usdt: float,
+        gross_pnl_usdt: float | None,
+        funding_usdt: float | None,
+        net_pnl_usdt: float | None,
+        fee_unaccounted: bool,
+    ) -> None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM fills WHERE id = ?", (int(fill_id),)).fetchone()
             if row is None:
