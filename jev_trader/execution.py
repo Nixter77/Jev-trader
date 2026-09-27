@@ -815,7 +815,14 @@ class BinanceFuturesBroker:
         if blocked is not None:
             return blocked
         blind_close = False
+        limits_cleared = False
         if intent.reduce_only and intent.action == "close" and intent.entry_type == "MARKET":
+            # Drop resting entry limits before reading the live size: an entry
+            # that fills between that read and the close would outgrow the
+            # close qty, and the "full" fill would then strip the remainder's
+            # stop. Stops are left alone (a blind close keeps them too).
+            self.cancel_open_limits(intent.symbol)
+            limits_cleared = True
             aligned = self._align_reduce_close(intent)
             if isinstance(aligned, ExecutionResult):
                 if not (_is_positions_unknown(aligned) and blind_close_allowed(intent)):
@@ -887,7 +894,8 @@ class BinanceFuturesBroker:
             # A reduce-only close and the closePosition stop can coexist: drop
             # only resting limits now; the stop goes after a confirmed full
             # fill, so a rejected / unknown / partial close stays protected.
-            self.cancel_open_limits(intent.symbol)
+            if not limits_cleared:
+                self.cancel_open_limits(intent.symbol)
         elif intent.entry_type == "MARKET":
             self.cancel_open_orders(intent.symbol)
         else:
