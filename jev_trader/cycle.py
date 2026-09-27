@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import time
 from dataclasses import replace
@@ -200,14 +201,40 @@ def model_skipped_intent(
 STOP_UNPROTECTED = "stop_unprotected"
 
 
+def _stored_stop(ledger: Any, symbol: str) -> float | None:
+    fn = getattr(ledger, "stored_stop", None)
+    if not callable(fn):
+        return None
+    try:
+        value = fn(symbol)
+    except Exception as exc:  # noqa: BLE001 — a ledger read must not block the stop
+        log_event("ledger_stop_error", symbol=symbol, error=f"{type(exc).__name__}: {exc}")
+        return None
+    return float(value) if value is not None and float(value) > 0 else None
+
+
+def _accepts_kw(fn: Any, name: str) -> bool:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def arm_exchange_stop(
     broker: Any,
     ledger: Ledger | None,
     symbol: str,
     stop_price: float | None,
     detail: dict[str, Any] | None,
+    *,
+    tighten_only: bool = False,
 ) -> Any:
     """Remember the stop and make sure the exchange has a close-all STOP_MARKET.
+
+    tighten_only (the per-cycle protective re-arm): the stop only moves up.
+    A lower recomputed stop keeps the ledger's stored one, and the broker
+    keeps an exchange stop that is already higher.
 
     Returns the broker's answer (None when there is nothing to arm).
     """
@@ -215,6 +242,10 @@ def arm_exchange_stop(
         return None
     price = float(stop_price)
     with order_lock:
+        if tighten_only and ledger is not None:
+            stored = _stored_stop(ledger, symbol)
+            if stored is not None and stored > price:
+                price = stored
         if ledger is not None:
             try:
                 ledger.set_stop(symbol, price)
@@ -223,8 +254,11 @@ def arm_exchange_stop(
         ensure = getattr(broker, "ensure_stop_market", None)
         if not callable(ensure):
             return None
+        kwargs: dict[str, Any] = {"order_side": "SELL"}
+        if tighten_only and _accepts_kw(ensure, "tighten_only"):
+            kwargs["tighten_only"] = True
         try:
-            res = ensure(symbol, stop_price=price, order_side="SELL")
+            res = ensure(symbol, stop_price=price, **kwargs)
         except Exception as exc:  # noqa: BLE001 — fill already happened; surface the miss
             res = {"error": f"{type(exc).__name__}: {exc}"}
         if isinstance(res, dict) and res.get("error"):
@@ -306,9 +340,17 @@ def run_once(
     )
     seen_flatten = current_flatten_generation()
     protective = long_protective_stop(snapshot, features, acct)
+    if protective is not None and ledger is not None:
+        # Ratchet: an ATR stop recomputed while the stored one is not in the
+        # snapshot (e.g. ledger sync keeps failing) must not loosen it.
+        stored = _stored_stop(ledger, snapshot.symbol)
+        if stored is not None and stored > protective:
+            protective = stored
     stop_unprotected = False
     if protective is not None and protective < features.close:
-        armed = arm_exchange_stop(exec_broker, ledger, snapshot.symbol, protective, None)
+        armed = arm_exchange_stop(
+            exec_broker, ledger, snapshot.symbol, protective, None, tighten_only=True
+        )
         # Stop swap refused and the old stop could not be put back: the long
         # has no exchange stop. Close it now instead of asking the model.
         stop_unprotected = isinstance(armed, dict) and bool(armed.get("unprotected"))

@@ -395,6 +395,24 @@ class Ledger:
             stop_price=stop_price,
         )
 
+    def stored_stop(self, symbol: str) -> float | None:
+        """Stop remembered for the open long (None when flat or unset)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT stop_price FROM positions
+                WHERE symbol = ? AND side = 'LONG' AND size > 0
+                """,
+                (symbol.upper(),),
+            ).fetchone()
+        if row is None or row["stop_price"] is None:
+            return None
+        try:
+            value = float(row["stop_price"])
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
     def set_stop(self, symbol: str, stop_price: float) -> None:
         with self._connect() as conn:
             conn.execute(
