@@ -11,7 +11,7 @@ import urllib.parse
 import urllib.request
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from dataclasses import replace
-from typing import Any
+from typing import Any, Callable
 
 from jev_trader.config import (
     LIVE_CONFIRM_VALUE,
@@ -443,6 +443,12 @@ class BinanceFuturesBroker:
         self._filters_loaded = False
         self._fill_poll_attempts = 4
         self._fill_poll_sleep = 0.25
+        # Plain-BUY covers whose submit timed out: symbol -> (cid, monotonic).
+        self._unknown_covers: dict[str, tuple[str, float]] = {}
+        self.cover_unknown_grace_sec = 300.0
+        # Optional ledger lookup (survives restarts): symbol -> cover cids
+        # still in submit_unknown.
+        self.unknown_cover_cids_fn: Callable[[str], list[str]] | None = None
 
     def sync_time(self) -> int:
         status, data = self._request("GET", "/fapi/v1/time", signed=False)
@@ -642,6 +648,20 @@ class BinanceFuturesBroker:
                 reduce_only=False,
                 detail={"error": "qty below LOT_SIZE", "qty": qty, "filters": flt},
             )
+        blocked_by = self._cover_in_flight(intent.symbol)
+        if blocked_by is not None:
+            log_event("cover_blocked_submit_unknown", symbol=intent.symbol, pending_cid=blocked_by)
+            return ExecutionResult(
+                status="rejected",
+                venue=self.venue,
+                client_order_id=intent.client_order_id,
+                reduce_only=False,
+                detail={
+                    "error": "cover_submit_unknown",
+                    "pending_client_order_id": blocked_by,
+                    "fallback": "cover_without_reduce_only",
+                },
+            )
         cid = client_order_id(intent.symbol, "flatten")
         params: dict[str, Any] = {
             "symbol": intent.symbol,
@@ -666,21 +686,36 @@ class BinanceFuturesBroker:
                 # submit_unknown: it counts in the hourly cap and the
                 # reconciler settles it after its grace window.
                 self.invalidate_wallet()
+                self._unknown_covers[intent.symbol.upper()] = (cid, time.monotonic())
                 return ExecutionResult(
                     status="submit_unknown",
                     venue=self.venue,
                     client_order_id=cid,
                     reduce_only=False,
-                    detail={"http_status": status, "body": data, "error": "submit_unknown", "resolved": "not_found_yet"},
+                    detail={
+                        "http_status": status,
+                        "body": data,
+                        "error": "submit_unknown",
+                        "resolved": "not_found_yet",
+                        "fallback": "cover_without_reduce_only",
+                        "original_client_order_id": intent.client_order_id,
+                    },
                 )
             else:
                 self.invalidate_wallet()
+                self._unknown_covers[intent.symbol.upper()] = (cid, time.monotonic())
                 return ExecutionResult(
                     status="submit_unknown",
                     venue=self.venue,
                     client_order_id=cid,
                     reduce_only=False,
-                    detail={"http_status": status, "body": data, "error": "submit_unknown"},
+                    detail={
+                        "http_status": status,
+                        "body": data,
+                        "error": "submit_unknown",
+                        "fallback": "cover_without_reduce_only",
+                        "original_client_order_id": intent.client_order_id,
+                    },
                 )
         ok = 200 <= status < 300
         if not ok:
@@ -732,6 +767,44 @@ class BinanceFuturesBroker:
                 "fallback": "cover_without_reduce_only",
             },
         )
+
+    def _cover_in_flight(self, symbol: str) -> str | None:
+        """cid of an earlier plain-BUY cover that may still fill, else None.
+
+        A second cover sent while the first is in submit_unknown can flip the
+        book long if both land.
+        """
+        sym = symbol.upper()
+        cids: dict[str, float | None] = {}
+        mem = self._unknown_covers.get(sym)
+        if mem is not None:
+            cids[mem[0]] = mem[1]
+        if self.unknown_cover_cids_fn is not None:
+            try:
+                for cid in self.unknown_cover_cids_fn(sym) or []:
+                    cids.setdefault(str(cid), None)
+            except Exception as exc:  # noqa: BLE001
+                log_event("cover_guard_error", symbol=sym, error=f"{type(exc).__name__}: {exc}")
+        for cid, since in cids.items():
+            status, body = self.query_order(sym, cid)
+            if 200 <= status < 300 and isinstance(body, dict) and body.get("orderId") is not None:
+                if str(body.get("status") or "").upper() in {"NEW", "PARTIALLY_FILLED"}:
+                    return cid
+                # Final on the exchange; the live position read that follows
+                # already reflects it.
+                if mem is not None and mem[0] == cid:
+                    self._unknown_covers.pop(sym, None)
+                continue
+            if order_not_found(body) and since is not None and time.monotonic() - since >= self.cover_unknown_grace_sec:
+                # Never surfaced within the grace window: cancel by cid in case
+                # it still does, then let a new cover through.
+                self.cancel_order(sym, cid)
+                self._unknown_covers.pop(sym, None)
+                continue
+            # Not found yet (exchange lag), or the query itself failed. Ledger
+            # rows without a local timestamp wait for the reconciler to settle.
+            return cid
+        return None
 
     def submit(self, intent: TradeIntent) -> ExecutionResult:
         with order_lock:

@@ -210,7 +210,7 @@ class Ledger:
                     """,
                     (
                         _now(),
-                        intent.client_order_id,
+                        _order_cid(intent, execution),
                         intent.symbol,
                         intent.action,
                         intent.qty,
@@ -366,7 +366,7 @@ class Ledger:
         try:
             self._insert_bot_fill(conn, (
                 _now(),
-                intent.client_order_id,
+                _order_cid(intent, execution),
                 symbol,
                 result.action,
                 pos_side,
@@ -465,6 +465,24 @@ class Ledger:
         return int(row["n"] if row is not None else 0)
 
     # --- exchange reconciliation -------------------------------------------
+
+    def unknown_cover_cids(self, symbol: str) -> list[str]:
+        """Plain-BUY short covers still in submit_unknown (no fill, not final)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT o.client_order_id FROM orders o
+                WHERE o.symbol = ?
+                  AND o.action = 'close'
+                  AND o.status = 'submit_unknown'
+                  AND o.final_status IS NULL
+                  AND json_extract(o.detail_json, '$.fallback') = ?
+                  AND NOT EXISTS (SELECT 1 FROM fills f WHERE f.client_order_id = o.client_order_id)
+                ORDER BY o.id DESC
+                """,
+                (symbol.upper(), COVER_FALLBACK),
+            ).fetchall()
+        return [str(r[0]) for r in rows]
 
     def pending_orders(self, since: datetime) -> list[dict[str, Any]]:
         """Orders whose outcome the exchange still has to tell us, oldest first.
@@ -1092,6 +1110,26 @@ def _iso_utc(when: datetime) -> str:
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
     return when.astimezone(timezone.utc).isoformat()
+
+
+COVER_FALLBACK = "cover_without_reduce_only"
+
+
+def _order_cid(intent: TradeIntent, execution: ExecutionResult | None) -> str:
+    """The clientOrderId the exchange knows the order by.
+
+    A short cover sent as a plain BUY goes out under its own jf… id; record it
+    under that id so the reconciler can find it (the intent id never existed).
+    """
+    if (
+        execution is not None
+        and execution.client_order_id
+        and execution.client_order_id != intent.client_order_id
+        and isinstance(execution.detail, dict)
+        and execution.detail.get("fallback") == COVER_FALLBACK
+    ):
+        return str(execution.client_order_id)
+    return intent.client_order_id
 
 
 def _exchange_order_id(execution: ExecutionResult | None) -> str | None:
