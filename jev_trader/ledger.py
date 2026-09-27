@@ -454,6 +454,13 @@ class Ledger:
             ts = ts.replace(tzinfo=timezone.utc)
         return max(0.0, (datetime.now(timezone.utc) - ts).total_seconds())
 
+    def count_entries_today(self, now: datetime) -> int:
+        """Buy entries since 00:00 UTC of `now`'s calendar day."""
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        start = now.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        return self.count_entries_since(start)
+
     def count_entries_since(self, since: datetime) -> int:
         """Entries (any symbol) at or after `since` (UTC).
 

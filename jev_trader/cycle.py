@@ -117,7 +117,7 @@ def pre_model_entry_block(
     """Guard that blocks any entry for a flat book, so the model call is wasted.
 
     Order: wallet_unavailable (no wallet this cycle), kill_switch, daily_loss, then
-    entry_guard_skip_reason (no_entry_window, hourly_entry_cap,
+    entry_guard_skip_reason (no_entry_window, hourly_entry_cap, daily_entry_cap,
     loss_streak_pause). An open position returns None (the model still
     decides closes; kill_switch there is a MARKET close from apply_risk).
     """
@@ -378,12 +378,16 @@ def run_once(
     seconds_since_close = None
     seconds_since_entry = None
     entries_last_hour = 0
+    entries_today = 0
     loss_streak = 0
     last_loss_ts = None
     if ledger is not None:
         seconds_since_close = ledger.seconds_since_last_close(snapshot.symbol)
         seconds_since_entry = ledger.seconds_since_last_entry(snapshot.symbol)
         entries_last_hour = ledger.count_entries_since(now - timedelta(hours=1))
+        today_fn = getattr(ledger, "count_entries_today", None)
+        if callable(today_fn):
+            entries_today = int(today_fn(now))
         loss_streak, last_loss_ts = loss_streak_from_closes(
             ledger.recent_close_pnls(limit=64)
         )
@@ -393,6 +397,7 @@ def run_once(
         entries_last_hour=entries_last_hour,
         loss_streak=loss_streak,
         last_loss_ts=last_loss_ts,
+        entries_today=entries_today,
     )
 
     resolved = judgment

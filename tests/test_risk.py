@@ -8,7 +8,7 @@ from jev_trader.features import compute_features
 from jev_trader.jev import judgment_from_dict
 from jev_trader.models import AccountState
 from jev_trader.policy import apply_policy
-from jev_trader.risk import apply_risk, post_only_limit_price
+from jev_trader.risk import apply_risk, post_only_limit_price, qty_after_fee_budget
 from jev_trader.snapshot import build_fixture_snapshot
 
 
@@ -57,7 +57,13 @@ def test_size_from_risk_pct_and_atr_stop_not_jev_probability(market_snapshot) ->
     assert high_p.stop_distance == pytest.approx(stop_distance)
     risk_qty = (10_000.0 * 0.005) / stop_distance
     max_qty = (10_000.0 * 3.0) / features.close
-    assert high_p.qty == pytest.approx(min(risk_qty, max_qty))
+    assert high_p.qty == pytest.approx(
+        qty_after_fee_budget(
+            qty=min(risk_qty, max_qty),
+            price=features.close,
+            risk_amount=10_000.0 * 0.005,
+        )
+    )
     assert high_p.qty != 0.95 * 10_000.0
     assert high_p.entry_type == "LIMIT_POST_ONLY"
     assert high_p.reduce_only is False
@@ -127,8 +133,8 @@ def test_reduce_only_set_on_close() -> None:
     assert intent.reduce_only is True
     assert intent.qty == 0.07
     assert intent.order_side == "SELL"
-    assert intent.entry_type == "MARKET"
-    assert intent.limit_price is None
+    assert intent.entry_type == "LIMIT_POST_ONLY"
+    assert intent.limit_price == post_only_limit_price("SELL", features.close, snapshot)
 
 
 def test_sell_short_while_flat_does_not_open(market_snapshot) -> None:
@@ -209,6 +215,14 @@ def test_stop_hit_flattens_long_even_on_hold() -> None:
     assert intent.entry_type == "MARKET"
     assert intent.reduce_only is True
     assert intent.risk_event == "stop"
+
+
+def test_fee_budget_caps_round_trip_at_15pct_of_risk() -> None:
+    untouched = qty_after_fee_budget(qty=10, price=100, risk_amount=50)
+    assert untouched == pytest.approx(10)
+    shrunk = qty_after_fee_budget(qty=300, price=100, risk_amount=50)
+    assert shrunk == pytest.approx(125)
+    assert shrunk * 100 * 0.0006 == pytest.approx(7.5)
 
 
 def test_limit_price_falls_back_to_last_close_without_book(market_snapshot) -> None:

@@ -15,6 +15,7 @@ from dataclasses import replace
 from jev_trader.cycle import decision_payload, run_once
 from jev_trader.execution import PaperBroker, bump_flatten_generation
 from jev_trader.features import compute_features
+from jev_trader.risk import qty_after_fee_budget
 from jev_trader.jev import judgment_from_dict
 from jev_trader.ledger import Ledger
 from jev_trader.live import (
@@ -268,7 +269,13 @@ def test_run_cycle_sizes_from_binance_wallet_not_paper_10k(
     features = compute_features(market_snapshot)
     risk_qty = (3044.7 * 0.005) / result.intent.stop_distance
     max_qty = (3044.7 * 3.0) / features.close
-    assert result.intent.qty == pytest.approx(min(risk_qty, max_qty))
+    assert result.intent.qty == pytest.approx(
+        qty_after_fee_budget(
+            qty=min(risk_qty, max_qty),
+            price=features.close,
+            risk_amount=3044.7 * 0.005,
+        )
+    )
     assert result.intent.qty * result.intent.stop_distance != pytest.approx(10_000.0 * 0.005)
 
 

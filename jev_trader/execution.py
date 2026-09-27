@@ -270,6 +270,78 @@ def wallet_positions_known(wallet: Any) -> bool:
 BACKOFF_HTTP_STATUSES = frozenset({418, 429})
 
 
+DAY_INCOME_TYPES = ("REALIZED_PNL", "COMMISSION", "FUNDING_FEE")
+DAY_INCOME_PAGE = 1000
+DAY_INCOME_MAX_PAGES = 3
+
+
+def collect_day_income(
+    fetch: Callable[..., tuple[int, Any]], start_ms: int, end_ms: int
+) -> dict[str, Any] | None:
+    """Sum the three income buckets. `fetch(params) -> (status, body)`.
+
+    None on a non-backoff failure. Raises ExchangeHTTPError on backoff.
+    """
+    totals = {name: 0.0 for name in DAY_INCOME_TYPES}
+    page_start = int(start_ms)
+    end_ms = int(end_ms)
+    seen: set[tuple[Any, ...]] = set()
+    truncated = False
+    for page in range(DAY_INCOME_MAX_PAGES):
+        status, data = fetch(
+            {"startTime": page_start, "endTime": end_ms, "limit": DAY_INCOME_PAGE}
+        )
+        if is_backoff_status(status):
+            raise ExchangeHTTPError("income", status, data)
+        if not (200 <= status < 300) or not isinstance(data, list):
+            return None
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            key = (
+                row.get("tranId"),
+                row.get("time"),
+                row.get("incomeType"),
+                row.get("symbol"),
+                row.get("income"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            kind = row.get("incomeType")
+            if kind not in totals:
+                continue
+            try:
+                totals[str(kind)] += float(row.get("income") or 0.0)
+            except (TypeError, ValueError):
+                continue
+        if len(data) < DAY_INCOME_PAGE:
+            break
+        last = 0
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            try:
+                last = max(last, int(row.get("time") or 0))
+            except (TypeError, ValueError):
+                continue
+        if last <= page_start or page == DAY_INCOME_MAX_PAGES - 1:
+            truncated = True
+            break
+        page_start = last + 1
+    realized = totals["REALIZED_PNL"]
+    commission = totals["COMMISSION"]
+    funding = totals["FUNDING_FEE"]
+    return {
+        "realized_usdt": realized,
+        "commission_usdt": commission,
+        "funding_usdt": funding,
+        "net_usdt": realized + commission + funding,
+        "known": not truncated,
+        "truncated": truncated,
+    }
+
+
 def is_backoff_status(status: int) -> bool:
     """Transport error, 5xx, or Binance rate limit / IP ban: stop and back off."""
     return status == 0 or status >= 500 or status in BACKOFF_HTTP_STATUSES
@@ -1156,6 +1228,23 @@ class BinanceFuturesBroker:
         if not (200 <= status < 300) or not isinstance(data, list):
             raise ExchangeHTTPError("userTrades", status, data)
         return [row for row in data if isinstance(row, dict)]
+
+    def day_income(
+        self, start_ms: int, end_ms: int, *, timeout: float = 8.0
+    ) -> dict[str, Any] | None:
+        """UTC-window realized + commission + funding. None if the read failed.
+
+        Raises ExchangeHTTPError on 418 / 429 / 5xx. A truncated window comes
+        back with known=False so the blotter does not treat a partial sum as
+        the day. Stops and closes do not consult this.
+        """
+
+        def fetch(params: dict[str, Any]) -> tuple[int, Any]:
+            return self._request(
+                "GET", "/fapi/v1/income", params=params, signed=True, timeout=timeout
+            )
+
+        return collect_day_income(fetch, start_ms, end_ms)
 
     def funding_income(
         self, symbol: str, start_ms: int, end_ms: int, *, timeout: float = 10.0

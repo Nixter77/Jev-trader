@@ -22,6 +22,7 @@ from jev_trader.cycle import decision_payload, dumps_decision, run_once
 from jev_trader.execution import (
     BinanceFuturesBroker,
     BinanceTestnetBroker,
+    ExchangeHTTPError,
     PaperBroker,
     is_real_fill,
     wallet_positions_known,
@@ -545,6 +546,8 @@ class LiveRunner:
         self.last_decisions: list[dict[str, Any]] = []
         self.last_error: str | None = None
         self.cycles = 0
+        self.day_income: dict[str, Any] | None = None
+        self._income_fetched_at = 0.0
         self.loops = {
             symbol: FiveMinuteCloseLoop(symbol, tf=interval, run_cycle=run_cycle)
             for symbol in self.symbols
@@ -648,6 +651,39 @@ class LiveRunner:
         """Open positions first each poll so management is not starved by Laya latency."""
         return order_symbols_open_first(self.symbols, self._open_priority_symbols())
 
+    def refresh_day_income(self) -> None:
+        """One account income read per 5 minutes. Failure keeps the last snapshot.
+
+        Stops and closes do not wait on this. A missing broker (paper, offline)
+        leaves the blotter on «неизвестно».
+        """
+        if self._offline:
+            return
+        now_m = time.monotonic()
+        if self.day_income is not None and now_m - self._income_fetched_at < 300.0:
+            return
+        broker = getattr(self.reconciler, "broker", None)
+        fetch = getattr(broker, "day_income", None)
+        if not callable(fetch):
+            return
+        start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = datetime.now(timezone.utc)
+        try:
+            snapshot = fetch(int(start.timestamp() * 1000), int(end.timestamp() * 1000))
+        except (ExchangeHTTPError, OSError, TimeoutError) as exc:
+            log_event("day_income_error", error=f"{type(exc).__name__}: {exc}")
+            self._income_fetched_at = now_m
+            return
+        except Exception as exc:  # noqa: BLE001 — the scoreboard must not stop the loop
+            log_event("day_income_error", error=f"{type(exc).__name__}: {exc}")
+            self._income_fetched_at = now_m
+            return
+        self._income_fetched_at = now_m
+        if not isinstance(snapshot, dict):
+            return
+        with self._state_lock:
+            self.day_income = snapshot
+
     def reconcile(self) -> None:
         """Exchange reconciliation (rate-limited inside the reconciler)."""
         rec = self.reconciler
@@ -731,6 +767,7 @@ class LiveRunner:
                 payload = _kline_payload_for_symbol(self.recorded_klines, symbol)
                 take(self.loops[symbol].handle_rest_klines(payload, now_ms=self.now_ms))
             return results
+        self.refresh_day_income()
         for symbol in self._symbols_for_pass():
             if remaining is not None and len(results) >= remaining:
                 break
@@ -803,10 +840,12 @@ class LiveRunner:
             cfg = load_entry_guard_config()
             now = datetime.now(timezone.utc)
             entries_last_hour = 0
+            entries_today = 0
             loss_streak = 0
             last_loss_ts = None
             if self.ledger is not None:
                 entries_last_hour = self.ledger.count_entries_since(now - timedelta(hours=1))
+                entries_today = self.ledger.count_entries_today(now)
                 loss_streak, last_loss_ts = loss_streak_from_closes(
                     self.ledger.recent_close_pnls(limit=64)
                 )
@@ -816,6 +855,7 @@ class LiveRunner:
                 entries_last_hour=entries_last_hour,
                 loss_streak=loss_streak,
                 last_loss_ts=last_loss_ts,
+                entries_today=entries_today,
             ).as_dict()
         except Exception as exc:  # noqa: BLE001 — status must not die on guard math
             log_event("entry_guard_status_error", error=f"{type(exc).__name__}: {exc}")
@@ -825,6 +865,7 @@ class LiveRunner:
             symbols = list(self.symbols)
             decisions = list(self.last_decisions[:30])
             last_error = self.last_error
+            day_income = None if self.day_income is None else dict(self.day_income)
         wallet, day_start, wallet_error = wallet_view(self.wallet_box)
         payload = {
             "ok": True,
@@ -842,10 +883,11 @@ class LiveRunner:
             "wallet": wallet,
             "day_start_equity_usdt": day_start,
             "entry_guards": entry_guards,
+            "day_income": day_income,
             "reconcile": self.last_reconcile,
             "decision_backend": self.decision_backend,
             "laya_checkpoint": self.laya_checkpoint if self.decision_backend == "laya" else None,
-            "hint": "Jev на закрытии 5m. Вход только BUY/лонг; выход MARKET; стоп на бирже.",
+            "hint": "Jev на закрытии 5m. Вход только BUY/лонг пост-онли; выход модели пост-онли; стоп и daily_loss — MARKET.",
         }
         try:
             write_json(self.status_path, payload)

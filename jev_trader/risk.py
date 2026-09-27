@@ -30,8 +30,13 @@ MIN_HOLD_SEC = 900.0
 DEFAULT_NO_ENTRY_WINDOW = "03:00-09:00"
 DEFAULT_NO_ENTRY_TZ = "Asia/Jerusalem"
 DEFAULT_MAX_ENTRIES_PER_HOUR = 2
+DEFAULT_MAX_ENTRIES_PER_DAY = 3
 DEFAULT_LOSS_STREAK_PAUSE_N = 3
 DEFAULT_LOSS_STREAK_PAUSE_MIN = 120.0
+# Maker entry ~2 bps plus a taker stop ~4 bps. The fee budget is a share of
+# the risk budget, so a tight ATR stop cannot size up to 3× notional.
+ROUND_TRIP_FEE_RATE = 0.0006
+FEE_BUDGET_OF_RISK = 0.15
 
 
 @dataclass(frozen=True)
@@ -41,6 +46,7 @@ class EntryGuardConfig:
     no_entry_window: tuple[time, time] | None
     no_entry_tz: str = DEFAULT_NO_ENTRY_TZ
     max_entries_per_hour: int = DEFAULT_MAX_ENTRIES_PER_HOUR
+    max_entries_per_day: int = DEFAULT_MAX_ENTRIES_PER_DAY
     loss_streak_pause_n: int = DEFAULT_LOSS_STREAK_PAUSE_N
     loss_streak_pause_min: float = DEFAULT_LOSS_STREAK_PAUSE_MIN
 
@@ -75,6 +81,8 @@ class EntryGuardState:
     max_entries_per_hour: int = DEFAULT_MAX_ENTRIES_PER_HOUR
     loss_streak_pause_n: int = DEFAULT_LOSS_STREAK_PAUSE_N
     window_label: str = "03:00–09:00 IL"
+    entries_today: int = 0
+    max_entries_per_day: int = DEFAULT_MAX_ENTRIES_PER_DAY
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -87,6 +95,8 @@ class EntryGuardState:
             "max_entries_per_hour": self.max_entries_per_hour,
             "loss_streak_pause_n": self.loss_streak_pause_n,
             "window_label": self.window_label,
+            "entries_today": self.entries_today,
+            "max_entries_per_day": self.max_entries_per_day,
         }
 
 
@@ -178,6 +188,7 @@ def load_entry_guard_config(
         no_entry_window=window,
         no_entry_tz=tz,
         max_entries_per_hour=max(0, _int("MAX_ENTRIES_PER_HOUR", DEFAULT_MAX_ENTRIES_PER_HOUR)),
+        max_entries_per_day=max(0, _int("MAX_ENTRIES_PER_DAY", DEFAULT_MAX_ENTRIES_PER_DAY)),
         loss_streak_pause_n=max(0, _int("LOSS_STREAK_PAUSE_N", DEFAULT_LOSS_STREAK_PAUSE_N)),
         loss_streak_pause_min=max(
             0.0, _float("LOSS_STREAK_PAUSE_MIN", DEFAULT_LOSS_STREAK_PAUSE_MIN)
@@ -192,6 +203,7 @@ def build_entry_guard_state(
     entries_last_hour: int,
     loss_streak: int,
     last_loss_ts: datetime | None,
+    entries_today: int = 0,
 ) -> EntryGuardState:
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -225,6 +237,8 @@ def build_entry_guard_state(
         max_entries_per_hour=int(config.max_entries_per_hour),
         loss_streak_pause_n=int(config.loss_streak_pause_n),
         window_label=window_label(config),
+        entries_today=int(entries_today),
+        max_entries_per_day=int(config.max_entries_per_day),
     )
 
 
@@ -239,6 +253,8 @@ def entry_guard_skip_reason(
         return "no_entry_window"
     if config.max_entries_per_hour > 0 and state.entries_last_hour >= config.max_entries_per_hour:
         return "hourly_entry_cap"
+    if config.max_entries_per_day > 0 and state.entries_today >= config.max_entries_per_day:
+        return "daily_entry_cap"
     if config.loss_streak_pause_n > 0 and state.pause_until is not None:
         clock = now or datetime.now(timezone.utc)
         if clock.tzinfo is None:
@@ -278,6 +294,17 @@ def _order_side(action: str, position_side: str) -> str:
     if action in {"close", "sell_short"}:
         return "SELL"
     return "BUY"
+
+
+def qty_after_fee_budget(*, qty: float, price: float, risk_amount: float) -> float:
+    """Shrink qty so the estimated round-trip fee stays within the risk budget."""
+    if qty <= 0 or price <= 0 or risk_amount <= 0:
+        return qty
+    fee = qty * price * ROUND_TRIP_FEE_RATE
+    budget = FEE_BUDGET_OF_RISK * risk_amount
+    if fee <= budget or budget <= 0:
+        return qty
+    return qty * (budget / fee)
 
 
 def post_only_limit_price(order_side: str, close: float, snapshot: MarketSnapshot) -> float:
@@ -378,7 +405,7 @@ def apply_risk(
             and seconds_since_last_entry < min_hold_sec
         ):
             return skip("min_hold")
-        return close_position(risk_event=None, entry_type="MARKET")
+        return close_position(risk_event=None, entry_type="LIMIT_POST_ONLY")
 
     if policy.action != "buy_long":
         return skip(policy.skip_reason or "hold")
@@ -423,6 +450,7 @@ def apply_risk(
         return skip("insufficient_margin")
     if close > 0:
         qty = min(qty, max_notional / close)
+        qty = qty_after_fee_budget(qty=qty, price=close, risk_amount=risk_amount)
     if qty <= 0:
         return skip("insufficient_margin")
     return TradeIntent(

@@ -16,6 +16,7 @@ from jev_trader.desk import (
     build_restrictions,
     compute_daily_loss,
     parse_ts,
+    present_day_income,
     resolve_decision_backend,
     skip_reason_counts,
 )
@@ -139,6 +140,7 @@ def dashboard_state(
     )
     decision = resolve_decision_backend(status)
     restrictions = build_restrictions(status, daily_loss=daily_loss)
+    day_income = present_day_income(None if status is None else status.get("day_income"))
     status_decisions = list((status or {}).get("last_decisions") or [])
     return {
         "ok": True,
@@ -155,6 +157,7 @@ def dashboard_state(
         "decision_model": decision,
         "entry_guards": restrictions.get("entry_guards"),
         "daily_loss": daily_loss,
+        "day_income": day_income,
         "restrictions": restrictions,
         "skip_reason_counts": skip_reason_counts(status_decisions),
         "open_count": len(open_positions),
@@ -631,6 +634,7 @@ MONITOR_HTML = """<!DOCTYPE html>
       </div>
     </header>
     <section class="kpis" id="kpis"></section>
+    <p class="sub" id="day-income"></p>
     <section class="model-panel" id="model-panel" aria-label="Модель и ограничения">
       <div class="row">
         <div>
@@ -691,12 +695,21 @@ MONITOR_HTML = """<!DOCTYPE html>
         + " · " + (bot.venue||"paper")
         + (bot.follow_jev ? " · по решению Jev" : " · с порогами")
         + (s.wallet && s.wallet.equity_usdt != null ? " · Binance " + fmt(s.wallet.equity_usdt,2) + " USDT" : "");
+      const inc = s.day_income || {};
+      const dayNet = inc.known ? inc.net_usdt : null;
       document.getElementById("kpis").innerHTML = [
         ["Капитал", money(s.equity_usdt), ""],
-        ["Реал. PnL", money(s.realized_pnl_usdt), clsPnl(s.realized_pnl_usdt)],
+        ["День, биржа", inc.known ? money(dayNet) : "неизвестно", inc.known ? clsPnl(dayNet) : ""],
         ["Нереал. PnL", money(s.unrealized_pnl_usdt), clsPnl(s.unrealized_pnl_usdt)],
         ["Открыто", String(s.open_count||0), ""]
       ].map(([k,v,c]) => `<div class="kpi"><label>${k}</label><b class="${c}">${v}</b></div>`).join("");
+      const dayLine = document.getElementById("day-income");
+      dayLine.textContent = inc.known
+        ? "День биржи: цена " + money(inc.realized_usdt)
+          + " · комиссия " + money(inc.commission_usdt)
+          + " · фандинг " + money(inc.funding_usdt)
+          + " · нетто " + money(inc.net_usdt)
+        : "День биржи: неизвестно";
       const dm = s.decision_model || {};
       document.getElementById("model-name").textContent = dm.title || "не указано";
       document.getElementById("model-note").textContent = dm.note || "";

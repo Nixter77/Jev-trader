@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from jev_trader.cli import build_parser
 from jev_trader.cycle import decision_payload, run_once_from_answers
 from jev_trader.execution import PaperBroker
 from jev_trader.ledger import Ledger
@@ -13,6 +14,14 @@ from jev_trader.snapshot import snapshot_to_jsonable
 from jev_trader.telegram import TelegramNotifier
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_run_defaults_to_strict_gates() -> None:
+    parser = build_parser()
+    assert parser.parse_args(["run"]).follow_jev is False
+    assert parser.parse_args(["run", "--strict-gates"]).follow_jev is False
+    assert parser.parse_args(["run", "--follow-jev"]).follow_jev is True
+    assert parser.parse_args(["live"]).follow_jev is False
 
 
 def test_run_once_emits_action_and_intent_or_skip(

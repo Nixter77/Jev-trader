@@ -12,7 +12,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 from jev_trader.cycle import decision_payload, run_once_from_answers
-from jev_trader.desk import build_restrictions, compute_daily_loss
+from jev_trader.desk import build_restrictions, compute_daily_loss, present_day_income
 from jev_trader.execution import PaperBroker
 from jev_trader.flatten import flatten_open_positions
 from jev_trader.jev import judgment_from_dict
@@ -388,6 +388,49 @@ def test_flatten_rejects_bad_content_type_host_and_origin(tmp_path: Path) -> Non
         server.server_close()
 
 
+def test_day_income_scoreboard_and_daily_entry_chip(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    status_path = tmp_path / "bot-status.json"
+    write_json(
+        status_path,
+        {
+            "day_income": {
+                "known": True,
+                "realized_usdt": -12.5,
+                "commission_usdt": -3.25,
+                "funding_usdt": 0.1,
+                "net_usdt": -15.65,
+            },
+            "entry_guards": {
+                "entries_today": 3,
+                "max_entries_per_day": 3,
+                "entries_last_hour": 0,
+                "max_entries_per_hour": 2,
+            },
+            "wallet": {"equity_usdt": 2300.0, "positions": []},
+        },
+    )
+    state = dashboard_state(ledger, status_path=status_path)
+    assert state["day_income"]["known"] is True
+    assert state["day_income"]["net_usdt"] == pytest.approx(-15.65)
+    assert state["day_income"]["commission_usdt"] == pytest.approx(-3.25)
+    cap = next(item for item in state["restrictions"]["items"] if item["id"] == "daily_entry_cap")
+    assert cap["active"] is True
+    assert cap["detail"] == "3 / 3"
+    assert present_day_income(
+        {
+            "known": True,
+            "realized_usdt": float("nan"),
+            "commission_usdt": -1,
+            "funding_usdt": 0,
+            "net_usdt": -1,
+        }
+    ) == {"known": False}
+    html = render_html(state)
+    assert "day-income" in html
+    assert "-15.65" in html
+
+
 def test_hourly_cap_follows_the_bot_snapshot_not_monitor_env(monkeypatch) -> None:
     monkeypatch.setenv("MAX_ENTRIES_PER_HOUR", "1")
     restrictions = build_restrictions(
@@ -490,13 +533,16 @@ def test_dashboard_exposes_backend_guards_and_daily_loss(tmp_path: Path) -> None
     assert ids["daily_loss"]["active"] is True
     assert ids["no_entry_window"]["active"] is True
     assert ids["hourly_entry_cap"]["active"] is True
+    assert ids["daily_entry_cap"]["active"] is False
     assert ids["loss_streak_pause"]["active"] is True
+    assert state["day_income"]["known"] is False
     assert state["skip_reason_counts"]["daily_loss"] == 1
     assert state["skip_reason_counts"]["loss_streak_pause"] == 1
     html = render_html(state)
     assert "Ограничения сейчас" in html
     assert "Модель" in html
     assert "restriction-chips" in html
+    assert 'id="day-income"' in html
 
 
 def test_dashboard_infers_laya_from_judge_ms_when_backend_missing(tmp_path: Path) -> None:

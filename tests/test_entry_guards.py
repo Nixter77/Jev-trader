@@ -209,6 +209,54 @@ def test_hourly_entry_cap_blocks_buy(market_snapshot) -> None:
     assert intent.skip_reason == "hourly_entry_cap"
 
 
+def test_daily_entry_cap_blocks_buy_and_spares_close(market_snapshot) -> None:
+    features = compute_features(market_snapshot)
+    now = datetime(2026, 7, 15, 12, 0, tzinfo=ZoneInfo("Asia/Jerusalem"))
+    cfg = _cfg(max_entries_per_hour=0, max_entries_per_day=3)
+    state = build_entry_guard_state(
+        config=cfg,
+        now=now,
+        entries_last_hour=0,
+        loss_streak=0,
+        last_loss_ts=None,
+        entries_today=3,
+    )
+    blocked = apply_risk(
+        _pass(),
+        features,
+        market_snapshot,
+        _account(),
+        entry_guard_config=cfg,
+        entry_guard_state=state,
+        now=now,
+    )
+    assert blocked.skip_reason == "daily_entry_cap"
+    assert blocked.qty == 0
+
+    long_snap = replace(
+        market_snapshot,
+        position=Position(
+            side="LONG",
+            size=1.0,
+            cash_usdt=10_000.0,
+            entry=float(market_snapshot.candles[-1].close),
+        ),
+    )
+    closed = apply_risk(
+        _pass("close"),
+        compute_features(long_snap),
+        long_snap,
+        _account(open_positions=1),
+        seconds_since_last_entry=10_000.0,
+        entry_guard_config=cfg,
+        entry_guard_state=state,
+        now=now,
+    )
+    assert closed.action == "close"
+    assert closed.entry_type == "LIMIT_POST_ONLY"
+    assert closed.skip_reason is None
+
+
 def test_hourly_cap_unlimited_allows(market_snapshot) -> None:
     features = compute_features(market_snapshot)
     now = datetime(2026, 7, 15, 12, 0, tzinfo=ZoneInfo("Asia/Jerusalem"))
@@ -263,6 +311,7 @@ def test_closes_still_allowed_during_all_guards(market_snapshot) -> None:
     assert intent.action == "close"
     assert intent.skip_reason is None
     assert intent.reduce_only is True
+    assert intent.entry_type == "LIMIT_POST_ONLY"
 
     # Stop flatten
     stopped = replace(
@@ -280,6 +329,7 @@ def test_closes_still_allowed_during_all_guards(market_snapshot) -> None:
     )
     assert stop_intent.action == "close"
     assert stop_intent.risk_event == "stop"
+    assert stop_intent.entry_type == "MARKET"
 
     # Kill switch flatten
     kill_intent = apply_risk(
@@ -348,6 +398,25 @@ def test_ledger_counts_entries_and_streak(tmp_path) -> None:
         conn.commit()
 
     assert ledger.count_entries_since(now - timedelta(hours=1)) == 2
+    yesterday = (now - timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
+    with ledger._connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO fills (
+                ts, client_order_id, symbol, action, position_side,
+                qty, price, venue, realized_pnl_usdt, cash_usdt
+            ) VALUES (?, 'old', 'BTCUSDT', 'buy_long', 'LONG', 1.0, 100.0, 'test', NULL, 10000.0)
+            """,
+            (yesterday.isoformat(),),
+        )
+        conn.commit()
+    today_start = now.astimezone(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    expected_today = sum(
+        1 for age in (10, 30, 90) if now - timedelta(minutes=age) >= today_start
+    )
+    assert ledger.count_entries_today(now) == expected_today
     streak, latest = loss_streak_from_closes(ledger.recent_close_pnls(limit=16))
     assert streak == 3
     assert latest is not None
@@ -371,4 +440,6 @@ def test_guard_state_as_dict_shape() -> None:
         "max_entries_per_hour": 2,
         "loss_streak_pause_n": 3,
         "window_label": "выкл",
+        "entries_today": 0,
+        "max_entries_per_day": 3,
     }

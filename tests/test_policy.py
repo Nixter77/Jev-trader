@@ -32,6 +32,16 @@ def test_hold_action_skips() -> None:
     assert decision.skip_reason == "hold"
 
 
+def test_default_gates_block_soft_scores_follow_jev_still_allows() -> None:
+    soft = _judgment(should_trade_now=0.34, trend_aligned=0.20)
+    blocked = apply_policy(soft)
+    assert blocked.passed is False
+    assert blocked.skip_reason == "should_trade_now"
+    allowed = apply_policy(soft, follow_jev=True)
+    assert allowed.passed is True
+    assert allowed.action == "buy_long"
+
+
 def test_follow_jev_buys_at_live_laya_scores() -> None:
     """Live typed-decisions buy_long is ~0.43 should and ~0.34 trend. That is an entry."""
     decision = apply_policy(

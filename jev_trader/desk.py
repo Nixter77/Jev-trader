@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from jev_trader.models import DAILY_LOSS_LIMIT_PCT
 from jev_trader.risk import (
     DEFAULT_LOSS_STREAK_PAUSE_N,
+    DEFAULT_MAX_ENTRIES_PER_DAY,
     DEFAULT_MAX_ENTRIES_PER_HOUR,
     daily_loss_hit,
 )
@@ -30,6 +31,7 @@ SKIP_REASONS = (
     "daily_loss",
     "no_entry_window",
     "hourly_entry_cap",
+    "daily_entry_cap",
     "loss_streak_pause",
     "reentry_cooldown",
 )
@@ -253,6 +255,25 @@ def _chip(
     return item
 
 
+def present_day_income(raw: Any) -> dict[str, Any]:
+    """Exchange day scoreboard. Unknown unless every money field is a finite float."""
+    if not isinstance(raw, dict) or raw.get("known") is not True:
+        return {"known": False}
+    realized = _as_float(raw.get("realized_usdt"))
+    commission = _as_float(raw.get("commission_usdt"))
+    funding = _as_float(raw.get("funding_usdt"))
+    net = _as_float(raw.get("net_usdt"))
+    if None in (realized, commission, funding, net):
+        return {"known": False}
+    return {
+        "known": True,
+        "realized_usdt": realized,
+        "commission_usdt": commission,
+        "funding_usdt": funding,
+        "net_usdt": net,
+    }
+
+
 def build_restrictions(
     status: dict[str, Any] | None,
     *,
@@ -267,6 +288,8 @@ def build_restrictions(
         clock = clock.replace(tzinfo=timezone.utc)
 
     max_entries = _as_int(guards.get("max_entries_per_hour"), DEFAULT_MAX_ENTRIES_PER_HOUR)
+    max_per_day = _as_int(guards.get("max_entries_per_day"), DEFAULT_MAX_ENTRIES_PER_DAY)
+    entries_today = _as_int(guards.get("entries_today"), 0)
     pause_n = _as_int(guards.get("loss_streak_pause_n"), DEFAULT_LOSS_STREAK_PAUSE_N)
     window_text = _safe_label(guards.get("window_label"), _DEFAULT_WINDOW_LABEL)
     entries_last_hour = _as_int(guards.get("entries_last_hour"), 0)
@@ -279,6 +302,7 @@ def build_restrictions(
     pause_active = pause_until_dt is not None and clock < pause_until_dt
     window_active = guards.get("window_active") is True
     hourly_active = max_entries > 0 and entries_last_hour >= max_entries
+    daily_active = max_per_day > 0 and entries_today >= max_per_day
     pause_label = (
         "Пауза после серии убытков" if pause_n <= 0 else f"Пауза после {pause_n} убытков"
     )
@@ -308,6 +332,16 @@ def build_restrictions(
             },
         ),
         _chip(
+            chip_id="daily_entry_cap",
+            label="Лимит входов за сутки",
+            active=daily_active,
+            detail=f"{entries_today} / {max_per_day}",
+            extra={
+                "entries_today": entries_today,
+                "max_entries_per_day": max_per_day,
+            },
+        ),
+        _chip(
             chip_id="loss_streak_pause",
             label=pause_label,
             active=pause_active,
@@ -332,6 +366,8 @@ def build_restrictions(
             "loss_streak": loss_streak,
             "pause_until": pause_until_iso,
             "max_entries_per_hour": max_entries,
+            "entries_today": entries_today,
+            "max_entries_per_day": max_per_day,
             "loss_streak_pause_n": pause_n,
             "window_label": window_text,
         },

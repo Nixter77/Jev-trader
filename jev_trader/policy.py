@@ -7,8 +7,8 @@ from jev_trader.models import (
 )
 
 SHOULD_TRADE_NOW_MIN = 0.72
-# Laya + strict mode. Jev under follow_jev keeps soft closes (desk PnL).
-# Trial 2026-09-23: 0.80 left Laya unable to exit (0 fills); lowered for multi-hour A/B.
+# Strict mode and Laya closes. Trial 2026-09-23: 0.80 left Laya unable to exit
+# (0 fills). Exchange income for 20–27 Sep 2026 is the scoreboard, not the desk.
 CLOSE_SHOULD_TRADE_MIN = 0.45
 # Soft confirm when action_probabilities present (typical for Laya).
 CLOSE_ACTION_PROB_MIN = 0.55
@@ -97,12 +97,14 @@ def apply_policy(
 ) -> PolicyDecision:
     """Confidence gates in code. Size/stop/leverage are never decided here.
 
-    Ledger (testnet): Laya soft closes bled at should~0.35; Jev soft closes at
-    ~0.34 were profitable. Under `follow_jev`:
-      - Jev: buy and close follow the model (desk book).
-      - Laya: entries follow the model; close stays gated but trial floors
-        are 0.45 / 0.55 / false_break 0.45 so the desk can actually exit.
-    `--strict-gates` / follow_jev=False gates both backends the same way.
+    Exchange income 20–27 Sep 2026 (testnet): about −717 USDT, of which
+    commission was −499. The desk ledger had called Jev's soft closes
+    profitable; that book omitted fees. `follow_jev` is the explicit flag
+    for that week:
+      - Jev: buy and close follow the model.
+      - Laya: entries follow the model; close stays on the trial floors
+        (0.45 / 0.55 / false_break 0.45).
+    `run` defaults to follow_jev=False, which gates both backends the same way.
     Risk flatten/stop bypasses policy via risk.py.
     """
     if judgment.action not in TRADE_ACTIONS:

@@ -846,13 +846,16 @@ def build_parser() -> argparse.ArgumentParser:
             dest="follow_jev",
             action="store_true",
             default=follow_jev,
-            help="Trade Jev buy/close without probability gates (size/stop still in code; no shorts)",
+            help=(
+                "No probability gates. The 20–27 Sep 2026 testnet week lost "
+                "about 717 USDT in this mode. Leave it off for the trial run."
+            ),
         )
         p.add_argument(
             "--strict-gates",
             dest="follow_jev",
             action="store_false",
-            help="Keep should_trade_now 0.72 and other policy gates",
+            help="should_trade_now 0.72 and the other policy gates (what run does)",
         )
         p.add_argument(
             "--min-should-trade",
@@ -874,7 +877,7 @@ def build_parser() -> argparse.ArgumentParser:
         "run",
         help="Always-on bot + local trade monitor (http://127.0.0.1:8787)",
     )
-    add_live_args(desk, follow_jev=True, fire_latest=True)
+    add_live_args(desk, follow_jev=False, fire_latest=True)
     desk.add_argument("--host", default="127.0.0.1")
     desk.add_argument("--port", type=int, default=8787)
     desk.add_argument("--pid", default=None, help="PID file (default next to ledger)")
