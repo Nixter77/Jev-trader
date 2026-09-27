@@ -27,6 +27,7 @@ from jev_trader.models import (
     MarketSnapshot,
     PolicyDecision,
     TradeIntent,
+    market_close_intent,
 )
 from jev_trader.policy import apply_policy
 from jev_trader.risk import (
@@ -196,6 +197,9 @@ def model_skipped_intent(
     )
 
 
+STOP_UNPROTECTED = "stop_unprotected"
+
+
 def arm_exchange_stop(
     broker: Any,
     ledger: Ledger | None,
@@ -302,8 +306,14 @@ def run_once(
     )
     seen_flatten = current_flatten_generation()
     protective = long_protective_stop(snapshot, features, acct)
+    stop_unprotected = False
     if protective is not None and protective < features.close:
-        arm_exchange_stop(exec_broker, ledger, snapshot.symbol, protective, None)
+        armed = arm_exchange_stop(exec_broker, ledger, snapshot.symbol, protective, None)
+        # Stop swap refused and the old stop could not be put back: the long
+        # has no exchange stop. Close it now instead of asking the model.
+        stop_unprotected = isinstance(armed, dict) and bool(armed.get("unprotected"))
+        if stop_unprotected:
+            log_event("stop_unprotected_fail_close", symbol=snapshot.symbol, stop=protective)
     # Guard inputs come first so a blocked flat book never pays for a model call.
     now = now or datetime.now(timezone.utc)
     if entry_guard_config is None:
@@ -332,7 +342,7 @@ def run_once(
     judge_ms: float | None = None
     pre_skip: str | None = None
     risk_close: str | None = None
-    if resolved is None:
+    if resolved is None and not stop_unprotected:
         risk_close = pre_model_risk_close(
             snapshot, acct, protective_stop=protective, close=features.close
         )
@@ -341,7 +351,20 @@ def run_once(
                 snapshot, acct, entry_guard_config, entry_guard_state, now=now
             )
 
-    if risk_close is not None:
+    if stop_unprotected:
+        resolved = model_skipped_judgment(STOP_UNPROTECTED)
+        policy = PolicyDecision(
+            action="hold", passed=False, skip_reason=STOP_UNPROTECTED, judgment=resolved
+        )
+        intent = market_close_intent(
+            symbol=snapshot.symbol,
+            qty=float(snapshot.position.size),
+            order_side="SELL",
+            client_order_id=client_order_id(snapshot.symbol, "close"),
+            risk_event="stop",
+            limit_price=features.close,
+        )
+    elif risk_close is not None:
         resolved = model_skipped_judgment(risk_close)
         policy = PolicyDecision(
             action="hold", passed=False, skip_reason=risk_close, judgment=resolved
@@ -427,7 +450,7 @@ def run_once(
         state=compact.as_dict(),
         risk_event=intent.risk_event,
         judge_ms=judge_ms,
-        model_skipped=pre_skip is not None or risk_close is not None,
+        model_skipped=pre_skip is not None or risk_close is not None or stop_unprotected,
     )
     if ledger is not None:
         ledger.record(result)

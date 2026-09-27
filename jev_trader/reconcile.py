@@ -55,6 +55,19 @@ RESTING_STATUSES = frozenset({"NEW", "PARTIALLY_FILLED"})
 STOP_WOULD_TRIGGER = -2021
 
 
+def _must_fail_close(res: Any) -> bool:
+    """Stop not armed and the long is left bare: price through the stop
+    (-2021), or a swap whose new stop and restore were both refused."""
+    if not isinstance(res, dict):
+        return False
+    if res.get("protected_by"):
+        return False
+    body = res.get("body")
+    if isinstance(body, dict) and body.get("code") == STOP_WOULD_TRIGGER:
+        return True
+    return bool(res.get("unprotected"))
+
+
 class _Halt(Exception):
     """Stop this pass: the exchange is unreachable or throttling us."""
 
@@ -463,7 +476,7 @@ class Reconciler:
         row["error"] = res.get("error") if isinstance(res, dict) and res.get("error") else res_body
         log_event("reconcile_stop_error", symbol=symbol, stop=stop, http_status=http_status, body=res_body, partial=True)
         self._check("stop", http_status, res_body)
-        if isinstance(res_body, dict) and res_body.get("code") == STOP_WOULD_TRIGGER:
+        if _must_fail_close(res):
             row["fail_closed"] = "cancel_rest_then_close"
             return "would_trigger"
         return "error"
@@ -581,7 +594,7 @@ class Reconciler:
             if not ok:
                 row["error"] = res.get("error") if isinstance(res, dict) and res.get("error") else body
                 log_event("reconcile_stop_error", symbol=symbol, stop=stop, http_status=http_status, body=body)
-                if isinstance(body, dict) and body.get("code") == STOP_WOULD_TRIGGER:
+                if _must_fail_close(res):
                     row["fail_closed"] = self._fail_closed(symbol, longs[symbol], stop)
             summary["stops"].append(row)
 

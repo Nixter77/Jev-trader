@@ -28,6 +28,9 @@ RECV_WINDOW_MS = 60_000
 FILLED_ORDER_STATUSES = frozenset({"FILLED", "PARTIALLY_FILLED"})
 LIMIT_ORDER_TYPES = frozenset({"LIMIT", "LIMIT_MAKER"})
 CLOSE_STOP_TYPES = frozenset({"STOP", "STOP_MARKET"})
+# Temporary reduce-only STOP_MARKET (explicit qty) that covers a closePosition
+# stop swap. client_order_id(symbol, "stop_tmp") starts with this.
+TEMP_STOP_PREFIX = "jt"
 # Binance rejects newClientOrderId longer than 36 characters.
 _CLIENT_ID_MAX = 36
 
@@ -53,7 +56,7 @@ def current_flatten_generation() -> int:
 def client_order_id(symbol: str, action: str) -> str:
     """Short id. `jev1_1000SHIBUSDT_buy_long_<ms>` does not fit Binance's 36-char limit."""
     global _id_seq
-    tag = {"buy_long": "b", "close": "c", "sell_short": "s", "flatten": "f"}.get(action, "x")
+    tag = {"buy_long": "b", "close": "c", "sell_short": "s", "flatten": "f", "stop_tmp": "t"}.get(action, "x")
     sym = "".join(ch for ch in symbol.upper() if ch.isalnum())[:12]
     with _id_lock:
         _id_seq = (_id_seq + 1) % 1000
@@ -1193,8 +1196,7 @@ class BinanceFuturesBroker:
     def _close_stop_open(self, symbol: str) -> bool:
         return bool(self._close_stops(symbol))
 
-    def _close_stops(self, symbol: str, order_side: str | None = None) -> list[dict[str, Any]] | None:
-        """Open closePosition STOP/STOP_MARKET orders (None if the query failed)."""
+    def _open_orders(self, symbol: str) -> list[dict[str, Any]] | None:
         status, data = self._request(
             "GET",
             "/fapi/v1/openOrders",
@@ -1203,10 +1205,12 @@ class BinanceFuturesBroker:
         )
         if not (200 <= status < 300) or not isinstance(data, list):
             return None
-        rows: list[dict[str, Any]] = []
-        for row in data:
-            if not isinstance(row, dict):
-                continue
+        return [row for row in data if isinstance(row, dict)]
+
+    @staticmethod
+    def _close_stops_from(rows: list[dict[str, Any]], order_side: str | None = None) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for row in rows:
             if str(row.get("type") or "") not in CLOSE_STOP_TYPES:
                 continue
             flag = row.get("closePosition")
@@ -1215,8 +1219,29 @@ class BinanceFuturesBroker:
             side = str(row.get("side") or "").upper()
             if order_side and side and side != order_side.upper():
                 continue
-            rows.append(row)
-        return rows
+            out.append(row)
+        return out
+
+    @staticmethod
+    def _temp_stops_from(rows: list[dict[str, Any]], order_side: str | None = None) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            if str(row.get("type") or "") not in CLOSE_STOP_TYPES:
+                continue
+            if not str(row.get("clientOrderId") or "").startswith(TEMP_STOP_PREFIX):
+                continue
+            side = str(row.get("side") or "").upper()
+            if order_side and side and side != order_side.upper():
+                continue
+            out.append(row)
+        return out
+
+    def _close_stops(self, symbol: str, order_side: str | None = None) -> list[dict[str, Any]] | None:
+        """Open closePosition STOP/STOP_MARKET orders (None if the query failed)."""
+        rows = self._open_orders(symbol)
+        if rows is None:
+            return None
+        return self._close_stops_from(rows, order_side)
 
     def _stop_matches(self, row: dict[str, Any], target: float, tick: float) -> bool:
         try:
@@ -1237,28 +1262,88 @@ class BinanceFuturesBroker:
         status, data = self._request("DELETE", "/fapi/v1/order", params=params, signed=True)
         return {"http_status": status, "body": data}
 
+    def _place_temp_stop(self, symbol: str, stop_price: float, order_side: str) -> dict[str, Any] | None:
+        """Reduce-only STOP_MARKET with the live position qty (None: no position read).
+
+        Unlike closePosition stops it is not limited to one per direction
+        (-4130), so it can sit next to the old closePosition stop while that
+        one is swapped.
+        """
+        try:
+            pos = self._live_position(symbol)
+        except PositionsUnknown:
+            return None
+        if pos is None:
+            return None
+        want = "LONG" if order_side.upper() == "SELL" else "SHORT"
+        if str(pos.get("side") or "").upper() != want:
+            return None
+        qty = abs(float(pos.get("size") or 0.0))
+        flt = self.filters_for(symbol)
+        if flt.get("stepSize"):
+            qty = round_to_step(qty, flt["stepSize"])
+        if qty <= 0:
+            return None
+        price = stop_price
+        if flt.get("tickSize"):
+            price = round_to_step(stop_price, flt["tickSize"])
+        cid = client_order_id(symbol, "stop_tmp")
+        params = {
+            "symbol": symbol.upper(),
+            "side": order_side,
+            "type": "STOP_MARKET",
+            "stopPrice": format_binance_decimal(price),
+            "quantity": format_binance_decimal(qty),
+            "reduceOnly": "true",
+            "workingType": "MARK_PRICE",
+            "newClientOrderId": cid,
+        }
+        status, data = self._request("POST", "/fapi/v1/order", params=params, signed=True)
+        self.invalidate_wallet()
+        return {"http_status": status, "body": data, "client_order_id": cid, "qty": qty}
+
+    def _drop_temps(self, symbol: str, temps: list[dict[str, Any]], keep: str | None = None) -> list[dict[str, Any]]:
+        return [
+            self._cancel_row(symbol, row)
+            for row in temps
+            if keep is None or str(row.get("clientOrderId") or "") != keep
+        ]
+
     def ensure_stop_market(
         self,
         symbol: str,
         *,
         stop_price: float,
         order_side: str = "SELL",
+        tighten_only: bool = False,
     ) -> dict[str, Any]:
         """Make the exchange's close-all stop sit at `stop_price`.
 
         A closePosition stop at another price (left from an earlier position
         or an older plan) is replaced. Binance keeps one closePosition stop
-        per direction (-4130), so it cannot be placed-then-swapped: the old
-        one is cancelled and the new one sent right after. If the new one is
-        refused, the old one is put back so the long is never left bare.
+        per direction (-4130), so the swap is covered by a temporary
+        reduce-only STOP_MARKET for the live qty at the new price: temp first,
+        then cancel old, place new, cancel temp. If the new closePosition stop
+        is refused, the temp stays as the protection. Without a temp (no
+        position read, or the temp refused) the old flow runs: cancel, place,
+        restore the old stop on refusal. When both the new stop and the
+        restore are refused, `unprotected` is set and the caller must close.
+
+        tighten_only: an existing stop that is already tighter (higher for a
+        SELL stop) is kept, so a recomputed ATR stop never loosens it.
         """
         with order_lock:
-            stops = self._close_stops(symbol, order_side)
-            if stops is None:
+            rows = self._open_orders(symbol)
+            if rows is None:
                 # Could not list orders: try to place; a duplicate is refused.
                 return self.place_stop_market(symbol, stop_price=stop_price, order_side=order_side)
+            stops = self._close_stops_from(rows, order_side)
+            temps = self._temp_stops_from(rows, order_side)
             if not stops:
-                return self.place_stop_market(symbol, stop_price=stop_price, order_side=order_side)
+                res = self.place_stop_market(symbol, stop_price=stop_price, order_side=order_side)
+                if temps and _http_ok(res):
+                    res["temp_cancels"] = self._drop_temps(symbol, temps)
+                return res
             flt = self.filters_for(symbol)
             tick = float(flt.get("tickSize") or 0.0) if flt else 0.0
             if tick <= 0:
@@ -1270,15 +1355,59 @@ class BinanceFuturesBroker:
                 return {"http_status": 200, "body": {"skipped": "stop_exists", "unverified": "no_tick_size"}, "stop_price": stop_price}
             target = round_to_step(stop_price, flt["tickSize"])
             if any(self._stop_matches(row, target, tick) for row in stops):
-                return {"http_status": 200, "body": {"skipped": "stop_exists"}, "stop_price": stop_price}
+                res = {"http_status": 200, "body": {"skipped": "stop_exists"}, "stop_price": stop_price}
+                if temps:
+                    res["temp_cancels"] = self._drop_temps(symbol, temps)
+                return res
+            if tighten_only:
+                tighter = _tighter_stop_prices(stops, target, tick, order_side)
+                if tighter:
+                    log_event("stop_kept_tighter", symbol=symbol, want=target, have=tighter)
+                    return {
+                        "http_status": 200,
+                        "body": {"skipped": "stop_tighter"},
+                        "stop_price": stop_price,
+                        "kept_stop_price": tighter[0],
+                    }
             old_prices = [row.get("stopPrice") for row in stops]
+            temp_cid: str | None = None
+            temp: dict[str, Any] | None = None
+            reuse = [
+                r for r in temps
+                if self._stop_matches(r, target, tick) and r.get("stopPrice") is not None
+            ]
+            if reuse:
+                temp_cid = str(reuse[0].get("clientOrderId") or "")
+            else:
+                temp = self._place_temp_stop(symbol, target, order_side)
+                if temp is not None and _http_ok(temp):
+                    temp_cid = str(temp["client_order_id"])
             cancels = [self._cancel_row(symbol, row) for row in stops]
             res = self.place_stop_market(symbol, stop_price=stop_price, order_side=order_side)
-            http_status = res.get("http_status")
-            ok = isinstance(http_status, int) and 200 <= http_status < 300
             res["replaced"] = {"old_stop_prices": old_prices, "cancels": cancels}
-            if ok:
-                log_event("stop_replaced", symbol=symbol, old=old_prices, new=target)
+            if temp is not None:
+                res["temp_stop"] = temp
+            if _http_ok(res):
+                if temp_cid:
+                    res["temp_cancel"] = self.cancel_order(symbol, temp_cid)
+                others = [r for r in temps if str(r.get("clientOrderId") or "") != temp_cid]
+                if others:
+                    res["temp_cancels"] = self._drop_temps(symbol, others)
+                log_event("stop_replaced", symbol=symbol, old=old_prices, new=target, covered=bool(temp_cid))
+                return res
+            if temp_cid:
+                # The temporary reduce-only stop at the new price protects the
+                # position; the next ensure turns it into a closePosition stop.
+                res["protected_by"] = "temp_stop"
+                res["temp_client_order_id"] = temp_cid
+                log_event(
+                    "stop_replace_temp_kept",
+                    symbol=symbol,
+                    old=old_prices,
+                    new=target,
+                    http_status=res.get("http_status"),
+                    body=res.get("body"),
+                )
                 return res
             restore: dict[str, Any] | None = None
             try:
@@ -1288,14 +1417,17 @@ class BinanceFuturesBroker:
             if old > 0:
                 restore = self.place_stop_market(symbol, stop_price=old, order_side=order_side)
             res["restored_old_stop"] = restore
+            if restore is None or not _http_ok(restore):
+                res["unprotected"] = True
             log_event(
                 "stop_replace_failed",
                 symbol=symbol,
                 old=old_prices,
                 new=target,
-                http_status=http_status,
+                http_status=res.get("http_status"),
                 body=res.get("body"),
                 restore=restore,
+                unprotected=bool(res.get("unprotected")),
             )
             return res
 
@@ -1393,6 +1525,31 @@ def _close_fully_filled(body: Any, filled_qty: float, qty: float, flt: dict[str,
     except (TypeError, ValueError):
         step = 0.0
     return filled_qty > 0 and filled_qty >= qty - step / 2 - 1e-12
+
+
+def _http_ok(res: Any) -> bool:
+    status = res.get("http_status") if isinstance(res, dict) else None
+    return isinstance(status, int) and 200 <= status < 300
+
+
+def _tighter_stop_prices(
+    stops: list[dict[str, Any]], target: float, tick: float, order_side: str
+) -> list[float]:
+    """Existing stop prices already tighter than target (SELL: higher, BUY: lower)."""
+    tol = tick / 2.0 if tick > 0 else max(1e-9, abs(target) * 1e-9)
+    out: list[float] = []
+    for row in stops:
+        try:
+            have = float(row.get("stopPrice"))
+        except (TypeError, ValueError):
+            continue
+        if have <= 0:
+            continue
+        if order_side.upper() == "SELL" and have > target + tol:
+            out.append(have)
+        elif order_side.upper() == "BUY" and have < target - tol:
+            out.append(have)
+    return sorted(out, reverse=order_side.upper() == "SELL")
 
 
 def blind_close_allowed(intent: TradeIntent) -> bool:
