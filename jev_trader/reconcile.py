@@ -32,7 +32,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from jev_trader.cycle import arm_exchange_stop
+from jev_trader.cycle import arm_exchange_stop, stop_needs_fail_close
 from jev_trader.execution import (
     ExchangeHTTPError,
     client_order_id as new_client_order_id,
@@ -55,17 +55,7 @@ RESTING_STATUSES = frozenset({"NEW", "PARTIALLY_FILLED"})
 STOP_WOULD_TRIGGER = -2021
 
 
-def _must_fail_close(res: Any) -> bool:
-    """Stop not armed and the long is left bare: price through the stop
-    (-2021), or a swap whose new stop and restore were both refused."""
-    if not isinstance(res, dict):
-        return False
-    if res.get("protected_by"):
-        return False
-    body = res.get("body")
-    if isinstance(body, dict) and body.get("code") == STOP_WOULD_TRIGGER:
-        return True
-    return bool(res.get("unprotected"))
+_must_fail_close = stop_needs_fail_close
 
 
 class _Halt(Exception):

@@ -13,6 +13,7 @@ from jev_trader.execution import (
     PaperBroker,
     client_order_id,
     current_flatten_generation,
+    fill_price,
     fill_qty,
     is_real_fill,
     order_lock,
@@ -199,6 +200,20 @@ def model_skipped_intent(
 
 
 STOP_UNPROTECTED = "stop_unprotected"
+STOP_WOULD_TRIGGER = -2021
+
+
+def stop_needs_fail_close(res: Any) -> bool:
+    """Stop not armed and the long is left bare: price through the stop
+    (-2021), or a swap whose new stop and restore were both refused."""
+    if not isinstance(res, dict):
+        return False
+    if res.get("protected_by"):
+        return False
+    body = res.get("body")
+    if isinstance(body, dict) and body.get("code") == STOP_WOULD_TRIGGER:
+        return True
+    return bool(res.get("unprotected"))
 
 
 def _stored_stop(ledger: Any, symbol: str) -> float | None:
@@ -465,6 +480,7 @@ def run_once(
         ):
             intent = replace(intent, skip_reason="flatten", qty=0.0, risk_event="flatten")
         execution = exec_broker.submit(intent)
+        entry_close: tuple[TradeIntent, Any] | None = None
         if (
             is_real_fill(execution)
             and intent.action == "buy_long"
@@ -472,13 +488,22 @@ def run_once(
             and fill_qty(execution, intent.qty) > 0
             and float(intent.stop_price) < features.close
         ):
-            arm_exchange_stop(
+            entry_arm = arm_exchange_stop(
                 exec_broker,
                 ledger,
                 intent.symbol,
                 float(intent.stop_price),
                 execution.detail if isinstance(execution.detail, dict) else None,
             )
+            if stop_needs_fail_close(entry_arm):
+                # The fresh long got no exchange stop (price already through
+                # it, or refused with nothing left on the book): close it now,
+                # not on the next bar.
+                entry_close = _fail_close_entry(
+                    exec_broker, intent, fill_qty(execution, intent.qty), features.close
+                )
+                if isinstance(execution.detail, dict):
+                    execution.detail["fail_closed"] = entry_close[1].status
 
     action, skip_reason = recorded_outcome(policy, intent, execution)
 
@@ -496,6 +521,21 @@ def run_once(
     )
     if ledger is not None:
         ledger.record(result)
+        if entry_close is not None:
+            # After the entry, so the close settles against it.
+            close_intent, close_exec = entry_close
+            ledger.record(
+                CycleResult(
+                    action="close",
+                    skip_reason=None,
+                    intent=close_intent,
+                    execution=close_exec,
+                    judgment=None,
+                    state_text="entry_stop_fail_close",
+                    state={"symbol": close_intent.symbol, "price": {"close": close_intent.limit_price or features.close}},
+                    risk_event="stop",
+                )
+            )
     if notifier is not None and notifier.enabled:
         payload = decision_payload(result)
         notifier.send(
@@ -503,6 +543,25 @@ def run_once(
             f"skip={payload['skip_reason']} venue={(execution.venue if execution else 'n/a')}"
         )
     return result
+
+
+def _fail_close_entry(broker: Any, entry: TradeIntent, qty: float, close: float) -> tuple[TradeIntent, Any]:
+    """Reduce-only MARKET close for an entry whose stop could not be armed."""
+    cid = client_order_id(entry.symbol, "close")
+    intent = market_close_intent(
+        symbol=entry.symbol,
+        qty=qty,
+        order_side="SELL",
+        client_order_id=cid,
+        risk_event="stop",
+        limit_price=close,
+    )
+    with order_lock:
+        execution = broker.submit(intent)
+    if is_real_fill(execution):
+        intent = replace(intent, qty=fill_qty(execution, qty), limit_price=fill_price(execution, close))
+    log_event("entry_stop_fail_close", symbol=entry.symbol, stop=entry.stop_price, status=execution.status)
+    return intent, execution
 
 
 def run_once_from_answers(

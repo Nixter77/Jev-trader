@@ -279,3 +279,47 @@ def test_network_outage_mid_swap_does_not_trigger_fail_close() -> None:
     assert not res.get("unprotected")
     assert res.get("protection_unknown") is True
     assert not _must_fail_close(res)
+
+
+def _entry_broker(stop_answer: dict[str, Any], submitted: list[Any]):
+    class Broker(PaperBroker):
+        def ensure_stop_market(self, symbol: str, *, stop_price: float, order_side: str = "SELL", **_kw: Any):
+            return dict(stop_answer)
+
+        def submit(self, intent):
+            submitted.append(intent)
+            return super().submit(intent)
+
+    return Broker()
+
+
+def test_entry_whose_stop_would_trigger_is_closed_at_once(market_snapshot, passing_answers, tmp_path) -> None:
+    from jev_trader.jev import judgment_from_dict
+    from jev_trader.ledger import Ledger
+
+    submitted: list[Any] = []
+    broker = _entry_broker({"http_status": 400, "body": {"code": -2021, "msg": "Order would immediately trigger."}}, submitted)
+    ledger = Ledger(tmp_path / "l.sqlite")
+    result = run_once(market_snapshot, judgment=judgment_from_dict(passing_answers), broker=broker, ledger=ledger)
+    assert result.action == "buy_long"
+    assert [i.action for i in submitted] == ["buy_long", "close"]
+    close = submitted[1]
+    assert close.reduce_only and close.order_side == "SELL" and close.entry_type == "MARKET"
+    assert close.risk_event == "stop"
+    assert close.qty == pytest.approx(result.intent.qty)
+    assert result.execution.detail["fail_closed"] == "paper_recorded"
+    with ledger._connect() as conn:
+        fills = [r[0] for r in conn.execute("SELECT action FROM fills ORDER BY id")]
+        side = conn.execute("SELECT side FROM positions WHERE symbol = ?", (market_snapshot.symbol,)).fetchone()[0]
+    assert fills == ["buy_long", "close"]
+    assert side == "FLAT"
+
+
+def test_entry_protected_by_temp_stop_is_not_closed(market_snapshot, passing_answers) -> None:
+    from jev_trader.jev import judgment_from_dict
+
+    submitted: list[Any] = []
+    broker = _entry_broker({"http_status": 400, "body": {"code": -1001}, "protected_by": "temp_stop"}, submitted)
+    result = run_once(market_snapshot, judgment=judgment_from_dict(passing_answers), broker=broker)
+    assert [i.action for i in submitted] == ["buy_long"]
+    assert "fail_closed" not in result.execution.detail
