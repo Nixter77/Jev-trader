@@ -3,19 +3,32 @@
 
 DRY RUN IS THE DEFAULT: no model call is made, no API key is read. The live path
 exists for a later, approved run only; it needs BOTH `--live` and
-`--i-have-approval` plus --max-calls, reads TYPESAFE_API_KEY from the process
-environment at run time (never from a file, never logged) and:
+`--i-have-approval` plus --max-calls. The key (never printed or logged) comes
+from the process environment (TYPESAFE_API_KEY, which typesafe_sdk reads), or
+with --env-file only that key is read from the file with the bot's own loader
+(python-dotenv + map_typesafe_api_key); nothing else from the file is used. It:
   - asks one FLAT buy question per planned bar, bar-major (all symbols advance
-    together), with --min-interval seconds between calls;
+    together), with --workers parallel threads (default 4) and --min-interval
+    seconds between any two call starts;
   - appends every answer (raw judgment + SDK usage input/output tokens) to an
-    append-only JSONL; a rerun skips bars already there (resume, no double pay);
-  - budget guard from real usage at --price-per-mtok: after --check-after calls
-    (2000) it projects cost/call x planned calls and stops if that exceeds
-    --budget-usd; it also stops before a call that would pass the budget, at
-    --max-calls (all answers in the file count) and if usage is missing;
-  - retries transport errors (3 attempts, backoff), never retries an answer
-    that was billed but unparsable, stops on auth/permission/bad-request errors
-    and after 5 bars in a row that failed.
+    append-only JSONL (single writer under a lock); a rerun skips bars already
+    answered or billed-but-unparsable (resume, no double pay); the plan
+    (symbols, range, window) is pinned in <answers>.meta.json and a resume
+    with a different plan is refused; a log goes to <answers>.log;
+  - budget guard from real usage at --price-per-mtok: a call slot is reserved
+    (worst-case tokens) before sending and settled from usage afterwards, so
+    --max-calls and --budget-usd hold across workers; after --check-after
+    completed calls (2000) it projects cost/call x planned calls and stops if
+    that exceeds --budget-usd; it also stops if usage is missing;
+  - 429/418 rate limits pause ALL workers (Retry-After respected, else
+    exponential backoff); transport errors: 3 attempts with backoff; a billed
+    but unparsable answer is charged and never retried; auth/permission/bad-
+    request errors stop everything, so do 5 failed bars in a row; Ctrl-C stops
+    issuing calls and saves the in-flight answers.
+
+Pre-run decision (2026-09-28): the paid month uses 14 symbols, the top-15 by
+model answers 21-23.09 UTC minus SKHYNIXUSDT (--exclude SKHYNIXUSDT), to fit
+the $4 cap; see PRE_RUN_DECISIONS.
 
 States are built with the bot's own code, so prompts match production:
   candles  public 5m klines of the candle venue (production reads the public
@@ -44,8 +57,10 @@ import json
 import math
 import os
 import re
+import random
 import statistics
 import sys
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -69,6 +84,11 @@ DEFAULT_PRICE_PER_MTOK = 0.042
 DEFAULT_EQUITY = 3044.35
 IL = ZoneInfo("Asia/Jerusalem")
 TESTNET_MISSING_DEFAULT = ("CLUSDT", "MUUSDT", "SNDKUSDT")
+# Decisions fixed BEFORE the paid run (also printed in the month_eval report header).
+PRE_RUN_DECISIONS = (
+    "Universe: top-15 by model answers 21-23.09 UTC minus SKHYNIXUSDT (fewest answers), decided 2026-09-28 before "
+    "the paid run to fit the $4 cap (14 symbols, --exclude SKHYNIXUSDT); evaluation rule unchanged.",
+)
 
 
 # --- request building (production code paths) ------------------------------------
@@ -402,7 +422,10 @@ class JevUsageClient:
 
             from jev_trader import JEV_MODEL
 
-            client = TypeSafeClient(api_key=api_key, model=JEV_MODEL)
+            from typesafe_sdk import RetryPolicy
+
+            # no SDK-internal retries: run_live owns retries and the rate-limit pause shared by all workers
+            client = TypeSafeClient(api_key=api_key, model=JEV_MODEL, retry=RetryPolicy(max_retries=0))
         self._client = client
 
     def judge(self, compact: Any) -> tuple[dict[str, Any], dict[str, Any], str]:
@@ -436,6 +459,9 @@ class BudgetGuard:
     input_tokens: int = 0
     output_tokens: int = 0
     estimated_usage: int = 0
+    inflight: int = 0
+    inflight_tokens: int = 0
+    max_input_seen: int = 0
 
     def add(self, input_tokens: int | None, output_tokens: int | None, fallback_input: int) -> int:
         """Count one billed call; returns the input tokens charged to the budget (fallback if not reported)."""
@@ -445,7 +471,41 @@ class BudgetGuard:
         self.input_tokens += charged
         self.output_tokens += int(output_tokens or 0)
         self.estimated_usage += est
+        self.max_input_seen = max(self.max_input_seen, charged)
         return charged
+
+    def worst_case_tokens(self, fallback_input: int) -> int:
+        """Tokens reserved for a call before it is sent: max(chars/2 of its body, 1.5 x largest input seen)."""
+        return max(int(fallback_input), math.ceil(1.5 * self.max_input_seen))
+
+    def reserve(self, worst_tokens: int) -> str | None:
+        """Reserve one call slot (caller holds the run lock); returns a stop reason instead if it may not be sent.
+
+        Completed calls drive stop_reason (incl. the projection); in-flight calls count at their worst case,
+        so concurrent workers can never together pass --max-calls or the budget.
+        """
+        reason = self.stop_reason()
+        if reason:
+            return reason
+        if self.calls + self.inflight >= self.max_calls:
+            return f"max_calls reached ({self.calls} done + {self.inflight} in flight >= {self.max_calls})"
+        worst = (self.input_tokens + self.inflight_tokens + worst_tokens) / 1e6 * self.price_per_mtok
+        if worst > self.budget_usd:
+            return (f"budget: spent ${self.cost():.4f} + {self.inflight + 1} reserved call(s) at worst case "
+                    f"${worst:.4f} would pass ${self.budget_usd:.2f}")
+        self.inflight += 1
+        self.inflight_tokens += worst_tokens
+        return None
+
+    def release(self, worst_tokens: int) -> None:
+        """Give a reserved slot back (the call was not billed)."""
+        self.inflight -= 1
+        self.inflight_tokens -= worst_tokens
+
+    def settle(self, worst_tokens: int, input_tokens: int | None, output_tokens: int | None, fallback_input: int) -> int:
+        """Turn a reservation into a billed call with the real usage."""
+        self.release(worst_tokens)
+        return self.add(input_tokens, output_tokens, fallback_input)
 
     def cost(self) -> float:
         return self.input_tokens / 1e6 * self.price_per_mtok
@@ -519,23 +579,87 @@ def load_done(path: Path) -> tuple[set[tuple[str, int]], list[dict[str, Any]]]:
 
 NON_RETRYABLE = ("TypeSafeAuthenticationError", "TypeSafePermissionDeniedError", "TypeSafeBadRequestError",
                  "TypeSafeNotFoundError", "TypeSafeUnprocessableEntityError", "TypeSafeError")
+RATE_LIMIT_STATUSES = (429, 418)
 
 
-def run_live(plan: list[tuple[int, str, int]], candles: dict[str, list[Candle]], client: Any, answers: Path,
-             guard: BudgetGuard, *, window: int, equity: float, min_interval: float = 0.2, attempts: int = 3,
-             max_consecutive_errors: int = 5, sleep=time.sleep, log=print) -> dict[str, Any]:
-    """Ask the model for every planned bar not yet in `answers`; append one JSON line per answer.
+def is_rate_limited(exc: BaseException) -> bool:
+    return type(exc).__name__ == "TypeSafeRateLimitError" or getattr(exc, "status", None) in RATE_LIMIT_STATUSES
 
-    The guard must already hold the usage of earlier answers (resume). Stops on the guard, on a
-    non-retryable API error, or after max_consecutive_errors bars that failed every attempt.
-    """
-    done, _ = load_done(answers)
-    errors_path = answers.with_suffix(".errors.jsonl")
-    todo = [p for p in plan if (p[1], p[0]) not in done]
-    log(f"plan {len(plan)} calls, already answered {len(plan) - len(todo)}, to do {len(todo)}; "
-        f"spent so far ${guard.cost():.4f} on {guard.calls} calls")
-    stop, consecutive, new_calls, last = None, 0, 0, 0.0
-    for path in (answers, errors_path):  # a crash can leave a torn last line: start the next record on a new line
+
+def retry_after_seconds(exc: BaseException) -> float | None:
+    """Retry-After of a rate-limit error in seconds (SDK retry_after_ms, retry-after-ms or retry-after headers)."""
+    ms_ = getattr(exc, "retry_after_ms", None)
+    if isinstance(ms_, (int, float)) and ms_ >= 0:
+        return float(ms_) / 1000
+    headers = getattr(exc, "headers", None)
+    if headers is None:
+        return None
+
+    def get(name: str) -> str | None:
+        try:
+            v = headers.get(name)
+            return v if v is not None else headers.get(name.title())
+        except Exception:  # noqa: BLE001
+            return None
+
+    raw_ms, raw_s = get("retry-after-ms"), get("retry-after")
+    try:
+        if raw_ms is not None:
+            return max(0.0, float(raw_ms) / 1000)
+        if raw_s is not None:
+            return max(0.0, float(raw_s))
+    except ValueError:
+        try:
+            from email.utils import parsedate_to_datetime
+
+            return max(0.0, parsedate_to_datetime(raw_s).timestamp() - time.time())
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+class SharedPacer:
+    """Pacing shared by all workers: --min-interval between any two call starts, and one common pause after a
+    rate-limit answer (Retry-After if given, else exponential backoff with jitter), so every worker slows down."""
+
+    def __init__(self, min_interval: float, base: float = 2.0, cap: float = 300.0, clock=time.monotonic) -> None:
+        self.lock = threading.Lock()
+        self.min_interval, self.base, self.cap, self.clock = min_interval, base, cap, clock
+        self.next_start = 0.0
+        self.pause_until = 0.0
+        self.strikes = 0
+
+    def wait_turn(self, stop: threading.Event) -> bool:
+        """Block until this worker may start a call; False if the run is stopping."""
+        while not stop.is_set():
+            with self.lock:
+                now = self.clock()
+                t = max(now, self.next_start, self.pause_until)
+                if t <= now:
+                    self.next_start = now + self.min_interval
+                    return True
+            stop.wait(min(t - now, 0.5))
+        return False
+
+    def rate_limited(self, retry_after: float | None) -> float:
+        with self.lock:
+            self.strikes += 1
+            if retry_after is not None:
+                delay = retry_after
+            else:
+                delay = self.base * 2 ** min(self.strikes - 1, 16) * (1 + 0.25 * random.random())
+            delay = min(delay, self.cap)
+            self.pause_until = max(self.pause_until, self.clock() + delay)
+            return delay
+
+    def ok(self) -> None:
+        with self.lock:
+            self.strikes = 0
+
+
+def _repair_torn(*paths: Path) -> None:
+    """A crash can leave a torn last line: start the next record on a new line."""
+    for path in paths:
         if path.is_file() and path.stat().st_size:
             with path.open("rb") as fb:
                 fb.seek(-1, os.SEEK_END)
@@ -543,71 +667,195 @@ def run_live(plan: list[tuple[int, str, int]], candles: dict[str, list[Candle]],
             if torn:
                 with path.open("a", encoding="utf-8") as fa:
                     fa.write("\n")
-    with answers.open("a", encoding="utf-8") as fh, errors_path.open("a", encoding="utf-8") as eh:
-        for bar_ms, sym, j in todo:
-            stop = guard.stop_reason()
-            if stop:
-                break
-            cs = candles[sym]
-            win = tuple(cs[max(0, j + 1 - window): j + 1])
-            compact, _payload, body = build_request(sym, win, equity)
-            result, err = None, None
-            fallback = math.ceil(len(body) / 2)  # conservative: the proxy tokenizer gives ~2.2 chars/token
-            for attempt in range(attempts):
-                wait = min_interval - (time.monotonic() - last)
-                if wait > 0:
-                    sleep(wait)
-                last = time.monotonic()
-                t_call = time.perf_counter()
-                try:
-                    result = client.judge(compact)
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    err = exc
-                    name = type(exc).__name__
-                    billed = isinstance(exc, BilledParseError) or name == "TypeSafeAPIResponseValidationError"
-                    rec = {"symbol": sym, "bar_ms": bar_ms, "attempt": attempt + 1, "error": name,
-                           "status": getattr(exc, "status", None), "billed": billed, "at": iso(int(time.time() * 1000))}
+
+
+def run_live(plan: list[tuple[int, str, int]], candles: dict[str, list[Candle]], client: Any, answers: Path,
+             guard: BudgetGuard, *, window: int, equity: float, workers: int = 1, min_interval: float = 0.2,
+             attempts: int = 3, rate_limit_attempts: int = 8, max_consecutive_errors: int = 5,
+             backoff_base: float = 2.0, rate_limit_base: float = 2.0, retry_after_cap: float = 300.0,
+             sleep=None, log=print) -> dict[str, Any]:
+    """Ask the model for every planned bar not yet answered; append one JSON line per answer.
+
+    `client` is either one client with .judge() shared by all workers, or a zero-argument factory called once
+    per worker (each worker then closes its own client). The guard must already hold the usage of earlier
+    answers (resume). Concurrency rules:
+      - every bar is handed to exactly one worker (bars already answered, or billed-but-unparsable, are skipped);
+      - a call slot is reserved in the guard under the run lock before sending (worst-case tokens), and settled
+        with the real usage afterwards, so --max-calls and the budget hold across workers; the projection check
+        uses completed calls;
+      - one lock serializes guard, counters and both JSONL writers, so lines never interleave;
+      - rate limits (429/418) pause ALL workers (SharedPacer, Retry-After respected) and do not count as
+        attempts, up to rate_limit_attempts per bar; transport errors get `attempts` tries with backoff;
+      - a billed but unparsable answer is charged and never retried; auth/permission/bad-request errors stop
+        everything; max_consecutive_errors failed bars in a row (completion order) stop everything;
+      - Ctrl-C stops issuing calls, waits for in-flight calls (already paid) and saves their answers.
+    """
+    done, _ = load_done(answers)
+    errors_path = answers.with_suffix(".errors.jsonl")
+    billed_keys = {(str(r.get("symbol")), int(r.get("bar_ms"))) for r in load_billed_errors(errors_path)
+                   if r.get("symbol") is not None and r.get("bar_ms") is not None}
+    todo = [p for p in plan if (p[1], p[0]) not in done and (p[1], p[0]) not in billed_keys]
+    log(f"plan {len(plan)} calls, already answered {len(done)}, billed-unparsable {len(billed_keys)}, "
+        f"to do {len(todo)}; spent so far ${guard.cost():.4f} on {guard.calls} calls; workers {workers}")
+    _repair_torn(answers, errors_path)
+    stop_evt = threading.Event()
+    lock = threading.Lock()
+    slots = threading.Condition(lock)
+    st: dict[str, Any] = {"stop": None, "consecutive": 0, "new_calls": 0, "next": 0, "requests": 0,
+                          "rate_limited": 0, "t0": time.monotonic()}
+    pacer = SharedPacer(min_interval, rate_limit_base, retry_after_cap)
+    nap = sleep or (lambda sec: stop_evt.wait(sec))
+    shared = hasattr(client, "judge")
+    fh = answers.open("a", encoding="utf-8")
+    eh = errors_path.open("a", encoding="utf-8")
+
+    def halt(reason: str) -> None:  # caller holds lock
+        if st["stop"] is None:
+            st["stop"] = reason
+        stop_evt.set()
+
+    def failed_bar(name: str) -> None:  # caller holds lock
+        st["consecutive"] += 1
+        if st["consecutive"] >= max_consecutive_errors:
+            halt(f"{st['consecutive']} bars in a row failed (last error {name})")
+
+    def write_error(rec: dict[str, Any]) -> None:  # caller holds lock
+        eh.write(json.dumps(rec) + "\n")
+        eh.flush()
+
+    def ask(cl: Any, compact: Any, bar_ms: int, sym: str, fallback: int, worst: int) -> None:
+        tries = rl = 0
+        while True:
+            if not pacer.wait_turn(stop_evt):
+                with lock:
+                    guard.release(worst)
+                return
+            t_call = time.perf_counter()
+            with lock:
+                st["requests"] += 1
+            try:
+                raw, usage, model = cl.judge(compact)
+            except Exception as exc:  # noqa: BLE001
+                name = type(exc).__name__
+                billed = isinstance(exc, BilledParseError) or name == "TypeSafeAPIResponseValidationError"
+                rate = not billed and is_rate_limited(exc)
+                rec = {"symbol": sym, "bar_ms": bar_ms, "attempt": tries + rl + 1, "error": name,
+                       "status": getattr(exc, "status", None), "billed": billed, "rate_limited": rate,
+                       "at": iso(int(time.time() * 1000))}
+                if rate:
+                    rec["pause_s"] = round(pacer.rate_limited(retry_after_seconds(exc)), 3)
+                with lock:
                     if billed:  # the server answered: charge it, never pay twice for the bar
-                        usage = getattr(exc, "usage", None) or {}
-                        rec["usage"] = usage
-                        rec["budget_input_tokens"] = guard.add(usage.get("input_tokens"), usage.get("output_tokens"),
-                                                               fallback_input=fallback)
-                    eh.write(json.dumps(rec) + "\n")
-                    eh.flush()
+                        u = getattr(exc, "usage", None) or {}
+                        rec["usage"] = u
+                        rec["budget_input_tokens"] = guard.settle(worst, u.get("input_tokens"), u.get("output_tokens"),
+                                                                  fallback)
+                    write_error(rec)
                     if billed:
-                        break
+                        failed_bar(name)
+                        return
                     if name in NON_RETRYABLE:
-                        stop = f"non-retryable API error {name} (status {getattr(exc, 'status', None)})"
-                        break
-                    sleep(2.0 * (2 ** attempt))
-            if stop:
-                break
-            if result is None:
-                consecutive += 1
-                if consecutive >= max_consecutive_errors:
-                    stop = f"{consecutive} bars in a row failed (last error {type(err).__name__})"
-                    break
+                        guard.release(worst)
+                        halt(f"non-retryable API error {name} (status {getattr(exc, 'status', None)})")
+                        return
+                    if rate:
+                        st["rate_limited"] += 1
+                        rl += 1
+                    else:
+                        tries += 1
+                    if rl >= rate_limit_attempts or tries >= attempts:
+                        guard.release(worst)
+                        failed_bar(name)
+                        return
+                if not rate:
+                    nap(backoff_base * 2 ** (tries - 1))
                 continue
-            consecutive = 0
-            raw, usage, model = result
-            charged = guard.add(usage.get("input_tokens"), usage.get("output_tokens"), fallback_input=fallback)
-            fh.write(json.dumps({"symbol": sym, "bar_ms": bar_ms, "bar_utc": iso(bar_ms), "model": model,
-                                 "judgment": raw, "usage": usage,
-                                 "usage_estimated": usage.get("input_tokens") is None, "budget_input_tokens": charged,
-                                 "latency_ms": round((time.perf_counter() - t_call) * 1000, 1),
-                                 "answered_at": iso(int(time.time() * 1000))}, ensure_ascii=False) + "\n")
+            pacer.ok()
+            with lock:
+                charged = guard.settle(worst, usage.get("input_tokens"), usage.get("output_tokens"), fallback)
+                fh.write(json.dumps({"symbol": sym, "bar_ms": bar_ms, "bar_utc": iso(bar_ms), "model": model,
+                                     "judgment": raw, "usage": usage,
+                                     "usage_estimated": usage.get("input_tokens") is None,
+                                     "budget_input_tokens": charged,
+                                     "latency_ms": round((time.perf_counter() - t_call) * 1000, 1),
+                                     "answered_at": iso(int(time.time() * 1000))}, ensure_ascii=False) + "\n")
+                fh.flush()
+                st["consecutive"] = 0
+                st["new_calls"] += 1
+                n = st["new_calls"]
+                if n % 100 == 0:
+                    os.fsync(fh.fileno())
+                if n % 1000 == 0:
+                    rate_s = n / max(1e-9, time.monotonic() - st["t0"])
+                    left = len(todo) - st["next"]
+                    log(f"{n} new calls ({rate_s:.2f}/s, ~{left / max(rate_s, 1e-9) / 3600:.1f} h left), total "
+                        f"{guard.calls}, spent ${guard.cost():.4f}, projection ${guard.projection() or 0:.2f}, "
+                        f"rate-limited {st['rate_limited']}, at {iso(bar_ms)}")
+            return
+
+    def worker() -> None:
+        cl = client if shared else client()
+        try:
+            while not stop_evt.is_set():
+                with lock:
+                    if st["next"] >= len(todo):
+                        return
+                    bar_ms, sym, j = todo[st["next"]]
+                    st["next"] += 1
+                cs = candles[sym]
+                compact, _payload, body = build_request(sym, tuple(cs[max(0, j + 1 - window): j + 1]), equity)
+                fallback = math.ceil(len(body) / 2)  # conservative: the proxy tokenizer gives ~2.2 chars/token
+                with lock:
+                    while True:
+                        if stop_evt.is_set():
+                            return
+                        worst = guard.worst_case_tokens(fallback)
+                        reason = guard.reserve(worst)
+                        if reason is None:
+                            break
+                        if guard.inflight > 0 and guard.stop_reason() is None:
+                            # the limit is only reached counting in-flight worst cases: wait until they settle
+                            # (a failed one frees its slot), then decide
+                            slots.wait(timeout=0.05)
+                            continue
+                        halt(reason)
+                        return
+                ask(cl, compact, bar_ms, sym, fallback, worst)
+        except Exception as exc:  # noqa: BLE001 - a bug must stop the run, not hang it
+            with lock:
+                halt(f"worker crashed: {type(exc).__name__}: {exc}")
+        finally:
+            if not shared:
+                close = getattr(cl, "close", None)
+                if callable(close):
+                    close()
+
+    threads = [threading.Thread(target=worker, name=f"jev-worker-{k}", daemon=True) for k in range(max(1, workers))]
+    try:
+        for t in threads:
+            t.start()
+        try:
+            while any(t.is_alive() for t in threads):
+                for t in threads:
+                    t.join(timeout=0.5)
+        except KeyboardInterrupt:
+            with lock:
+                halt("interrupted (Ctrl-C); rerun the same command to resume")
+            log("Ctrl-C: no new calls; waiting for in-flight calls (already paid) to be saved ...")
+            for t in threads:
+                t.join()
+    finally:
+        with lock:
             fh.flush()
-            new_calls += 1
-            if new_calls % 100 == 0:
-                os.fsync(fh.fileno())
-            if new_calls % 1000 == 0:
-                log(f"{new_calls} new calls, total {guard.calls}, spent ${guard.cost():.4f}, "
-                    f"projection ${guard.projection() or 0:.2f}, at {iso(bar_ms)}")
-    summary = {"stop_reason": stop or "plan complete", "new_calls": new_calls, "total_calls": guard.calls,
+            os.fsync(fh.fileno())
+            fh.close()
+            eh.close()
+    stop = st["stop"]
+    summary = {"stop_reason": stop or "plan complete", "new_calls": st["new_calls"], "total_calls": guard.calls,
+               "requests_sent": st["requests"], "rate_limited": st["rate_limited"],
                "input_tokens": guard.input_tokens, "output_tokens": guard.output_tokens,
                "cost_usd": round(guard.cost(), 6), "projection_usd": guard.projection(),
-               "estimated_usage_responses": guard.estimated_usage}
+               "estimated_usage_responses": guard.estimated_usage, "workers": workers}
     log(("STOPPED: " if stop else "DONE: ") + json.dumps(summary))
     return summary
 
@@ -625,6 +873,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                          "--universe-days")
     ap.add_argument("--universe-days", default="2026-09-21,2026-09-23", help="first,last UTC day (inclusive)")
     ap.add_argument("--universe-size", type=int, default=15)
+    ap.add_argument("--exclude", default="", help="comma list removed from the universe (recorded in outputs)")
     ap.add_argument("--testnet-missing", default=",".join(TESTNET_MISSING_DEFAULT),
                     help="symbols without testnet markets (reported as a second subset)")
     ap.add_argument("--candle-venue", default="mainnet", choices=("mainnet", "testnet"))
@@ -634,7 +883,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--price-per-mtok", type=float, default=DEFAULT_PRICE_PER_MTOK, help="USD per 1M input tokens")
     ap.add_argument("--tokenizer", default=None, help="tokenizer.json path, or 'none'")
     ap.add_argument("--samples", type=int, default=2, help="sample requests per symbol written to the out dir")
-    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
+    ap.add_argument("--workers", type=int, default=4,
+                    help="--live: parallel request threads; dry-run: token-counting processes")
     ap.add_argument("--out", default="/tmp/jevbt/out/month")
     ap.add_argument("--dry-run", action="store_true", default=True, help="default; never calls the model")
     ap.add_argument("--live", action="store_true", help="paid Jev calls (also needs --i-have-approval)")
@@ -643,11 +893,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--budget-usd", type=float, default=4.0, help="hard cap on real cost from SDK usage")
     ap.add_argument("--check-after", type=int, default=2000, help="calls before the projection check starts")
     ap.add_argument("--answers", default=None, help="append-only answers JSONL (default <out>/live_answers.jsonl)")
-    ap.add_argument("--min-interval", type=float, default=0.2, help="seconds between call starts")
+    ap.add_argument("--min-interval", type=float, default=0.2, help="seconds between any two call starts (all workers)")
+    ap.add_argument("--env-file", default=None,
+                    help="--live only: read ONLY TYPESAFE_API_KEY / typesafe_API_KEY from this dotenv file with the "
+                         "bot's parser (python-dotenv + jev_trader.config.map_typesafe_api_key); nothing is exported "
+                         "or printed. Without it the key must be in the process environment")
     ap.add_argument("--check-ledger", default=None, metavar="LEDGER",
                     help="only compare rebuilt states with logged state_text (read-only ledger copy)")
     ap.add_argument("--check-n", type=int, default=150)
     ap.add_argument("--tag", default="", help="suffix for the dry-run output file names")
+    ap.add_argument("--progress", action="store_true",
+                    help="only print progress and real spend of --answers (no network, no key)")
     return ap.parse_args(argv)
 
 
@@ -660,11 +916,96 @@ def resolve_symbols(args: argparse.Namespace) -> tuple[list[str], list[dict[str,
         d0, d1 = (x.strip() for x in args.universe_days.split(","))
         uni, table = universe_from_ledger(args.universe_ledger, d0, d1, args.universe_size)
         symbols = sorted(set(symbols) | set(uni))
-    return symbols, table
+    excl = exclude_set(args)
+    missing = sorted(excl - set(symbols))
+    if missing:
+        raise SystemExit(f"--exclude names symbols that are not in the universe: {', '.join(missing)}")
+    return sorted(s for s in symbols if s not in excl), table
+
+
+def exclude_set(args: argparse.Namespace) -> set[str]:
+    return {s.strip().upper() for s in (getattr(args, "exclude", "") or "").split(",") if s.strip()}
+
+
+def universe_rule(args: argparse.Namespace) -> str | None:
+    parts = []
+    if args.universe_ledger:
+        parts.append(f"top {args.universe_size} by model answers on {args.universe_days} (UTC, inclusive)")
+    if args.symbols:
+        parts.append("explicit --symbols list")
+    if exclude_set(args):
+        parts.append("minus " + ", ".join(sorted(exclude_set(args))) + " (--exclude)")
+    return "; ".join(parts) or None
+
+
+def resolve_api_key(env_file: str | None) -> tuple[str, str]:
+    """(key, source) for the live path. Never prints or logs the value.
+
+    --env-file: the bot's own loader semantics (python-dotenv parser, `typesafe_API_KEY` mapped onto
+    `TYPESAFE_API_KEY` by jev_trader.config.map_typesafe_api_key, the file wins like load_settings(env_file)),
+    but only the key is taken: nothing is put into os.environ. Otherwise the process environment.
+    """
+    if env_file:
+        path = Path(env_file).expanduser()
+        if not path.is_file():
+            raise SystemExit(f"--env-file {path}: no such file; nothing was called")
+        from dotenv import dotenv_values
+
+        from jev_trader.config import map_typesafe_api_key
+
+        values = dotenv_values(path)
+        sub = {k: str(values.get(k) or "") for k in ("TYPESAFE_API_KEY", "typesafe_API_KEY")}
+        key = (map_typesafe_api_key(sub) or "").strip()
+        if key:
+            return key, f"--env-file {path.name}"
+    key = (os.environ.get("TYPESAFE_API_KEY") or os.environ.get("typesafe_API_KEY") or "").strip()
+    if key:
+        return key, "process environment"
+    where = f"neither in --env-file {env_file} nor in" if env_file else "not set in"
+    raise SystemExit(f"TYPESAFE_API_KEY (or typesafe_API_KEY) is {where} the process environment; nothing was called")
+
+
+def progress(answers: Path, price_per_mtok: float) -> dict[str, Any]:
+    """Calls done, tokens and real spend so far from the answers JSONL (+ billed errors, meta, status)."""
+    _, recs = load_done(answers)
+    errs = []
+    ep = answers.with_suffix(".errors.jsonl")
+    if ep.is_file():
+        for line in ep.open(encoding="utf-8"):
+            try:
+                errs.append(json.loads(line))
+            except ValueError:
+                continue
+    billed = [e for e in errs if e.get("billed")]
+    meta_p = answers.with_suffix(".meta.json")
+    meta = json.loads(meta_p.read_text()) if meta_p.is_file() else {}
+    planned = meta.get("planned_calls")
+    tok = sum(int(r.get("budget_input_tokens") or (r.get("usage") or {}).get("input_tokens") or 0) for r in recs + billed)
+    out_tok = sum(int((r.get("usage") or {}).get("output_tokens") or 0) for r in recs + billed)
+    calls = len(recs) + len(billed)
+    spent = tok / 1e6 * price_per_mtok
+    res = {"answers": len(recs), "billed_unparsable": len(billed), "planned_calls": planned,
+           "done_pct": round(100 * calls / planned, 2) if planned else None,
+           "input_tokens": tok, "output_tokens": out_tok, "input_tokens_per_call": round(tok / calls, 1) if calls else None,
+           "spent_usd": round(spent, 4),
+           "projected_usd": round(spent / calls * planned, 3) if calls and planned else None,
+           "budget_usd": meta.get("budget_usd"), "rate_limited": sum(1 for e in errs if e.get("rate_limited")),
+           "other_errors": sum(1 for e in errs if not e.get("rate_limited") and not e.get("billed")),
+           "last_bar_utc": recs[-1].get("bar_utc") if recs else None,
+           "last_answer_at": max((r.get("answered_at") or "" for r in recs), default=None)}
+    st = answers.parent / "live_status.json"
+    if st.is_file():
+        res["last_run_stop_reason"] = json.loads(st.read_text()).get("stop_reason")
+    return res
 
 
 def main(argv: list[str] | None = None) -> dict[str, Any] | None:
     args = parse_args(argv)
+    if args.progress:
+        answers = Path(args.answers) if args.answers else Path(args.out) / "live_answers.jsonl"
+        res = progress(answers, args.price_per_mtok)
+        print(json.dumps(res, indent=1, ensure_ascii=False))
+        return res
     end = (datetime.strptime(args.end, "%Y-%m-%d").replace(tzinfo=timezone.utc) if args.end
            else datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0))
     end_ms = int(end.timestamp() * 1000)
@@ -685,22 +1026,47 @@ def main(argv: list[str] | None = None) -> dict[str, Any] | None:
     if args.live:
         if not args.i_have_approval or args.max_calls <= 0 or args.budget_usd <= 0:
             raise SystemExit("--live needs --i-have-approval, --max-calls > 0 and --budget-usd > 0; nothing was called")
-        key = os.environ.get("TYPESAFE_API_KEY", "").strip()
-        if not key:
-            raise SystemExit("TYPESAFE_API_KEY is not set in this process environment; nothing was called")
+        key, key_source = resolve_api_key(args.env_file)  # before any network access
+        answers = Path(args.answers) if args.answers else out / "live_answers.jsonl"
+        answers.parent.mkdir(parents=True, exist_ok=True)
+        log_path = answers.with_suffix(".log")
+
+        def log(msg: str) -> None:
+            line = f"[{datetime.now(IL).strftime('%Y-%m-%d %H:%M:%S')} IL] {msg}"
+            print(line, flush=True)
+            with log_path.open("a", encoding="utf-8") as lf:
+                lf.write(line + "\n")
+
+        meta_path = answers.with_suffix(".meta.json")
+        meta = {"symbols": symbols, "universe_rule": universe_rule(args), "range_utc": [iso(start_ms), iso(end_ms)],
+                "candle_venue": args.candle_venue, "window": args.window, "equity": args.equity,
+                "budget_usd": args.budget_usd, "price_per_mtok": args.price_per_mtok, "max_calls": args.max_calls,
+                "check_after": args.check_after, "decisions": PRE_RUN_DECISIONS}
+        if meta_path.is_file():
+            prev = json.loads(meta_path.read_text())
+            fixed = ("symbols", "range_utc", "candle_venue", "window", "equity")
+            diff = [k for k in fixed if prev.get(k) != meta[k]]
+            if diff:
+                raise SystemExit(f"resume refused: {', '.join(diff)} differ from {meta_path.name} (the plan is fixed "
+                                 "before the run); nothing was called")
+        log(f"live month replay: {len(symbols)} symbols {','.join(symbols)}; rule: {meta['universe_rule']}; "
+            f"key from {key_source}; workers {args.workers}; answers {answers}")
         candles = {s: load_candles(args.candle_venue, s, fetch_start, end_ms, Path(args.cache)) for s in symbols}
         plan = build_plan(candles, start_ms, end_ms)
-        answers = Path(args.answers) if args.answers else out / "live_answers.jsonl"
+        meta["planned_calls"] = len(plan)
+        if not meta_path.is_file():
+            meta["started_at"] = iso(int(time.time() * 1000))
+            meta_path.write_text(json.dumps(meta, indent=1, ensure_ascii=False))
         guard = BudgetGuard(args.budget_usd, args.price_per_mtok, planned_calls=len(plan), max_calls=args.max_calls,
                             check_after=args.check_after)
         seed_guard(guard, answers)
-        client = JevUsageClient(api_key=key)
+
+        def factory() -> JevUsageClient:
+            return JevUsageClient(api_key=key)
+
+        summary = run_live(plan, candles, factory, answers, guard, window=args.window, equity=args.equity,
+                           workers=args.workers, min_interval=args.min_interval, log=log)
         del key
-        try:
-            summary = run_live(plan, candles, client, answers, guard, window=args.window, equity=args.equity,
-                               min_interval=args.min_interval)
-        finally:
-            client.close()
         (out / "live_status.json").write_text(json.dumps(summary, indent=1))
         return summary
 
@@ -723,8 +1089,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any] | None:
         "equity": args.equity, "price_per_mtok": args.price_per_mtok, "tokenizer": tok_path,
         "tokenizer_note": "local Laya tokenizer used as a proxy; Jev's own tokenizer and server prompt are unknown",
         "elapsed_sec": round(time.time() - t0, 1),
-        "symbols": symbols, "universe_rule": None if universe_table is None else
-        f"top {args.universe_size} by model answers on {args.universe_days} (UTC, inclusive)",
+        "symbols": symbols, "universe_rule": universe_rule(args), "excluded": sorted(exclude_set(args)),
+        "decisions": PRE_RUN_DECISIONS,
         "universe_counts": universe_table,
         "planned_calls": full["calls"], "budget_usd": args.budget_usd,
         "summary": [full, tn],
@@ -776,4 +1142,6 @@ def render(r: dict[str, Any]) -> str:
 
 
 if __name__ == "__main__":
-    main()
+    _res = main()
+    # exit 3 when a live run stopped before completing the plan (guard, errors, Ctrl-C); 0 otherwise
+    sys.exit(3 if isinstance(_res, dict) and _res.get("stop_reason") not in (None, "plan complete") else 0)

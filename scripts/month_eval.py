@@ -19,6 +19,9 @@ Fixed before any answer exists; nothing here is tuned on the results.
              from the same half's Jev answer bars; minus-top-5 removes each seed's own top 5
   BTC hold   BTCUSDT bought at the half's first open, sold at its last close (taker both sides)
 Candles/funding: public Binance (mainnet by default: what the model saw), via backtest_replay.
+Universe (decided 2026-09-28 before the paid run, see jev_month_replay.PRE_RUN_DECISIONS): top-15 symbols by
+model answers 21-23.09 UTC minus SKHYNIXUSDT (fewest answers), 14 symbols, to fit the $4 cap. The report header
+repeats these decisions and the universe recorded by the live run (<answers>.meta.json).
 """
 from __future__ import annotations
 
@@ -33,6 +36,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import backtest_holds as h  # noqa: E402
 import backtest_replay as b  # noqa: E402
+from jev_month_replay import PRE_RUN_DECISIONS  # noqa: E402
 
 BAR = b.BAR_MS
 DEFAULT_START = "2026-08-29T00:00"
@@ -122,7 +126,16 @@ def evaluate(answers: list[dict[str, Any]], market: b.Market, start_ms: int, mid
 
 
 def render(res: dict[str, Any]) -> str:
-    L = [f"# Month evaluation (pre-registered), {res.get('venue', '?')} candles, {res['seeds']} random seeds", "",
+    L = [f"# Month evaluation (pre-registered), {res.get('venue', '?')} candles, {res['seeds']} random seeds", ""]
+    L += [f"- decided before the run: {d}" for d in res.get("decisions", PRE_RUN_DECISIONS)]
+    meta = res.get("run_meta") or {}
+    if meta:
+        L.append(f"- live run meta: {len(meta.get('symbols', []))} symbols {', '.join(meta.get('symbols', []))}; "
+                 f"rule: {meta.get('universe_rule')}; planned calls {meta.get('planned_calls')}; "
+                 f"budget ${meta.get('budget_usd')}")
+    L.append(f"- symbols with Jev answers in the file ({len(res.get('answer_symbols', []))}): "
+             f"{', '.join(res.get('answer_symbols', []))}")
+    L += ["",
          f"threshold should_trade_now >= {res['threshold']:.4f} (p{int(res['threshold_quantile'] * 100)} of "
          f"{res['threshold_from_answers']} Jev answers, {res['threshold_window'][0]} .. {res['threshold_window'][1]})", "",
          "| half | Jev answers | buy_long | signals | net | price | fees | funding | trades | win% | avg win | avg loss | "
@@ -169,6 +182,10 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     res["venue"] = args.venue
     res["answers_file"] = args.answers
     res["symbols"] = symbols
+    res["answer_symbols"] = sorted({a["symbol"] for a in answers})
+    res["decisions"] = list(PRE_RUN_DECISIONS)
+    meta_path = Path(args.answers).with_suffix(".meta.json")
+    res["run_meta"] = json.loads(meta_path.read_text()) if meta_path.is_file() else None
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / f"month_eval{args.tag}.json").write_text(json.dumps(res, indent=1, ensure_ascii=False, default=str))
