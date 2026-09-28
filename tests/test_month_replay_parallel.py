@@ -273,5 +273,5 @@ def test_progress_reports_spend(tmp_path: Path) -> None:
          max_consecutive_errors=1000)
     r = mr.progress(answers, 0.042)
     assert r["answers"] + r["billed_unparsable"] == 40 and r["input_tokens"] == 40_000
-    assert abs(r["spent_usd"] - 40_000 / 1e6 * 0.042) < 1e-4 and r["planned_calls"] == len(plan)
+    assert abs(r["spent_total_usd"] - 40_000 / 1e6 * 0.042) < 1e-4 and r["planned_calls"] == len(plan)
     assert r["rate_limited"] == sum(fake.limited.values())

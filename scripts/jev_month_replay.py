@@ -24,11 +24,20 @@ with --env-file only that key is read from the file with the bot's own loader
     exponential backoff); transport errors: 3 attempts with backoff; a billed
     but unparsable answer is charged and never retried; auth/permission/bad-
     request errors stop everything, so do 5 failed bars in a row; Ctrl-C stops
-    issuing calls and saves the in-flight answers.
+    issuing calls and saves the in-flight answers;
+  - --import-from OLD: a NEW answers file starts with the in-plan answers (and
+    billed-but-unparsable records) of an earlier run with the same range /
+    venue / window / equity (old files only read, sha256 recorded); every
+    other call the old run paid for is `prior_spend_usd` in the new meta and
+    counts against the TOTAL cap; --import-only does just this (no key);
+  - the projection (prior + spent + remaining x max(average so far, average of
+    the last 2000 calls)) is re-checked before every call after --check-after,
+    so a drift in tokens/call stops the run early and cheaply.
 
-Pre-run decision (2026-09-28): the paid month uses 14 symbols, the top-15 by
-model answers 21-23.09 UTC minus SKHYNIXUSDT (--exclude SKHYNIXUSDT), to fit
-the $4 cap; see PRE_RUN_DECISIONS.
+Pre-run decisions (2026-09-28, see PRE_RUN_DECISIONS): first 14 symbols (top-15
+by model answers 21-23.09 UTC minus SKHYNIXUSDT); after the guard stopped that
+run at 2001 calls, the first 9 of the same ranking, $4 total cap incl. the
+$0.1007 already spent.
 
 States are built with the bot's own code, so prompts match production:
   candles  public 5m klines of the candle venue (production reads the public
@@ -53,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import math
 import os
@@ -62,6 +72,7 @@ import statistics
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -88,6 +99,11 @@ TESTNET_MISSING_DEFAULT = ("CLUSDT", "MUUSDT", "SNDKUSDT")
 PRE_RUN_DECISIONS = (
     "Universe: top-15 by model answers 21-23.09 UTC minus SKHYNIXUSDT (fewest answers), decided 2026-09-28 before "
     "the paid run to fit the $4 cap (14 symbols, --exclude SKHYNIXUSDT); evaluation rule unchanged.",
+    "After the guard stopped the 14-symbol run at 2001 calls (real ~1198 input tokens/call, projection $6.08), the "
+    "universe was cut on 2026-09-28 to the first 9 of the same pre-fixed ranking (top by model answers 21-23.09 UTC): "
+    "SOLUSDT, BTCUSDT, ETHUSDT, ZECUSDT, XRPUSDT, XAUUSDT, DOGEUSDT, CLUSDT, NEARUSDT. The choice does not depend on "
+    "the answers already received (they were not inspected); the evaluation rule is unchanged; the cap is $4 TOTAL, "
+    "including the $0.1007 already spent by the stopped run (answers of the 9 symbols are imported, not re-paid).",
 )
 
 
@@ -462,6 +478,13 @@ class BudgetGuard:
     inflight: int = 0
     inflight_tokens: int = 0
     max_input_seen: int = 0
+    prior_usd: float = 0.0  # spent earlier on calls that are NOT in this plan (counts against the total cap)
+    recent_window: int = 2000
+    recent: Any = None  # deque of the last recent_window charged input-token counts
+
+    def __post_init__(self) -> None:
+        if self.recent is None:
+            self.recent = deque(maxlen=max(1, self.recent_window))
 
     def add(self, input_tokens: int | None, output_tokens: int | None, fallback_input: int) -> int:
         """Count one billed call; returns the input tokens charged to the budget (fallback if not reported)."""
@@ -472,6 +495,7 @@ class BudgetGuard:
         self.output_tokens += int(output_tokens or 0)
         self.estimated_usage += est
         self.max_input_seen = max(self.max_input_seen, charged)
+        self.recent.append(charged)
         return charged
 
     def worst_case_tokens(self, fallback_input: int) -> int:
@@ -489,9 +513,9 @@ class BudgetGuard:
             return reason
         if self.calls + self.inflight >= self.max_calls:
             return f"max_calls reached ({self.calls} done + {self.inflight} in flight >= {self.max_calls})"
-        worst = (self.input_tokens + self.inflight_tokens + worst_tokens) / 1e6 * self.price_per_mtok
+        worst = self.prior_usd + (self.input_tokens + self.inflight_tokens + worst_tokens) / 1e6 * self.price_per_mtok
         if worst > self.budget_usd:
-            return (f"budget: spent ${self.cost():.4f} + {self.inflight + 1} reserved call(s) at worst case "
+            return (f"budget: spent ${self.total_cost():.4f} + {self.inflight + 1} reserved call(s) at worst case "
                     f"${worst:.4f} would pass ${self.budget_usd:.2f}")
         self.inflight += 1
         self.inflight_tokens += worst_tokens
@@ -508,27 +532,44 @@ class BudgetGuard:
         return self.add(input_tokens, output_tokens, fallback_input)
 
     def cost(self) -> float:
+        """Real cost of the calls of this plan (answers + billed errors in the answers files)."""
         return self.input_tokens / 1e6 * self.price_per_mtok
+
+    def total_cost(self) -> float:
+        """Everything spent against the cap: prior out-of-plan spend + this plan."""
+        return self.prior_usd + self.cost()
 
     def cost_per_call(self) -> float | None:
         return self.cost() / self.calls if self.calls else None
 
+    def recent_cost_per_call(self) -> float | None:
+        return sum(self.recent) / len(self.recent) / 1e6 * self.price_per_mtok if self.recent else None
+
     def projection(self) -> float | None:
+        """Total at the end of the plan: prior + spent + remaining calls x max(average so far, recent average).
+
+        The recent window (last recent_window calls) makes a drift in tokens/call visible early.
+        """
         cpc = self.cost_per_call()
-        return None if cpc is None else cpc * self.planned_calls
+        if cpc is None:
+            return None
+        per = max(cpc, self.recent_cost_per_call() or 0.0)
+        return self.total_cost() + per * max(0, self.planned_calls - self.calls)
 
     def stop_reason(self) -> str | None:
-        """Checked before every call."""
+        """Checked before every call (so the projection is re-checked continuously after check_after calls)."""
         if self.calls >= self.max_calls:
             return f"max_calls reached ({self.calls} >= {self.max_calls})"
-        if self.cost() >= self.budget_usd:
-            return f"budget reached: real cost ${self.cost():.4f} >= ${self.budget_usd:.2f}"
+        if self.total_cost() >= self.budget_usd:
+            return f"budget reached: real cost ${self.total_cost():.4f} >= ${self.budget_usd:.2f}"
         cpc = self.cost_per_call()
-        if cpc is not None and self.cost() + cpc > self.budget_usd:
-            return f"budget: the next call would pass ${self.budget_usd:.2f} (spent ${self.cost():.4f})"
+        if cpc is not None and self.total_cost() + cpc > self.budget_usd:
+            return f"budget: the next call would pass ${self.budget_usd:.2f} (spent ${self.total_cost():.4f})"
         if self.calls >= self.check_after and (self.projection() or 0.0) > self.budget_usd:
-            return (f"projection over budget: ${self.cost_per_call():.8f}/call x {self.planned_calls} planned calls = "
-                    f"${self.projection():.2f} > ${self.budget_usd:.2f} (after {self.calls} calls, spent ${self.cost():.4f})")
+            per = max(cpc or 0.0, self.recent_cost_per_call() or 0.0)
+            return (f"projection over budget: prior ${self.prior_usd:.4f} + spent ${self.cost():.4f} + "
+                    f"{max(0, self.planned_calls - self.calls)} remaining x ${per:.8f}/call = ${self.projection():.2f} > "
+                    f"${self.budget_usd:.2f} (after {self.calls} of {self.planned_calls} planned calls)")
         if self.estimated_usage > 20:
             return f"usage missing in {self.estimated_usage} responses; the budget cannot be enforced"
         return None
@@ -555,6 +596,72 @@ def seed_guard(guard: "BudgetGuard", answers: Path) -> None:
     for rec in prior + load_billed_errors(answers.with_suffix(".errors.jsonl")):
         u = rec.get("usage") or {}
         guard.add(rec.get("budget_input_tokens", u.get("input_tokens")), u.get("output_tokens"), fallback_input=0)
+
+
+PLAN_FIXED_KEYS = ("range_utc", "candle_venue", "window", "equity")
+
+
+def sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def charged_tokens(rec: dict[str, Any]) -> int:
+    u = rec.get("usage") or {}
+    return int(rec.get("budget_input_tokens") or u.get("input_tokens") or 0)
+
+
+def import_prior(old_answers: Path, new_answers: Path, plan_keys: set[tuple[str, int]], new_meta: dict[str, Any],
+                 price_per_mtok: float) -> dict[str, Any]:
+    """Copy the answers (and billed-but-unparsable records) of an earlier run that fall inside the new plan.
+
+    The old files are only read. The old meta must match the new plan (range, candle venue, window, equity).
+    Everything the old run paid for but that is NOT imported becomes `prior_spend_usd` (counts against the cap);
+    the imported records keep their usage and are charged when the guard is seeded from the new file.
+    """
+    old_meta_path = old_answers.with_suffix(".meta.json")
+    if not old_answers.is_file() or not old_meta_path.is_file():
+        raise SystemExit(f"--import-from {old_answers}: answers or meta file missing; nothing was imported")
+    old_meta = json.loads(old_meta_path.read_text())
+    diff = [k for k in PLAN_FIXED_KEYS if old_meta.get(k) != new_meta.get(k)]
+    if diff:
+        raise SystemExit(f"--import-from refused: {', '.join(diff)} differ between the old and the new plan")
+    if new_answers.exists() and new_answers.stat().st_size:
+        raise SystemExit(f"--import-from refused: {new_answers} already has records (import only into a new file)")
+    sha_before = sha256_of(old_answers)
+    _, old_recs = load_done(old_answers)
+    old_billed = load_billed_errors(old_answers.with_suffix(".errors.jsonl"))
+    keep = [r for r in old_recs if (str(r["symbol"]), int(r["bar_ms"])) in plan_keys]
+    kept_keys = {(str(r["symbol"]), int(r["bar_ms"])) for r in keep}
+    keep_billed, seen = [], set()
+    for r in old_billed:
+        k = (str(r.get("symbol")), int(r.get("bar_ms") or 0))
+        if k in plan_keys and k not in kept_keys and k not in seen:
+            seen.add(k)
+            keep_billed.append(r)
+    all_tok = sum(charged_tokens(r) for r in old_recs + old_billed)
+    imp_tok = sum(charged_tokens(r) for r in keep + keep_billed)
+    new_answers.parent.mkdir(parents=True, exist_ok=True)
+    for path, recs in ((new_answers, keep), (new_answers.with_suffix(".errors.jsonl"), keep_billed)):
+        tmp = path.with_name(path.name + ".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            for r in recs:
+                fh.write(json.dumps({**r, "imported_from": str(old_answers)}, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp.replace(path)
+    if sha256_of(old_answers) != sha_before:
+        raise SystemExit("the old answers file changed during the import; aborting")
+    return {"source": str(old_answers), "source_sha256": sha_before, "source_symbols": old_meta.get("symbols"),
+            "source_calls": len(old_recs) + len(old_billed), "source_input_tokens": all_tok,
+            "prior_total_spend_usd": round(all_tok / 1e6 * price_per_mtok, 6),
+            "imported_answers": len(keep), "imported_billed_unparsable": len(keep_billed),
+            "imported_input_tokens": imp_tok, "imported_spend_usd": round(imp_tok / 1e6 * price_per_mtok, 6),
+            "prior_spend_usd": round((all_tok - imp_tok) / 1e6 * price_per_mtok, 9),
+            "imported_at": iso(int(time.time() * 1000))}
 
 
 def load_done(path: Path) -> tuple[set[tuple[str, int]], list[dict[str, Any]]]:
@@ -696,7 +803,8 @@ def run_live(plan: list[tuple[int, str, int]], candles: dict[str, list[Candle]],
                    if r.get("symbol") is not None and r.get("bar_ms") is not None}
     todo = [p for p in plan if (p[1], p[0]) not in done and (p[1], p[0]) not in billed_keys]
     log(f"plan {len(plan)} calls, already answered {len(done)}, billed-unparsable {len(billed_keys)}, "
-        f"to do {len(todo)}; spent so far ${guard.cost():.4f} on {guard.calls} calls; workers {workers}")
+        f"to do {len(todo)}; spent so far ${guard.total_cost():.4f} (prior ${guard.prior_usd:.4f}) on {guard.calls} "
+        f"in-plan calls; workers {workers}")
     _repair_torn(answers, errors_path)
     stop_evt = threading.Event()
     lock = threading.Lock()
@@ -789,7 +897,7 @@ def run_live(plan: list[tuple[int, str, int]], candles: dict[str, list[Candle]],
                     rate_s = n / max(1e-9, time.monotonic() - st["t0"])
                     left = len(todo) - st["next"]
                     log(f"{n} new calls ({rate_s:.2f}/s, ~{left / max(rate_s, 1e-9) / 3600:.1f} h left), total "
-                        f"{guard.calls}, spent ${guard.cost():.4f}, projection ${guard.projection() or 0:.2f}, "
+                        f"{guard.calls}, spent ${guard.total_cost():.4f}, projection ${guard.projection() or 0:.4f}, "
                         f"rate-limited {st['rate_limited']}, at {iso(bar_ms)}")
             return
 
@@ -854,7 +962,8 @@ def run_live(plan: list[tuple[int, str, int]], candles: dict[str, list[Candle]],
     summary = {"stop_reason": stop or "plan complete", "new_calls": st["new_calls"], "total_calls": guard.calls,
                "requests_sent": st["requests"], "rate_limited": st["rate_limited"],
                "input_tokens": guard.input_tokens, "output_tokens": guard.output_tokens,
-               "cost_usd": round(guard.cost(), 6), "projection_usd": guard.projection(),
+               "cost_usd": round(guard.cost(), 6), "prior_usd": guard.prior_usd,
+               "total_cost_usd": round(guard.total_cost(), 6), "projection_usd": guard.projection(),
                "estimated_usage_responses": guard.estimated_usage, "workers": workers}
     log(("STOPPED: " if stop else "DONE: ") + json.dumps(summary))
     return summary
@@ -902,6 +1011,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="only compare rebuilt states with logged state_text (read-only ledger copy)")
     ap.add_argument("--check-n", type=int, default=150)
     ap.add_argument("--tag", default="", help="suffix for the dry-run output file names")
+    ap.add_argument("--import-from", default=None, metavar="OLD_ANSWERS",
+                    help="--live/--import-only: seed a NEW answers file with the in-plan answers of an earlier run "
+                         "(old files are only read); its other paid calls count as prior spend against the cap")
+    ap.add_argument("--import-only", action="store_true",
+                    help="do the --import-from step, write the meta and print the projection; no key, no model call")
     ap.add_argument("--progress", action="store_true",
                     help="only print progress and real spend of --answers (no network, no key)")
     return ap.parse_args(argv)
@@ -984,11 +1098,16 @@ def progress(answers: Path, price_per_mtok: float) -> dict[str, Any]:
     out_tok = sum(int((r.get("usage") or {}).get("output_tokens") or 0) for r in recs + billed)
     calls = len(recs) + len(billed)
     spent = tok / 1e6 * price_per_mtok
+    prior = float((meta.get("import") or {}).get("prior_spend_usd") or 0.0)
+    recent = [charged_tokens(r) for r in recs[-2000:]]
+    per = max(spent / calls, sum(recent) / len(recent) / 1e6 * price_per_mtok) if calls and recent else None
     res = {"answers": len(recs), "billed_unparsable": len(billed), "planned_calls": planned,
+           "imported": (meta.get("import") or {}).get("imported_answers", 0),
            "done_pct": round(100 * calls / planned, 2) if planned else None,
            "input_tokens": tok, "output_tokens": out_tok, "input_tokens_per_call": round(tok / calls, 1) if calls else None,
-           "spent_usd": round(spent, 4),
-           "projected_usd": round(spent / calls * planned, 3) if calls and planned else None,
+           "spent_in_file_usd": round(spent, 4), "prior_out_of_plan_usd": round(prior, 4),
+           "spent_total_usd": round(prior + spent, 4),
+           "projected_total_usd": round(prior + spent + per * max(0, planned - calls), 4) if per and planned else None,
            "budget_usd": meta.get("budget_usd"), "rate_limited": sum(1 for e in errs if e.get("rate_limited")),
            "other_errors": sum(1 for e in errs if not e.get("rate_limited") and not e.get("billed")),
            "last_bar_utc": recs[-1].get("bar_utc") if recs else None,
@@ -1023,10 +1142,10 @@ def main(argv: list[str] | None = None) -> dict[str, Any] | None:
         (out / f"state_check_{args.candle_venue}_{len(symbols)}sym.json").write_text(json.dumps(res, indent=1))
         print(json.dumps(res, indent=1))
         return res
-    if args.live:
-        if not args.i_have_approval or args.max_calls <= 0 or args.budget_usd <= 0:
+    if args.live or args.import_only:
+        if args.live and (not args.i_have_approval or args.max_calls <= 0 or args.budget_usd <= 0):
             raise SystemExit("--live needs --i-have-approval, --max-calls > 0 and --budget-usd > 0; nothing was called")
-        key, key_source = resolve_api_key(args.env_file)  # before any network access
+        key, key_source = resolve_api_key(args.env_file) if args.live else ("", "")  # before any network access
         answers = Path(args.answers) if args.answers else out / "live_answers.jsonl"
         answers.parent.mkdir(parents=True, exist_ok=True)
         log_path = answers.with_suffix(".log")
@@ -1041,25 +1160,48 @@ def main(argv: list[str] | None = None) -> dict[str, Any] | None:
         meta = {"symbols": symbols, "universe_rule": universe_rule(args), "range_utc": [iso(start_ms), iso(end_ms)],
                 "candle_venue": args.candle_venue, "window": args.window, "equity": args.equity,
                 "budget_usd": args.budget_usd, "price_per_mtok": args.price_per_mtok, "max_calls": args.max_calls,
-                "check_after": args.check_after, "decisions": PRE_RUN_DECISIONS}
-        if meta_path.is_file():
-            prev = json.loads(meta_path.read_text())
-            fixed = ("symbols", "range_utc", "candle_venue", "window", "equity")
-            diff = [k for k in fixed if prev.get(k) != meta[k]]
+                "check_after": args.check_after, "decisions": list(PRE_RUN_DECISIONS)}
+        prev = json.loads(meta_path.read_text()) if meta_path.is_file() else None
+        if prev is not None:
+            diff = [k for k in ("symbols",) + PLAN_FIXED_KEYS if prev.get(k) != meta[k]]
             if diff:
                 raise SystemExit(f"resume refused: {', '.join(diff)} differ from {meta_path.name} (the plan is fixed "
                                  "before the run); nothing was called")
-        log(f"live month replay: {len(symbols)} symbols {','.join(symbols)}; rule: {meta['universe_rule']}; "
-            f"key from {key_source}; workers {args.workers}; answers {answers}")
+            if args.import_from and not prev.get("import"):
+                raise SystemExit("--import-from given but this answers file was started without an import; "
+                                 "nothing was called")
+            if args.import_from and Path(prev["import"]["source"]).resolve() != Path(args.import_from).resolve():
+                raise SystemExit("--import-from differs from the import recorded in the meta; nothing was called")
         candles = {s: load_candles(args.candle_venue, s, fetch_start, end_ms, Path(args.cache)) for s in symbols}
         plan = build_plan(candles, start_ms, end_ms)
         meta["planned_calls"] = len(plan)
-        if not meta_path.is_file():
+        if prev is None:
+            if args.import_from:
+                meta["import"] = import_prior(Path(args.import_from), answers, {(p[1], p[0]) for p in plan}, meta,
+                                              args.price_per_mtok)
+                log(f"imported {meta['import']['imported_answers']} answers + "
+                    f"{meta['import']['imported_billed_unparsable']} billed-unparsable from {args.import_from}; prior "
+                    f"total spend ${meta['import']['prior_total_spend_usd']:.4f}, of it out-of-plan "
+                    f"${meta['import']['prior_spend_usd']:.4f}")
             meta["started_at"] = iso(int(time.time() * 1000))
             meta_path.write_text(json.dumps(meta, indent=1, ensure_ascii=False))
+            prev = meta
+        prior_usd = float((prev.get("import") or {}).get("prior_spend_usd") or 0.0)
         guard = BudgetGuard(args.budget_usd, args.price_per_mtok, planned_calls=len(plan), max_calls=args.max_calls,
-                            check_after=args.check_after)
+                            check_after=args.check_after, prior_usd=prior_usd)
         seed_guard(guard, answers)
+        if args.import_only:
+            res = {"planned_calls": len(plan), "in_file_calls": guard.calls, "prior_out_of_plan_usd": prior_usd,
+                   "spent_total_usd": round(guard.total_cost(), 6), "cost_per_call_usd": guard.cost_per_call(),
+                   "projection_total_usd": guard.projection(), "budget_usd": args.budget_usd,
+                   "headroom_usd": None if guard.projection() is None else round(args.budget_usd - guard.projection(), 4),
+                   "import": prev.get("import")}
+            log("import-only: " + json.dumps(res))
+            return res
+        log(f"live month replay: {len(symbols)} symbols {','.join(symbols)}; rule: {meta['universe_rule']}; "
+            f"key from {key_source}; workers {args.workers}; answers {answers}; prior out-of-plan spend "
+            f"${prior_usd:.4f}; total spent so far ${guard.total_cost():.4f}; projection "
+            f"${guard.projection() or 0:.4f} of ${args.budget_usd:.2f}")
 
         def factory() -> JevUsageClient:
             return JevUsageClient(api_key=key)

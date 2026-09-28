@@ -19,9 +19,10 @@ Fixed before any answer exists; nothing here is tuned on the results.
              from the same half's Jev answer bars; minus-top-5 removes each seed's own top 5
   BTC hold   BTCUSDT bought at the half's first open, sold at its last close (taker both sides)
 Candles/funding: public Binance (mainnet by default: what the model saw), via backtest_replay.
-Universe (decided 2026-09-28 before the paid run, see jev_month_replay.PRE_RUN_DECISIONS): top-15 symbols by
-model answers 21-23.09 UTC minus SKHYNIXUSDT (fewest answers), 14 symbols, to fit the $4 cap. The report header
-repeats these decisions and the universe recorded by the live run (<answers>.meta.json).
+Universe (jev_month_replay.PRE_RUN_DECISIONS): first 14 symbols (top-15 by model answers 21-23.09 UTC minus
+SKHYNIXUSDT); after the guard stopped that run at 2001 calls, cut on 2026-09-28 to the first 9 of the same ranking
+(answers not inspected), $4 total cap incl. the $0.1007 already spent. The report header repeats these decisions and
+the universe/import recorded by the live run (<answers>.meta.json).
 """
 from __future__ import annotations
 
@@ -133,6 +134,11 @@ def render(res: dict[str, Any]) -> str:
         L.append(f"- live run meta: {len(meta.get('symbols', []))} symbols {', '.join(meta.get('symbols', []))}; "
                  f"rule: {meta.get('universe_rule')}; planned calls {meta.get('planned_calls')}; "
                  f"budget ${meta.get('budget_usd')}")
+        imp = meta.get("import") or {}
+        if imp:
+            L.append(f"- imported from the stopped run {imp.get('source')}: {imp.get('imported_answers')} answers + "
+                     f"{imp.get('imported_billed_unparsable')} billed-unparsable; that run's total spend "
+                     f"${imp.get('prior_total_spend_usd')} counts against the ${meta.get('budget_usd')} total cap")
     L.append(f"- symbols with Jev answers in the file ({len(res.get('answer_symbols', []))}): "
              f"{', '.join(res.get('answer_symbols', []))}")
     L += ["",
