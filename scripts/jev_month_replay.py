@@ -3,8 +3,19 @@
 
 DRY RUN IS THE DEFAULT: no model call is made, no API key is read. The live path
 exists for a later, approved run only; it needs BOTH `--live` and
-`--i-have-approval`, reads TYPESAFE_API_KEY from the process environment at run
-time (never from a file) and stops after --max-calls.
+`--i-have-approval` plus --max-calls, reads TYPESAFE_API_KEY from the process
+environment at run time (never from a file, never logged) and:
+  - asks one FLAT buy question per planned bar, bar-major (all symbols advance
+    together), with --min-interval seconds between calls;
+  - appends every answer (raw judgment + SDK usage input/output tokens) to an
+    append-only JSONL; a rerun skips bars already there (resume, no double pay);
+  - budget guard from real usage at --price-per-mtok: after --check-after calls
+    (2000) it projects cost/call x planned calls and stops if that exceeds
+    --budget-usd; it also stops before a call that would pass the budget, at
+    --max-calls (all answers in the file count) and if usage is missing;
+  - retries transport errors (3 attempts, backoff), never retries an answer
+    that was billed but unparsable, stops on auth/permission/bad-request errors
+    and after 5 bars in a row that failed.
 
 States are built with the bot's own code, so prompts match production:
   candles  public 5m klines of the candle venue (production reads the public
@@ -30,11 +41,14 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
+import re
 import statistics
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -242,32 +256,75 @@ def symbols_from_ledger(path: str) -> list[str]:
     return sorted(r[0] for r in rows)
 
 
+# --- universe -------------------------------------------------------------------------------
+
+def universe_from_ledger(path: str, day_from: str, day_to: str, size: int) -> tuple[list[str], list[dict[str, Any]]]:
+    """Top `size` symbols by model answers (not model_skipped) on UTC days day_from..day_to (inclusive).
+
+    Ties break alphabetically. Returns the symbols and the per-day answer counts of every symbol seen.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    rows = conn.execute(
+        "SELECT upper(symbol), substr(ts, 1, 10), count(*) FROM decisions WHERE judgment_json IS NOT NULL "
+        "AND json_extract(judgment_json, '$.model') NOT IN ('model_skipped') AND substr(ts, 1, 10) BETWEEN ? AND ? "
+        "GROUP BY 1, 2", (day_from, day_to)).fetchall()
+    conn.close()
+    per: dict[str, dict[str, int]] = {}
+    for sym, day, n in rows:
+        per.setdefault(sym, {})[day] = n
+    table = sorted(({"symbol": s, "total": sum(d.values()), "per_day": d} for s, d in per.items()),
+                   key=lambda r: (-r["total"], r["symbol"]))
+    return [r["symbol"] for r in table[:size]], table
+
+
 # --- reconstruction check against logged states ------------------------------------------
 
-def check_ledger(path: str, venue: str, cache: Path, n: int, seed: int = 2) -> dict[str, Any]:
-    """Rebuild logged state_text market lines (2-4) from candles; exact-match rates.
+FIELD_RE = re.compile(r"(\w+)=(\S+)")
 
-    Reports the match with a fixed 300-bar window and with the best window in 239..300
-    (the live buffer length after a restart grows from 239 to 300).
+
+def state_fields(text: str) -> dict[str, str]:
+    """Named values of a state_text (ema_stack has no key= so it gets one)."""
+    lines = text.split("\n")
+    out = dict(FIELD_RE.findall(text))
+    if len(lines) > 2 and lines[2].split():
+        out["ema_stack"] = lines[2].split()[0]
+    out["news"] = lines[-1] if lines and lines[-1].startswith("news:") else ""
+    return out
+
+
+def check_ledger(path: str, venue: str, cache: Path, n: int, seed: int = 2,
+                 symbols: list[str] | None = None) -> dict[str, Any]:
+    """Rebuild logged state_text from candles; exact-match rates overall and field by field.
+
+    Compared with a fixed 300-bar window (what the month run uses) and with the best window in
+    239..300 (the live buffer grows from 239 closed bars after a restart to 300). The flat-book
+    fields (pos/size/cash_usdt) and the order book are expected to differ: the replay has no live
+    position, wallet or depth.
     """
     import random
-    import re
     import sqlite3
 
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     rows = conn.execute("SELECT symbol, state_text FROM decisions WHERE judgment_json IS NOT NULL "
+                        "AND json_extract(judgment_json, '$.model') NOT IN ('model_skipped') "
                         "AND state_text LIKE 'symbol=%'").fetchall()
     conn.close()
+    want = {s.upper() for s in symbols} if symbols else None
     recs = []
     for sym, st in rows:
         mm = re.search(r"ts=(\S+)Z", st or "")
-        if mm:
+        if mm and (want is None or sym.upper() in want):
             t = int(datetime.strptime(mm.group(1), "%Y-%m-%dT%H:%M").replace(tzinfo=timezone.utc).timestamp() * 1000)
             recs.append((sym.upper(), t, st))
     t0, t1 = min(r[1] for r in recs), max(r[1] for r in recs)
     sample = random.Random(seed).sample(recs, min(n, len(recs)))
     candles: dict[str, list[Candle]] = {}
-    fixed = anyw = total = 0
+    stats: dict[str, dict[str, list[int]]] = {"w300": {}, "best": {}}
+    examples: dict[str, list[dict[str, str]]] = {}
+    lines_w300 = lines_best = total = 0
+    windows: dict[int, int] = {}
     for sym, t, st in sample:
         if sym not in candles:
             candles[sym] = load_candles(venue, sym, t0 - 320 * BAR_MS, t1 + BAR_MS, cache)
@@ -275,45 +332,284 @@ def check_ledger(path: str, venue: str, cache: Path, n: int, seed: int = 2) -> d
         idx = {c.ts: i for i, c in enumerate(cs)}
         if t not in idx:
             continue
-        j, logged = idx[t], st.split("\n")[1:4]
+        j, logged = idx[t], st.split("\n")
         total += 1
+        w300 = build_request(sym, tuple(cs[max(0, j - 299): j + 1]), DEFAULT_EQUITY)[0].as_text()
+        best_text, best_w = w300, None
         for w in [300] + list(range(239, 300)):
-            compact, _, _ = build_request(sym, tuple(cs[max(0, j + 1 - w): j + 1]), 1.0)
-            if compact.as_text().split("\n")[1:4] == logged:
-                fixed += w == 300
-                anyw += 1
+            txt = w300 if w == 300 else build_request(sym, tuple(cs[max(0, j + 1 - w): j + 1]), DEFAULT_EQUITY)[0].as_text()
+            if txt.split("\n")[1:4] == logged[1:4]:
+                best_text, best_w = txt, w
                 break
-    return {"venue": venue, "checked": total, "match_window_300": fixed / total if total else None,
-            "match_some_window_239_300": anyw / total if total else None}
+        lines_w300 += w300.split("\n")[1:4] == logged[1:4]
+        lines_best += best_w is not None
+        if best_w is not None:
+            windows[best_w] = windows.get(best_w, 0) + 1
+        lf = state_fields(st)
+        for key, txt in (("w300", w300), ("best", best_text)):
+            rf = state_fields(txt)
+            for f, v in lf.items():
+                cell = stats[key].setdefault(f, [0, 0])
+                cell[0] += 1
+                ok = rf.get(f) == v
+                cell[1] += ok
+                if key == "w300" and not ok and len(examples.setdefault(f, [])) < 3:
+                    examples[f].append({"symbol": sym, "ts": iso(t), "logged": v, "rebuilt": str(rf.get(f))})
+    rate = lambda d: {f: round(c[1] / c[0], 4) for f, c in sorted(d.items())}  # noqa: E731
+    return {
+        "venue": venue, "symbols": sorted(want) if want else "all", "checked": total,
+        "market_lines_match_window_300": lines_w300 / total if total else None,
+        "market_lines_match_some_window_239_300": lines_best / total if total else None,
+        "field_match_window_300": rate(stats["w300"]), "field_match_best_window": rate(stats["best"]),
+        "mismatch_examples_window_300": examples,
+        "best_window_top": sorted(windows.items(), key=lambda kv: -kv[1])[:8],
+    }
 
 
-# --- live path (not run without explicit approval) ------------------------------------
+# --- plan, live client, budget guard, resume ----------------------------------------------
 
-def run_live(args: argparse.Namespace, symbols: list[str], start_ms: int, end_ms: int, fetch_start: int) -> None:
-    """Paid Jev calls. Guarded by --live AND --i-have-approval; key from the environment only."""
-    from jev_trader.jev import JevClient
+def build_plan(candles: dict[str, list[Candle]], start_ms: int, end_ms: int, min_bars: int = 50
+               ) -> list[tuple[int, str, int]]:
+    """(bar_ms, symbol, index) for every closed bar in range with >= min_bars history, bar-major order.
 
-    key = os.environ.get("TYPESAFE_API_KEY", "")
-    if not key:
-        raise SystemExit("TYPESAFE_API_KEY is not set in the process environment")
-    out = Path(args.out) / "live_answers.jsonl"
-    done = 0
-    with JevClient(api_key=key) as client, out.open("a", encoding="utf-8") as fh:
-        for sym in symbols:
-            candles = load_candles(args.candle_venue, sym, fetch_start, end_ms, Path(args.cache))
-            for j, c in enumerate(candles):
-                if not (start_ms <= c.ts < end_ms) or j + 1 < 50:
+    Bar-major means an interrupted run still covers every symbol up to the same time.
+    """
+    plan = [(c.ts, sym, j) for sym, cs in candles.items() for j, c in enumerate(cs)
+            if start_ms <= c.ts < end_ms and j + 1 >= min_bars]
+    plan.sort()
+    return plan
+
+
+class BilledParseError(Exception):
+    """The API answered (and billed) but the answer could not be parsed; never retried."""
+
+    def __init__(self, usage: dict[str, Any], cause: Exception) -> None:
+        super().__init__(f"{type(cause).__name__}: {cause}")
+        self.usage = usage
+
+
+def _usage_of(resp: Any) -> dict[str, Any]:
+    usage = getattr(resp, "usage", None)
+    return {"input_tokens": getattr(usage, "input_tokens", None), "output_tokens": getattr(usage, "output_tokens", None)}
+
+
+class JevUsageClient:
+    """Same request as jev_trader.jev.JevClient.judge, but also returns the SDK usage."""
+
+    def __init__(self, api_key: str, client: Any = None) -> None:
+        if client is None:
+            from typesafe_sdk import TypeSafeClient
+
+            from jev_trader import JEV_MODEL
+
+            client = TypeSafeClient(api_key=api_key, model=JEV_MODEL)
+        self._client = client
+
+    def judge(self, compact: Any) -> tuple[dict[str, Any], dict[str, Any], str]:
+        from jev_trader.jev import judgment_from_response, position_side_from_compact
+
+        allowed = allowed_actions_for_position(position_side_from_compact(compact))
+        payload = build_system_one_payload(compact, allowed_actions=allowed)
+        resp = self._client.system_one(state=payload["state"], questions=payload["questions"], model=payload["model"])
+        try:
+            judgment = judgment_from_response(resp)
+        except Exception as exc:  # noqa: BLE001
+            raise BilledParseError(_usage_of(resp), exc) from exc
+        return judgment.raw, _usage_of(resp), judgment.model
+
+    def close(self) -> None:
+        close = getattr(self._client, "close", None)
+        if callable(close):
+            close()
+
+
+@dataclass
+class BudgetGuard:
+    """Real-cost guard from SDK usage (input tokens x price; output tokens are recorded, not priced)."""
+
+    budget_usd: float
+    price_per_mtok: float
+    planned_calls: int
+    max_calls: int
+    check_after: int = 2000
+    calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    estimated_usage: int = 0
+
+    def add(self, input_tokens: int | None, output_tokens: int | None, fallback_input: int) -> int:
+        """Count one billed call; returns the input tokens charged to the budget (fallback if not reported)."""
+        est = input_tokens is None
+        charged = int(fallback_input if est else input_tokens)
+        self.calls += 1
+        self.input_tokens += charged
+        self.output_tokens += int(output_tokens or 0)
+        self.estimated_usage += est
+        return charged
+
+    def cost(self) -> float:
+        return self.input_tokens / 1e6 * self.price_per_mtok
+
+    def cost_per_call(self) -> float | None:
+        return self.cost() / self.calls if self.calls else None
+
+    def projection(self) -> float | None:
+        cpc = self.cost_per_call()
+        return None if cpc is None else cpc * self.planned_calls
+
+    def stop_reason(self) -> str | None:
+        """Checked before every call."""
+        if self.calls >= self.max_calls:
+            return f"max_calls reached ({self.calls} >= {self.max_calls})"
+        if self.cost() >= self.budget_usd:
+            return f"budget reached: real cost ${self.cost():.4f} >= ${self.budget_usd:.2f}"
+        cpc = self.cost_per_call()
+        if cpc is not None and self.cost() + cpc > self.budget_usd:
+            return f"budget: the next call would pass ${self.budget_usd:.2f} (spent ${self.cost():.4f})"
+        if self.calls >= self.check_after and (self.projection() or 0.0) > self.budget_usd:
+            return (f"projection over budget: ${self.cost_per_call():.8f}/call x {self.planned_calls} planned calls = "
+                    f"${self.projection():.2f} > ${self.budget_usd:.2f} (after {self.calls} calls, spent ${self.cost():.4f})")
+        if self.estimated_usage > 20:
+            return f"usage missing in {self.estimated_usage} responses; the budget cannot be enforced"
+        return None
+
+
+def load_billed_errors(path: Path) -> list[dict[str, Any]]:
+    """Error lines that were billed (the API answered); they count toward the budget on resume."""
+    out: list[dict[str, Any]] = []
+    if path.is_file():
+        with path.open(encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
                     continue
-                if done >= args.max_calls:
-                    print(f"stopped at --max-calls {args.max_calls}")
-                    return
-                win = tuple(candles[max(0, j + 1 - args.window): j + 1])
-                snap = snapshot_from_closed_bars(sym, win, tf="5m", book=None,
-                                                 position=Position(side="FLAT", size=0.0, cash_usdt=args.equity))
-                compact = build_compact_state(snap, compute_features(snap))
-                judgment = client.judge(compact)
-                fh.write(json.dumps({"symbol": sym, "bar_ms": c.ts, "judgment": judgment.raw}, ensure_ascii=False) + "\n")
-                done += 1
+                if isinstance(rec, dict) and rec.get("billed"):
+                    out.append(rec)
+    return out
+
+
+def seed_guard(guard: "BudgetGuard", answers: Path) -> None:
+    """Resume: charge every earlier answer and billed error to the guard."""
+    _, prior = load_done(answers)
+    for rec in prior + load_billed_errors(answers.with_suffix(".errors.jsonl")):
+        u = rec.get("usage") or {}
+        guard.add(rec.get("budget_input_tokens", u.get("input_tokens")), u.get("output_tokens"), fallback_input=0)
+
+
+def load_done(path: Path) -> tuple[set[tuple[str, int]], list[dict[str, Any]]]:
+    """Answered (symbol, bar_ms) keys from an append-only JSONL; a torn last line is ignored."""
+    done: set[tuple[str, int]] = set()
+    recs: list[dict[str, Any]] = []
+    if not path.is_file():
+        return done, recs
+    with path.open(encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("judgment") and "symbol" in rec and "bar_ms" in rec:
+                key = (str(rec["symbol"]), int(rec["bar_ms"]))
+                if key not in done:
+                    done.add(key)
+                    recs.append(rec)
+    return done, recs
+
+
+NON_RETRYABLE = ("TypeSafeAuthenticationError", "TypeSafePermissionDeniedError", "TypeSafeBadRequestError",
+                 "TypeSafeNotFoundError", "TypeSafeUnprocessableEntityError", "TypeSafeError")
+
+
+def run_live(plan: list[tuple[int, str, int]], candles: dict[str, list[Candle]], client: Any, answers: Path,
+             guard: BudgetGuard, *, window: int, equity: float, min_interval: float = 0.2, attempts: int = 3,
+             max_consecutive_errors: int = 5, sleep=time.sleep, log=print) -> dict[str, Any]:
+    """Ask the model for every planned bar not yet in `answers`; append one JSON line per answer.
+
+    The guard must already hold the usage of earlier answers (resume). Stops on the guard, on a
+    non-retryable API error, or after max_consecutive_errors bars that failed every attempt.
+    """
+    done, _ = load_done(answers)
+    errors_path = answers.with_suffix(".errors.jsonl")
+    todo = [p for p in plan if (p[1], p[0]) not in done]
+    log(f"plan {len(plan)} calls, already answered {len(plan) - len(todo)}, to do {len(todo)}; "
+        f"spent so far ${guard.cost():.4f} on {guard.calls} calls")
+    stop, consecutive, new_calls, last = None, 0, 0, 0.0
+    for path in (answers, errors_path):  # a crash can leave a torn last line: start the next record on a new line
+        if path.is_file() and path.stat().st_size:
+            with path.open("rb") as fb:
+                fb.seek(-1, os.SEEK_END)
+                torn = fb.read(1) != b"\n"
+            if torn:
+                with path.open("a", encoding="utf-8") as fa:
+                    fa.write("\n")
+    with answers.open("a", encoding="utf-8") as fh, errors_path.open("a", encoding="utf-8") as eh:
+        for bar_ms, sym, j in todo:
+            stop = guard.stop_reason()
+            if stop:
+                break
+            cs = candles[sym]
+            win = tuple(cs[max(0, j + 1 - window): j + 1])
+            compact, _payload, body = build_request(sym, win, equity)
+            result, err = None, None
+            fallback = math.ceil(len(body) / 2)  # conservative: the proxy tokenizer gives ~2.2 chars/token
+            for attempt in range(attempts):
+                wait = min_interval - (time.monotonic() - last)
+                if wait > 0:
+                    sleep(wait)
+                last = time.monotonic()
+                t_call = time.perf_counter()
+                try:
+                    result = client.judge(compact)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    err = exc
+                    name = type(exc).__name__
+                    billed = isinstance(exc, BilledParseError) or name == "TypeSafeAPIResponseValidationError"
+                    rec = {"symbol": sym, "bar_ms": bar_ms, "attempt": attempt + 1, "error": name,
+                           "status": getattr(exc, "status", None), "billed": billed, "at": iso(int(time.time() * 1000))}
+                    if billed:  # the server answered: charge it, never pay twice for the bar
+                        usage = getattr(exc, "usage", None) or {}
+                        rec["usage"] = usage
+                        rec["budget_input_tokens"] = guard.add(usage.get("input_tokens"), usage.get("output_tokens"),
+                                                               fallback_input=fallback)
+                    eh.write(json.dumps(rec) + "\n")
+                    eh.flush()
+                    if billed:
+                        break
+                    if name in NON_RETRYABLE:
+                        stop = f"non-retryable API error {name} (status {getattr(exc, 'status', None)})"
+                        break
+                    sleep(2.0 * (2 ** attempt))
+            if stop:
+                break
+            if result is None:
+                consecutive += 1
+                if consecutive >= max_consecutive_errors:
+                    stop = f"{consecutive} bars in a row failed (last error {type(err).__name__})"
+                    break
+                continue
+            consecutive = 0
+            raw, usage, model = result
+            charged = guard.add(usage.get("input_tokens"), usage.get("output_tokens"), fallback_input=fallback)
+            fh.write(json.dumps({"symbol": sym, "bar_ms": bar_ms, "bar_utc": iso(bar_ms), "model": model,
+                                 "judgment": raw, "usage": usage,
+                                 "usage_estimated": usage.get("input_tokens") is None, "budget_input_tokens": charged,
+                                 "latency_ms": round((time.perf_counter() - t_call) * 1000, 1),
+                                 "answered_at": iso(int(time.time() * 1000))}, ensure_ascii=False) + "\n")
+            fh.flush()
+            new_calls += 1
+            if new_calls % 100 == 0:
+                os.fsync(fh.fileno())
+            if new_calls % 1000 == 0:
+                log(f"{new_calls} new calls, total {guard.calls}, spent ${guard.cost():.4f}, "
+                    f"projection ${guard.projection() or 0:.2f}, at {iso(bar_ms)}")
+    summary = {"stop_reason": stop or "plan complete", "new_calls": new_calls, "total_calls": guard.calls,
+               "input_tokens": guard.input_tokens, "output_tokens": guard.output_tokens,
+               "cost_usd": round(guard.cost(), 6), "projection_usd": guard.projection(),
+               "estimated_usage_responses": guard.estimated_usage}
+    log(("STOPPED: " if stop else "DONE: ") + json.dumps(summary))
+    return summary
 
 
 # --- main ---------------------------------------------------------------------------------
@@ -324,6 +620,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--days", type=float, default=30.0)
     ap.add_argument("--symbols", default="", help="comma list")
     ap.add_argument("--symbols-from-ledger", default=None, help="read-only ledger copy; its answered symbols")
+    ap.add_argument("--universe-ledger", default=None, metavar="LEDGER",
+                    help="read-only ledger copy: take the top --universe-size symbols by model answers on "
+                         "--universe-days")
+    ap.add_argument("--universe-days", default="2026-09-21,2026-09-23", help="first,last UTC day (inclusive)")
+    ap.add_argument("--universe-size", type=int, default=15)
     ap.add_argument("--testnet-missing", default=",".join(TESTNET_MISSING_DEFAULT),
                     help="symbols without testnet markets (reported as a second subset)")
     ap.add_argument("--candle-venue", default="mainnet", choices=("mainnet", "testnet"))
@@ -338,11 +639,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--dry-run", action="store_true", default=True, help="default; never calls the model")
     ap.add_argument("--live", action="store_true", help="paid Jev calls (also needs --i-have-approval)")
     ap.add_argument("--i-have-approval", action="store_true")
-    ap.add_argument("--max-calls", type=int, default=0, help="hard cap for --live")
+    ap.add_argument("--max-calls", type=int, default=0, help="hard cap for --live (all answers in the file count)")
+    ap.add_argument("--budget-usd", type=float, default=4.0, help="hard cap on real cost from SDK usage")
+    ap.add_argument("--check-after", type=int, default=2000, help="calls before the projection check starts")
+    ap.add_argument("--answers", default=None, help="append-only answers JSONL (default <out>/live_answers.jsonl)")
+    ap.add_argument("--min-interval", type=float, default=0.2, help="seconds between call starts")
     ap.add_argument("--check-ledger", default=None, metavar="LEDGER",
-                    help="only compare rebuilt market lines with logged state_text (read-only ledger copy)")
+                    help="only compare rebuilt states with logged state_text (read-only ledger copy)")
     ap.add_argument("--check-n", type=int, default=150)
+    ap.add_argument("--tag", default="", help="suffix for the dry-run output file names")
     return ap.parse_args(argv)
+
+
+def resolve_symbols(args: argparse.Namespace) -> tuple[list[str], list[dict[str, Any]] | None]:
+    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    table = None
+    if args.symbols_from_ledger:
+        symbols = sorted(set(symbols) | set(symbols_from_ledger(args.symbols_from_ledger)))
+    if args.universe_ledger:
+        d0, d1 = (x.strip() for x in args.universe_days.split(","))
+        uni, table = universe_from_ledger(args.universe_ledger, d0, d1, args.universe_size)
+        symbols = sorted(set(symbols) | set(uni))
+    return symbols, table
 
 
 def main(argv: list[str] | None = None) -> dict[str, Any] | None:
@@ -352,25 +670,39 @@ def main(argv: list[str] | None = None) -> dict[str, Any] | None:
     end_ms = int(end.timestamp() * 1000)
     start_ms = int((end - timedelta(days=args.days)).timestamp() * 1000)
     fetch_start = start_ms - args.window * BAR_MS
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    if args.symbols_from_ledger:
-        symbols = sorted(set(symbols) | set(symbols_from_ledger(args.symbols_from_ledger)))
+    symbols, universe_table = resolve_symbols(args)
     if not symbols:
-        raise SystemExit("no symbols (use --symbols or --symbols-from-ledger)")
+        raise SystemExit("no symbols (use --symbols, --symbols-from-ledger or --universe-ledger)")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     Path(args.cache).mkdir(parents=True, exist_ok=True)
 
     if args.check_ledger:
-        res = check_ledger(args.check_ledger, args.candle_venue, Path(args.cache), args.check_n)
-        (out / f"state_check_{args.candle_venue}.json").write_text(json.dumps(res, indent=1))
-        print(json.dumps(res))
+        res = check_ledger(args.check_ledger, args.candle_venue, Path(args.cache), args.check_n, symbols=symbols)
+        (out / f"state_check_{args.candle_venue}_{len(symbols)}sym.json").write_text(json.dumps(res, indent=1))
+        print(json.dumps(res, indent=1))
         return res
     if args.live:
-        if not args.i_have_approval or args.max_calls <= 0:
-            raise SystemExit("--live needs --i-have-approval and --max-calls > 0; nothing was called")
-        run_live(args, symbols, start_ms, end_ms, fetch_start)
-        return None
+        if not args.i_have_approval or args.max_calls <= 0 or args.budget_usd <= 0:
+            raise SystemExit("--live needs --i-have-approval, --max-calls > 0 and --budget-usd > 0; nothing was called")
+        key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+        if not key:
+            raise SystemExit("TYPESAFE_API_KEY is not set in this process environment; nothing was called")
+        candles = {s: load_candles(args.candle_venue, s, fetch_start, end_ms, Path(args.cache)) for s in symbols}
+        plan = build_plan(candles, start_ms, end_ms)
+        answers = Path(args.answers) if args.answers else out / "live_answers.jsonl"
+        guard = BudgetGuard(args.budget_usd, args.price_per_mtok, planned_calls=len(plan), max_calls=args.max_calls,
+                            check_after=args.check_after)
+        seed_guard(guard, answers)
+        client = JevUsageClient(api_key=key)
+        del key
+        try:
+            summary = run_live(plan, candles, client, answers, guard, window=args.window, equity=args.equity,
+                               min_interval=args.min_interval)
+        finally:
+            client.close()
+        (out / "live_status.json").write_text(json.dumps(summary, indent=1))
+        return summary
 
     _, tok_path = load_tokenizer(args.tokenizer)
     tasks = [(args.candle_venue, s, fetch_start, start_ms, end_ms, args.cache, args.window, args.equity,
@@ -391,14 +723,18 @@ def main(argv: list[str] | None = None) -> dict[str, Any] | None:
         "equity": args.equity, "price_per_mtok": args.price_per_mtok, "tokenizer": tok_path,
         "tokenizer_note": "local Laya tokenizer used as a proxy; Jev's own tokenizer and server prompt are unknown",
         "elapsed_sec": round(time.time() - t0, 1),
+        "symbols": symbols, "universe_rule": None if universe_table is None else
+        f"top {args.universe_size} by model answers on {args.universe_days} (UTC, inclusive)",
+        "universe_counts": universe_table,
+        "planned_calls": full["calls"], "budget_usd": args.budget_usd,
         "summary": [full, tn],
         "scaled": {s["label"]: [scaled(s, 31), scaled(s, 60)] for s in (full, tn)},
         "per_symbol": [{k: v for k, v in r.items() if k != "samples"} for r in rows],
     }
     samples = [smp for r in rows for smp in r["samples"]]
-    (out / "sample_requests.jsonl").write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in samples) + "\n")
-    (out / "month_dry_run.json").write_text(json.dumps(result, indent=1, ensure_ascii=False))
-    (out / "month_dry_run.md").write_text(render(result))
+    (out / f"sample_requests{args.tag}.jsonl").write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in samples) + "\n")
+    (out / f"month_dry_run{args.tag}.json").write_text(json.dumps(result, indent=1, ensure_ascii=False))
+    (out / f"month_dry_run{args.tag}.md").write_text(render(result))
     print(render(result))
     return result
 
@@ -428,6 +764,13 @@ def render(r: dict[str, Any]) -> str:
         L.append(f"- {s['label']}: outside the 03-09 Asia/Jerusalem no-entry window {s['calls_outside_window']:,} calls, "
                  f"tokens tokenizer {fm(tok_o)} (${fm(None if tok_o is None else cost(tok_o, r['price_per_mtok']), 2)}), "
                  f"chars/4 {s['chars_outside_window'] / 4:,.0f} (${cost(s['chars_outside_window'] / 4, r['price_per_mtok']):.2f})")
+    full = r["summary"][0]
+    L.append(f"\nsymbols ({len(r['symbols'])}): {', '.join(r['symbols'])}" +
+             (f"; rule: {r['universe_rule']}" if r.get("universe_rule") else ""))
+    L.append(f"planned calls {r['planned_calls']:,}; budget ${r['budget_usd']:.2f}: tokenizer estimate "
+             f"${fm(full['usd_tokenizer'], 2)}, chars/4 ${full['usd_chars4']:.2f}, chars/3.5 ${full['usd_chars3_5']:.2f}; "
+             f"break-even input tokens per call for the budget: "
+             f"{r['budget_usd'] / r['price_per_mtok'] * 1e6 / max(1, r['planned_calls']):,.1f}")
     L.append(f"\nelapsed {r['elapsed_sec']} s; no model calls were made")
     return "\n".join(L)
 
